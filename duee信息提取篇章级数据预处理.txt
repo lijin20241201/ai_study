@@ -1,0 +1,468 @@
+import os
+import sys
+import json
+
+def read_by_lines(path):
+    result = list()
+    with open(path, "r", encoding="utf8") as infile:
+        for line in infile:
+            result.append(line.strip())
+    return result
+
+def write_by_lines(path, data):
+    with open(path, "w", encoding="utf8") as outfile:
+        [outfile.write(d + "\n") for d in data]
+
+def text_to_sents(text):
+    # 包含中文句子分隔符的 Unicode 字符串列表。这些分隔符用于在中文文本中识别和分割句子
+    delimiter_symbols = [u"。", u"？", u"！"]#。？！
+    paragraphs = text.split("\n")#按换行符拆分文本
+    ret = []
+    for para in paragraphs:#para:指其中的每个按行分割的一个个文本段
+        if para.strip()  == u"":
+            continue
+        sents = [u""]
+        for s in para:#遍历文本段中的每个字符
+            # print(s)#每个字符
+            sents[-1] += s
+            # print(s)
+            # print(len(sents))
+            if s in delimiter_symbols :#如果够一句话了,就为这个文本段新开始个，表示一个文本段中第二个句子
+                sents.append(u"")
+            # print(len(sents))
+        # print('--------------------')
+        if sents[-1] == u"":#如果这个文本段以空字符串结尾
+            sents = sents[:-1]
+        ret.extend(sents)#
+    return ret
+
+a=text_to_sents('这些分隔符用于在中文文本中识别和分割句子。mmm')
+
+import hashlib
+
+def calculate_md5(input_str):  
+    md5_hash = hashlib.md5(input_str.encode('utf-8')).hexdigest()  
+    return md5_hash  
+input_string = "hello world"  
+print(calculate_md5(input_string))
+
+conf_dir = "./conf/DuEE-Fin"
+
+if not os.path.exists(conf_dir):
+        os.makedirs(conf_dir)
+
+schema_path = "./datasets/DuEE-fin/duee_fin_event_schema.json"
+
+tags_trigger_path = "{}/trigger_tag.dict".format(conf_dir)#保存trigger标签
+tags_role_path = "{}/role_tag.dict".format(conf_dir)#保存role标签
+tags_enum_path = "{}/enum_tag.dict".format(conf_dir)#保存枚举
+
+def label_add(labels, _type):
+        if "B-{}".format(_type) not in labels:#没在列表里面就追加
+            labels.extend(["B-{}".format(_type), "I-{}".format(_type)])
+        return labels
+
+# trigger,触发词
+schema_l=read_by_lines(schema_path)# schema
+labels = []
+for  line in schema_l:
+    d_json = json.loads(line.strip())
+    labels = label_add(labels, d_json["event_type"])
+labels.append("O")
+tags_trigger = []#
+for index, label in enumerate(labels):#保存在列表，为了写到文件方便
+    tags_trigger.append("{}\t{}".format(index, label))
+
+write_by_lines(tags_trigger_path, tags_trigger)
+
+enum_role = "环节"
+labels = []
+for  line in schema_l:
+    d_json = json.loads(line.strip())
+    for role in d_json["role_list"]:
+            if role["role"] == enum_role:#
+                continue
+            labels = label_add(labels, role["role"])
+labels.append("O")
+tags_roles = []#
+for index, label in enumerate(labels):#里面元素是字典形式
+    tags_roles.append("{}\t{}".format(index, label))
+
+write_by_lines(tags_role_path, tags_roles)
+
+enum_role = "环节"
+labels = []
+for  line in schema_l:
+    d_json = json.loads(line.strip())
+    for role in d_json["role_list"]:
+            if role["role"] == enum_role:
+                labels = role["enum_items"]
+tags_enums = []
+for index, label in enumerate(labels):#里面元素是映射对的样式
+    tags_enums .append("{}\t{}".format(index, label))
+
+write_by_lines(tags_enum_path, tags_enums)
+
+# data process
+data_dir = "./datasets/DuEE-Fin"
+
+sentence_dir = "{}/sentence".format(data_dir)
+
+trigger_save_dir = "{}/trigger".format(data_dir)
+
+role_save_dir = "{}/role".format(data_dir)
+enum_save_dir = "{}/enum".format(data_dir)
+
+if not os.path.exists(sentence_dir):
+    os.makedirs(sentence_dir)
+
+x_train = read_by_lines( "./datasets/DuEE-fin/duee_fin_train.json")
+
+def argument_in_sent(sent, argument_list, trigger):
+        trigger_start = sent.find(trigger)#触发词的起始索引
+        if trigger_start < 0:#如果没在句子组内找到，返回-1,[]，None
+            return trigger_start, [], None
+        new_arguments, enum_argument = [], None
+        for argument in argument_list:#遍历角色参数列表
+            word = argument["argument"]#论元
+            role_type = argument["role"]#论元角色
+            if role_type == enum_role:#如果等于环节
+                # special
+                enum_argument = argument#保存枚举参数
+                continue#退出当次循环,因为枚举不属于触发词，角色等，枚举是 分类模型
+            start = sent.find(word)#查找论元开始索引
+            if start < 0:#如果不存在，退出当次循环
+                continue
+            new_arguments.append({#新的参数组列表，里面装论元角色和对应的论元
+                "role": role_type,#角色类型
+                "argument": word,#论元
+                "argument_start_index": start#论元起始
+            })
+        return trigger_start, new_arguments, enum_argument
+
+enum_role = "环节"
+sentences = []
+for line in x_train:#遍历训练集
+    d_json = json.loads(line)
+    title = d_json["title"]#每个样本的标题
+    text =d_json["text"]#样本的文本内容
+    sents = text_to_sents(text)#拆分文本内容为很多句子
+    # 存放每个原样本的句子组,原样本分成的小文本段映射，原样本text分割成的句子组集合，有顺序
+    exist_sents, sent_mapping_event, sents_order = set(), {}, []
+    step = 3
+    batch_sents = [sents[i:i + step] for i in range(0, len(sents), step)]#把当前样本的文本分成段
+    if len(title) > 0:#如果有标题
+        batch_sents = [[title]] + batch_sents#带上标题,原先的一个样本会形成很多批次
+    for batch in batch_sents:
+        #去除批次句子中的换行等符号
+        b_sent = " ".join(batch).replace("\n",
+                                         " ").replace("\r\n", " ").replace(
+                                             "\r", " ").replace("\t", " ")
+        if b_sent in sent_mapping_event:#如果当前句子组形成的字符串在字典的键里面，就退出当次循环
+            continue
+        sent_id = calculate_md5(b_sent)#计算当前小段文本的md5编码
+        sent_mapping_event[b_sent] = {
+            "id": d_json["id"],#原样本id
+            "sent_id": sent_id,#句子小批次id
+            "text": b_sent#样本内句子小分组内容
+        }
+        sents_order.append(b_sent)
+    for event in d_json.get("event_list", []):#遍历当前样本内的事件列表
+        #当前句子，触发词开始，参数，枚举参数
+        cur_sent, trigger_start, arguments, enum_argument = "", -1, [], None#初始化
+        for sent in sents_order:#sent:遍历当前样本内的每个文本段
+            # sent：样本内的句子组，角色和其具体的论元形成的列表，触发词：比如质押
+            # display(sent,event["arguments"],event["trigger"])
+            tri_start, argus, enum_arg = argument_in_sent(#返回触发词在新序列中起始，新参数列表，枚举参数
+            sent, event["arguments"], event["trigger"])  
+            if tri_start < 0:#如果tri_start<0,就是没找到，退出当前样本的小文本段，继续下次
+                continue
+            # print(tri_start, argus, enum_arg)#能到这的都是含有触发词的小文本段
+            if len(argus) > len(arguments):
+                #当前样本的第i个文本段，触发词在当前句子组内的索引，角色参数列表
+                cur_sent, trigger_start, arguments = sent, tri_start, argus
+            if enum_arg:#如果有枚举，就设置枚举参数，这个是分类模型
+                enum_argument = enum_arg
+        if trigger_start >= 0 and len(arguments) > 0:#如果当前样本有触发词，并且有新角色参数
+            # add enum 2 event
+            if enum_argument:#如果有枚举参数
+                arguments.append(enum_argument)
+            # print(sent_mapping_event[cur_sent])#当前有触发词的文本段映射的原id,组id,文本段内容
+            if "event_list" not in sent_mapping_event[cur_sent]:#如果没这个键
+                sent_mapping_event[cur_sent]["event_list"] = []#添加一个空的
+            new_event = {#新事件
+                "arguments": arguments,#角色字典列表
+                "event_type": event["event_type"],#事件类型 质押
+                "trigger": event["trigger"],#触发词 质押
+                "trigger_start_index": trigger_start#触发词位置
+            }
+            #只有有触发词的正文才会加event_list
+            sent_mapping_event[cur_sent]["event_list"].append(new_event)
+    sentences.extend(sent_mapping_event.values())#一个原始样本会被分成几个小样本句子组
+train_sent = [json.dumps(s, ensure_ascii=False) for s in sentences]
+
+len(train_sent)# 32637,原始样本因为里面text被分成几个批次，所以现在的总体样本要多了
+
+write_by_lines("{}/train.json".format(sentence_dir), train_sent)
+
+def marked_doc_2_sentence(doc):
+    def argument_in_sent(sent, argument_list, trigger):
+        trigger_start = sent.find(trigger)
+        if trigger_start < 0:
+            return trigger_start, [], None
+        new_arguments, enum_argument = [], None
+        for argument in argument_list:
+            word = argument["argument"]
+            role_type = argument["role"]
+            if role_type == enum_role:
+                # special
+                enum_argument = argument
+                continue
+            start = sent.find(word)
+            if start < 0:
+                continue
+            new_arguments.append({
+                "role": role_type,
+                "argument": word,
+                "argument_start_index": start
+            })
+        return trigger_start, new_arguments, enum_argument
+    title = doc["title"]
+    text = doc["text"]
+    sents = text_to_sents(text)
+    exist_sents, sent_mapping_event, sents_order = set(), {}, []
+    step = 3
+    batch_sents = [sents[i:i + step] for i in range(0, len(sents), step)]
+    if len(title) > 0:
+        batch_sents = [[title]] + batch_sents
+    for batch in batch_sents:
+        b_sent = " ".join(batch).replace("\n",
+                                         " ").replace("\r\n", " ").replace(
+                                             "\r", " ").replace("\t", " ")
+        if b_sent in sent_mapping_event:
+            continue
+        sent_id = calculate_md5(b_sent)
+        sent_mapping_event[b_sent] = {
+            "id": doc["id"],
+            "sent_id": sent_id,
+            "text": b_sent
+        }
+        sents_order.append(b_sent)
+    for event in doc.get("event_list", []):
+        cur_sent, trigger_start, arguments, enum_argument = "", -1, [], None
+        for sent in sents_order:
+            tri_start, argus, enum_arg = argument_in_sent(
+                sent, event["arguments"], event["trigger"])
+            if tri_start < 0:
+                continue
+            if len(argus) > len(arguments):
+                cur_sent, trigger_start, arguments = sent, tri_start, argus
+            if enum_arg:
+                enum_argument = enum_arg
+        if trigger_start >= 0 and len(arguments) > 0:
+            # add enum 2 event
+            if enum_argument:
+                arguments.append(enum_argument)
+            if "event_list" not in sent_mapping_event[cur_sent]:
+                sent_mapping_event[cur_sent]["event_list"] = []
+            new_event = {
+                "arguments": arguments,
+                "event_type": event["event_type"],
+                "trigger": event["trigger"],
+                "trigger_start_index": trigger_start
+            }
+            sent_mapping_event[cur_sent]["event_list"].append(new_event)
+    return sent_mapping_event.values()
+
+def docs_data_process(path):
+    lines = read_by_lines(path)
+    sentences = []
+    for line in lines:
+        d_json = json.loads(line)
+        sentences.extend(marked_doc_2_sentence(d_json))
+    sentences = [json.dumps(s, ensure_ascii=False) for s in sentences]
+    return sentences
+
+dev_sent = docs_data_process(
+    "./datasets/DuEE-fin/duee_fin_dev.json")
+
+write_by_lines("{}/dev.json".format(sentence_dir), dev_sent)
+
+test_sent = docs_data_process(
+    "./datasets/DuEE-fin/duee_fin_test2.json")
+write_by_lines("{}/test.json".format(sentence_dir), test_sent)
+
+if not os.path.exists(trigger_save_dir):
+    os.makedirs(trigger_save_dir)
+
+def label_data(data, start, l, _type):
+        for i in range(start, start + l):
+            suffix = "B-" if i == start else "I-" #i=起始索引就加B-前缀，否则加I-
+            data[i] = "{}{}".format(suffix, _type)#设置触发词标签
+        return data
+
+sentences = []
+train_tri = ["text_a\tlabel"]
+for line in read_by_lines("{}/train.json".format(sentence_dir)):
+    d_json = json.loads(line)#加载sentence/train.json训练集中的每一行
+    _id = d_json["id"]#原样本id
+    #把text中的每个字符转换成文本字符列表，换行和制表符等变成，
+    text_a = [
+        "，" if t == " " or t == "\n" or t == "\t" else t
+        for t in list(d_json["text"].lower())
+    ]
+    labels = ["O"] * len(text_a)#O是非实体,标签初始化
+    if len(d_json.get("event_list", [])) == 0:#过滤掉没有event_list的
+        continue
+    for event in d_json.get("event_list", []):
+        event_type = event["event_type"]#事件类型
+        start = event["trigger_start_index"]#触发词起始索引
+        trigger = event["trigger"]#触发词
+        #为触发词添加标签
+        labels = label_data(labels, start, len(trigger), event_type)
+    train_tri.append("{}\t{}".format('\002'.join(text_a),#\002会把里面的token相连
+                                  '\002'.join(labels)))
+
+write_by_lines("{}/train.tsv".format(trigger_save_dir), train_tri)
+
+def data_process(path, model="trigger", is_predict=False):
+    def label_data(data, start, l, _type):#为触发词，role等加标签
+        for i in range(start, start + l):
+            suffix = "B-" if i == start else "I-"
+            data[i] = "{}{}".format(suffix, _type)
+        return data
+    enum_role = "环节"
+    sentences = []
+    output = ["text_a"] if is_predict else ["text_a\tlabel"]
+    for line in read_by_lines(path):
+        d_json = json.loads(line)
+        _id = d_json["id"]
+        text_a = [
+            "，" if t == " " or t == "\n" or t == "\t" else t
+            for t in list(d_json["text"].lower())
+        ]
+        if is_predict:
+            sentences.append({"text": d_json["text"], "id": _id})
+            output.append('\002'.join(text_a))
+        else:
+            if model == u"trigger":
+                labels = ["O"] * len(text_a)
+                if len(d_json.get("event_list", [])) == 0:
+                    continue
+                for event in d_json.get("event_list", []):
+                    event_type = event["event_type"]
+                    start = event["trigger_start_index"]
+                    trigger = event["trigger"]
+                    labels = label_data(labels, start, len(trigger), event_type)
+                output.append("{}\t{}".format('\002'.join(text_a),
+                                              '\002'.join(labels)))
+            elif model == u"role":
+                labels = ["O"] * len(text_a)#初始化标签，O非实体
+                if len(d_json.get("event_list", [])) == 0:
+                    continue
+                for event in d_json.get("event_list", []):
+                    for arg in event["arguments"]:
+                        role_type = arg["role"]
+                        if role_type == enum_role:#枚举分类
+                            continue
+                        argument = arg["argument"]
+                        start = arg["argument_start_index"]
+                        labels = label_data(labels, start, len(argument),
+                                            role_type)
+                    output.append("{}\t{}".format('\002'.join(text_a),
+                                                  '\002'.join(labels)))
+    return output
+
+dev_tri = data_process("{}/dev.json".format(sentence_dir), "trigger")
+write_by_lines("{}/dev.tsv".format(trigger_save_dir), dev_tri)
+test_tri = data_process("{}/test.json".format(sentence_dir), "trigger")
+write_by_lines("{}/test.tsv".format(trigger_save_dir), test_tri)
+
+if not os.path.exists(role_save_dir):
+        os.makedirs(role_save_dir)
+
+enum_role = "环节"
+sentences = []
+train_role = ["text_a\tlabel"]
+for line in read_by_lines("{}/train.json".format(sentence_dir)):
+    d_json = json.loads(line)#加载sentence/train.json训练集中的每一行
+    _id = d_json["id"]#原样本id
+    #把text中的每个字符转换成文本字符列表，换行和制表符等变成，
+    text_a = [
+        "，" if t == " " or t == "\n" or t == "\t" else t
+        for t in list(d_json["text"].lower())
+    ]
+    labels = ["O"] * len(text_a)#初始化标签，O非实体
+    if len(d_json.get("event_list", [])) == 0:
+        continue
+    for event in d_json.get("event_list", []):
+        for arg in event["arguments"]:#遍历每一个角色参数
+            role_type = arg["role"]
+            if role_type == enum_role:#如果等于环节，是枚举分类
+                continue
+            argument = arg["argument"]#论元
+            start = arg["argument_start_index"]#论元起始索引
+            labels = label_data(labels, start, len(argument),
+                                role_type)
+        train_role.append("{}\t{}".format('\002'.join(text_a),
+                                      '\002'.join(labels)))
+
+write_by_lines("{}/train.tsv".format(role_save_dir), train_role)
+
+dev_role = data_process("{}/dev.json".format(sentence_dir), "role")
+write_by_lines("{}/dev.tsv".format(role_save_dir), dev_role)
+test_role = data_process("{}/test.json".format(sentence_dir), "role")
+write_by_lines("{}/test.tsv".format(role_save_dir), test_role)
+
+if not os.path.exists(enum_save_dir):
+    os.makedirs(enum_save_dir)
+
+enum_role = "环节"
+def enum_data_process(path, is_predict=False):
+    output = ["text_a"] if is_predict else ["label\ttext_a"]
+    for line in read_by_lines(path):
+        d_json = json.loads(line)
+        text = d_json["text"].lower().replace("\t", " ")
+        if is_predict:
+            output.append(text)
+            continue
+        if len(d_json.get("event_list", [])) == 0:#过滤掉没有event_list的
+            continue
+        label = None
+        for event in d_json["event_list"]:
+            if event["event_type"] != "公司上市":#过滤掉event_type!= "公司上市"的
+                continue
+            for argument in event["arguments"]:
+                role_type = argument["role"]#获取参数中的角色
+                if role_type == enum_role:#如果角色类型是环节
+                    label = argument["argument"]#获取标签
+        if label:
+            output.append("{}\t{}".format(label, text))
+    return output
+
+enum_role = "环节"
+trian_enum = ["label\ttext_a"]
+cnt=0
+for line in read_by_lines("{}/train.json".format(sentence_dir)):
+    d_json = json.loads(line)
+    text = d_json["text"].lower().replace("\t", " ")
+    if len(d_json.get("event_list", [])) == 0:#过滤掉没有event_list的
+            continue
+    label = None
+    for event in d_json["event_list"]:
+        if event["event_type"] != "公司上市":#过滤掉事件类型不是公司上市的
+            continue
+        for argument in event["arguments"]:
+            role_type = argument["role"]#获取参数中的角色
+            if role_type == enum_role:#如果角色等于环节
+                label = argument["argument"]
+    if label:
+        trian_enum.append("{}\t{}".format(label, text))
+
+write_by_lines("{}/train.tsv".format(enum_save_dir), trian_enum)
+
+dev_enum = enum_data_process("{}/dev.json".format(sentence_dir))
+write_by_lines("{}/dev.tsv".format(enum_save_dir), dev_enum)
+
+test_enum = enum_data_process("{}/test.json".format(sentence_dir))
+write_by_lines("{}/test.tsv".format(enum_save_dir), test_enum)

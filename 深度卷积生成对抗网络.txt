@@ -1,0 +1,254 @@
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'#设置tensorflow的日志级别
+from tensorflow.python.platform import build_info
+import tensorflow as tf
+
+# glob 是Python的一个标准库模块，它提供了在目录中使用通
+# 配符搜索创建文件列表的函数。例如，你可以使用 glob 来查找某个目录下所有以 .jpg 结尾的文件
+import glob
+# imageio 是一个Python库，用于读取、写入、保存、处理和转换图像数据。这个库支持多种图像格式，
+# 并且提供了简单的API来读取和写入图像。此外，imageio 还支持视频和体积数据的读写，以及GIF动画的创建。
+import imageio
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+import PIL
+from tensorflow.keras import layers
+import time
+from IPython import display
+
+(train_images, train_labels), (_, _) = tf.keras.datasets.mnist.load_data()
+
+#变形成4维张量，数据类型浮点数
+train_images = train_images.reshape(train_images.shape[0], 28, 28, 1).astype('float32')
+train_images = (train_images - 127.5) / 127.5  # Normalize the images to [-1, 1]
+
+BUFFER_SIZE = 60000
+BATCH_SIZE = 256
+
+# 这行代码将数据集中的元素打乱。BUFFER_SIZE参数指定了用于打乱的缓冲区大小。
+# 缓冲区大小应该足够大，以确保数据集被打乱得足够充分。如果BUFFER_SIZE小于数据集的大小，
+# 那么打乱的效果可能不如预期。在实际应用中，通常会将BUFFER_SIZE设置为数据集的大小或更大的值。
+# 这段代码的目的是从train_images创建一个tf.data.Dataset对象，
+# 打乱其中的样本，并将它们组合成批次，以便后续用于模型训练。
+train_dataset = tf.data.Dataset.from_tensor_slices(\
+    train_images).shuffle(BUFFER_SIZE).batch(BATCH_SIZE)
+
+from keras import layers
+from keras.layers import Input,Dense,BatchNormalization,LeakyReLU,Reshape,Conv2DTranspose
+
+from tensorflow.keras.models import Model
+
+#模仿师 使用 tf.keras.layers.Conv2DTranspose（上采样）层来从种子（随机噪声）中生成图像
+# 以一个使用该种子作为输入的 Dense 层开始，然后多次上采样，直至达到所需的 28x28x1 的图像大小。
+# 请注意，除了输出层使用双曲正切之外，其他每层均使用 tf.keras.layers.LeakyReLU 激活。
+#构造生成器模型
+def make_generator_model():
+    # 定义输入层(从随机噪声开始)  
+    inputs = Input(shape=(100,))  
+    # 添加线性层  
+    x = Dense(7*7*256, use_bias=False)(inputs)  
+    # 添加批次标准化层  
+    # 首先，它会计算输入数据的均值和方差，并使用这些值对数据
+    # 进行标准化。这通常意味着它会减去均值并除以标准差，从而使数据具有零均值和单位方差。
+    # 然后，它会对标准化后的数据进行缩放和偏移。这是通过两个可学习的参数（称为 gamma
+    # 和 beta）来实现的。这些参数在训练过程中会被更新，以允许模型学习适当的缩放和偏移量
+    #由于批次标准化涉及到对数据的均值和方差的计算，它还可以起到轻微的正则化作用，有助于减少过拟合。
+    x = BatchNormalization()(x)  
+    # 添加激活函数 (LeakyReLU允许有负值)
+    x = LeakyReLU()(x)  
+    # 变形操作  
+    x = Reshape((7, 7, 256))(x)  
+    # 添加上采样层  
+    x = Conv2DTranspose(128, (5, 5), strides=(1, 1), padding='same', use_bias=False)(x)  
+    x = BatchNormalization()(x)  
+    x = LeakyReLU()(x)  
+      
+    x = Conv2DTranspose(64, (5, 5), strides=(2, 2), padding='same', use_bias=False)(x)  
+    x = BatchNormalization()(x)  
+    x = LeakyReLU()(x)  
+      
+    # 最终的输出层  
+    outputs = Conv2DTranspose(1, (5, 5), strides=(2, 2), \
+                              padding='same', use_bias=False, activation='tanh')(x)
+    # 创建并返回模型  
+    model = Model(inputs=inputs, outputs=outputs, name='Generator')  
+    return model  
+# 创建生成器模型实例  其中batchnormal层有可训练参数,也有不可训练参数25088+256+128
+# 不可训练参数可能包括用于追踪运行时的均值和方差的变量。这些不可训练参数在推理
+# （测试）阶段用于标准化输入，但它们不是通过梯度下降来优化的。
+generator = make_generator_model()  
+generator.summary()#7*7*256*188,5*5*128*256,5*5*128*64,5*5*64*1
+
+noise = tf.random.normal([1, 100])#标准正太分布,之所以不太均匀，是数据太少
+generated_image = generator(noise, training=False)
+plt.imshow(generated_image[0, :, :,:], cmap='gray')
+
+print(noise.numpy().std(),noise.numpy().mean(),noise.shape)
+
+#鉴定师
+def make_discriminator_model():
+    inputs = Input(shape=(28,28,1))
+    x=Conv2D(64,5, strides=(2, 2), padding='same')(inputs)
+    x=LeakyReLU(alpha=0.2)(x)
+    x=Dropout(0.3)(x)
+    x=Conv2D(128,5, strides=(2, 2), padding='same')(x)
+    x=LeakyReLU(alpha=0.2)(x)
+    x=Dropout(0.3)(x)
+    x=Flatten()(x)
+    outputs=Dense(1)(x)
+    # 创建并返回模型  
+    model = Model(inputs=inputs, outputs=outputs, name='Discriminator')  
+    return model
+
+from keras.layers import Conv2D,Dropout,Flatten
+
+discriminator=make_discriminator_model()
+discriminator.summary()#5*5*64+64,5*5*64*128+128,7*7*128+1
+#Flatten(7*7*128)
+
+# padding='same'在这里的作用是确保在卷积操作后，特征图的边界不会
+# 由于卷积核的移动而丢失信息，通过在输入特征图的边缘添加适当数量的0来实现。
+# 然而，这并不意味着特征图的尺寸不会因为步长（stride）的设置而改变。
+
+decision = discriminator(generated_image)
+print (decision)
+
+#from_logits=True 使用分值，如果模型输出是概率，这里就得是false
+cross_entropy = tf.keras.losses.BinaryCrossentropy(from_logits=True)
+
+# 该方法量化判别器判断真伪图片的能力。它将判别器对真实图片的预测值与值全为 1
+# 的数组进行对比，将判别器对伪造（生成的）图片的预测值与值全为 0 的数组进行对比。
+#这两个参数分别代表判别器对真实图片和伪造图片的预测输出。
+def discriminator_loss(real_output, fake_output):
+    real_loss = cross_entropy(tf.ones_like(real_output), real_output)
+    fake_loss = cross_entropy(tf.zeros_like(fake_output), fake_output)
+    total_loss = real_loss + fake_loss
+    return total_loss
+
+# 生成器的损失可量化其欺骗判别器的能力。直观地说，
+# 如果生成器表现良好，判别器会将伪造图像分类为真实图像（或 1）。
+# 在此，需要将判别器对生成图像的决策与值全为 1 的数组进行对比。
+def generator_loss(fake_output):
+    return cross_entropy(tf.ones_like(fake_output), fake_output)
+
+# 判别器和生成器优化器不同，因为您将分别训练两个网络
+generator_optimizer = tf.keras.optimizers.Adam(1e-4)
+discriminator_optimizer = tf.keras.optimizers.Adam(1e-4)
+
+# checkpoint_dir 变量定义了检查点文件将被保存的目录路径，即 './training_checkpoints'。
+checkpoint_dir = './training_checkpoints'
+# 生成检查点文件的完整前缀，这样 TensorFlow 就知道如何命名和保存检查点文件。
+checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
+# 使用 tf.train.Checkpoint 创建了一个检查点对象
+# 这种机制在长时间运行的训练任务中特别有用，因为它允许你在任何时候停止和恢复训练，而不会丢失之前的进度。同时，
+# 如果你发现模型在某个检查点处表现最好，你也可以直接加载那个检查点，而无需重新训练整个模型。
+checkpoint = tf.train.Checkpoint(generator_optimizer=generator_optimizer,
+                                 discriminator_optimizer=discriminator_optimizer,
+                                 generator=generator,
+                                 discriminator=discriminator)
+
+EPOCHS = 50
+noise_dim = 100# 生成器输入噪声的维度。
+# um_examples_to_generate: 在训练过程中要生成的图片数量，用于可视化
+num_examples_to_generate = 16
+# You will reuse this seed overtime (so it's easier)
+# to visualize progress in the animated GIF)
+seed = tf.random.normal([num_examples_to_generate, noise_dim])
+
+# 把普通python函数转换为tensorflow计算图函数
+@tf.function
+def train_step(images):# 接受真实图片images作为输入
+    # 为当前批次生成随机噪声，作为生成器的输入
+    noise = tf.random.normal([BATCH_SIZE, noise_dim])#随机种子
+    #两个梯度带（生成器和判别器）
+    with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
+      generated_images = generator(noise, training=True)#使用生成器根据噪声生成图片
+      real_output = discriminator(images, training=True)#使用判别器对真实图片进行预测
+      #获使用判别器对生成图片进行预测
+      fake_output = discriminator(generated_images, training=True)
+      gen_loss = generator_loss(fake_output)#生成器损失
+      #判别器损失
+      disc_loss = discriminator_loss(real_output, fake_output)
+    #获取生成器损失对生成器可训练参数的梯度
+    gradients_of_generator = gen_tape.gradient(gen_loss, generator.trainable_variables)
+    #获取判别器损失对判别器可训练参数的梯度
+    gradients_of_discriminator = disc_tape.gradient(disc_loss,\
+                                                    discriminator.trainable_variables)
+    #根据生成器梯度更新生成器可训练参数                                                
+    generator_optimizer.apply_gradients(\
+        zip(gradients_of_generator, generator.trainable_variables))
+    #根据判别器梯度更新判别器可训练参数
+    discriminator_optimizer.apply_gradients(\
+        zip(gradients_of_discriminator, discriminator.trainable_variables))
+
+def train(dataset, epochs):
+  for epoch in range(epochs):
+    start = time.time()
+    for image_batch in dataset:
+      train_step(image_batch)#把一个批次的训练数据传进去
+    #当你在 Jupyter Notebook 中运行一个长时间运行的代码块时，你可能会想要清除之前的输出，
+    #以便在输出区域中只显示最新的信息或进度。
+    # clear_output: 这个函数会清除输出单元格中的所有输出
+    # wait=True: 这个参数意味着函数会等待，直到下一个输出被发送之前不会清除输出
+    display.clear_output(wait=True)
+    generate_and_save_images(generator,
+                             epoch + 1,
+                             seed)
+    # Save the model every 15 epochs
+    if (epoch + 1) % 15 == 0:
+      checkpoint.save(file_prefix = checkpoint_prefix)
+    print (' 第{}个轮次耗时{}秒'.format(epoch + 1, time.time()-start))
+  #
+  display.clear_output(wait=True)
+  #最后生成器生成的图片
+  generate_and_save_images(generator,
+                           epochs,
+                           seed)
+
+def generate_and_save_images(model, epoch, test_input):
+  # training=False，不更新梯度，获取生成器生成的图片
+  predictions = model(test_input, training=False)
+  fig = plt.figure(figsize=(4, 4))#画布大小
+  for i in range(predictions.shape[0]):#画出生成器生成的图片
+      plt.subplot(4, 4, i+1)
+      plt.imshow(predictions[i, :, :, 0] * 127.5 + 127.5, cmap='gray')
+      plt.axis('off')
+  plt.savefig('./img/image_at_epoch_{:04d}.png'.format(epoch))
+  plt.show()
+
+from IPython.display import clear_output  
+import time  
+for i in range(10):  
+    time.sleep(1)  # 模拟一个耗时任务  
+    clear_output(wait=True)  # 清除之前的输出  
+    print(f"Progress: {i+1}/10")  # 显示新的输出
+
+train(train_dataset, EPOCHS)
+
+# checkpoint.restore(...) 是一个方法，用于从指定的检查点文件中恢复模型的权重和状态。
+# 当传入 tf.train.latest_checkpoint(checkpoint_dir) 的返回值时，它将尝试从最新
+# 的检查点恢复模型。如果没有找到任何检查点文件，它将返回 None
+
+checkpoint.restore(tf.train.latest_checkpoint(checkpoint_dir))
+
+#显示生成器单个轮次生成的网格图
+def display_image(epoch_no):
+  return PIL.Image.open('./img/image_at_epoch_{:04d}.png'.format(epoch_no))
+
+display_image(EPOCHS)
+
+filenames=os.listdir('./img/')
+
+filenames=[name for name in filenames if name.startswith('image_at_epoch')]
+
+import imageio.v2 as imageio
+
+anim_file = './img/dcgan.gif'
+with imageio.get_writer(anim_file, mode='I') as writer:
+  filenames = glob.glob('./img/image*.png')
+  filenames = sorted(filenames)
+  # print(len(filenames))
+  for filename in filenames:
+    image = imageio.imread(filename)
+    writer.append_data(image)

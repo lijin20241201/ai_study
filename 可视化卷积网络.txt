@@ -1,0 +1,187 @@
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ["KERAS_BACKEND"] = "tensorflow"
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
+import keras
+import numpy as np
+import tensorflow as tf
+
+print(keras.__version__,tf.__version__)
+
+model = keras.applications.ResNet50V2(include_top=False)
+
+layer = model.get_layer("conv3_block4_out")
+
+feature_extractor = keras.Model(inputs=model.inputs, outputs=layer.output)
+
+def compute_loss(input_image, filter_index,model):#参数：输入(四维张量)，滤镜索引,特征提取模型
+    activation = model(input_image)#获取特征图
+    filter_activation = activation[:,:,:,filter_index]#(n,h,w)
+    # print(f'{filter_activation.shape=}')
+    return tf.reduce_mean(filter_activation)#返回的是单个滤镜图(矩阵)的均值,标量
+
+@tf.function
+def gradient_ascent_step(img, filter_index, learning_rate,model):#图函数
+    with tf.GradientTape() as tape:#对输入图片求梯度，梯度上升
+        tape.watch(img)#梯度带监视输入图片数据
+        loss = compute_loss(img, filter_index,model)#计算某个滤镜图的损失
+    # 用标量数据loss对输入数据求梯度
+    grads = tape.gradient(loss, img)
+    #梯度单位化(就是对其中的行或列向量单位化,向量长度变成1)
+    grads = tf.math.l2_normalize(grads)
+    img += learning_rate * grads#梯度上升,获取滤镜激活图
+    return loss, img
+
+def initialize_image(w,h,c):#构造输入图像数据(-0.125,0.125)
+    img = tf.random.uniform((1,w,h,c))# 生成满足均匀分布的随机值
+    return (img - 0.5) * 0.25
+def visualize_filter(filter_index,w,h,c,model):#梯度上升，返回损失，滤镜激活图
+    iterations = 30#上升次数
+    learning_rate = 10.0
+    img = initialize_image(w,h,c)#(-0.125,0.125)
+    for iteration in range(iterations):
+        loss, img = gradient_ascent_step(img, filter_index, learning_rate,model)#梯度上升,loss,img
+    img = deprocess_image(img[0].numpy())#(130, 130, 3)
+    # print(f'{img.shape=}')
+    return loss, img
+def deprocess_image(img):#图片数据处理
+    img -= img.mean()
+    img /= img.std() + 1e-5#标准化
+    img *= 0.15
+    img += 0.5
+    img = np.clip(img, 0, 1)
+    img *= 255
+    img = np.clip(img, 0, 255).astype("uint8")
+    return img
+
+import matplotlib.pyplot as plt
+
+def get_filter_img_grid(shape,model):
+    w,h,c=shape
+    def get_filter_imgs(w,h,c,model):
+        all_imgs = []
+        for filter_index in range(64):
+            loss, img = visualize_filter(filter_index,w,h,c,model)#(130,130,3)
+            all_imgs.append(img)
+        return all_imgs
+    margin = 5#网格图中间的内边距
+    n = 8
+    width = n * w + (n - 1) * margin#网格图的宽
+    height = n *h + (n - 1) * margin#网格图的高
+    all_imgs=get_filter_imgs(w,h,c,model)
+    # print(len(all_imgs))
+    stitched_filters = np.zeros((width, height,c))#能激活64个滤镜的图片
+    for i in range(n):
+        for j in range(n):
+            img = all_imgs[i * n + j]
+            stitched_filters[
+                (w + margin) * i : (w + margin) * i +w,
+                (h + margin) * j : (h + margin) * j+ h,
+                :,
+            ] = img
+    return stitched_filters
+
+def show_img(img):
+    plt.figure(figsize=(10,10))
+    plt.axis('off')
+    plt.tight_layout()
+    plt.imshow(img.astype('uint8'))
+    plt.show()
+
+path='../datasets/mnist.npz'
+with np.load(path) as data:
+    x_train=data['x_train']
+    y_train=data['y_train']
+    x_test=data['x_test']
+    y_test=data['y_test']
+print(x_train.shape,y_train.shape,x_test.shape,y_test.shape)
+
+x_train = x_train.astype("float32") / 255#转换数据到0-1,float32
+x_test = x_test.astype("float32") / 255
+
+x_train = np.expand_dims(x_train, -1)
+x_test = np.expand_dims(x_test, -1)
+
+num_classes = 10
+input_shape = (28, 28, 1)
+
+mnist_model = keras.Sequential(
+    [
+        keras.layers.Input(shape=input_shape),
+        keras.layers.Conv2D(64, kernel_size=(3, 3), activation="relu"),
+        keras.layers.Conv2D(64, kernel_size=(3, 3), activation="relu"),
+        keras.layers.MaxPooling2D(pool_size=(2, 2)),
+        keras.layers.Conv2D(128, kernel_size=(3, 3), activation="relu"),
+        keras.layers.Conv2D(128, kernel_size=(3, 3), activation="relu"),
+        keras.layers.MaxPooling2D(pool_size=(2, 2)),
+        keras.layers.Flatten(),
+        keras.layers.Dropout(0.5),
+        keras.layers.Dense(num_classes)
+    ]
+)
+
+batch_size = 128
+epochs = 20
+
+def run_model(model):
+    model.compile(
+    loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+    optimizer=keras.optimizers.Adam(learning_rate=1e-3),
+    metrics=[
+        keras.metrics.SparseCategoricalAccuracy(name="acc"),
+    ] )
+    callbacks = [ keras.callbacks.ModelCheckpoint(
+    filepath="./checkpoint/best_mnist_model_1.keras",\
+                   monitor='val_loss',save_best_only=True,mode='min'),\
+    keras.callbacks.EarlyStopping(monitor="val_loss", patience=2)#超过两次验证损失不减少就停止
+    ]
+    his=model.fit(
+    x_train,
+    y_train,
+    batch_size=batch_size,# 批次大小128
+    epochs=epochs,
+    validation_split=0.15,#会切割0.15的比例做验证集
+    callbacks=callbacks )
+    return his
+
+his=run_model(mnist_model)
+
+mnist_model.load_weights('./checkpoint/best_mnist_model_1.keras')
+# mnist_model.evaluate(x_test,y_test,verbose=2)
+
+def get_conv_filter_imgs(shape,model,layer_name):#获取指定模型的指定层的滤镜激活图
+    feature_extractor=keras.Model(model.inputs,model.get_layer(layer_name).output)
+    filter_imgs=get_filter_img_grid(shape,feature_extractor)
+    return filter_imgs
+
+layer_name='conv2d_1'
+
+mnist_filters=get_conv_filter_imgs((28,28,1),mnist_model,layer_name)
+
+print(mnist_filters.shape,mnist_filters.max(),mnist_filters.min())
+
+show_img(mnist_filters)
+layer_names=['conv2d','conv2d_1','conv2d_2','conv2d_3']
+
+def get_convs_filter_imgs(shape,model,layer_names):#获取指定模型的指定层的滤镜激活图
+    lst=[]
+    for name in layer_names:
+        feature_extractor=keras.Model(model.inputs,model.get_layer(name).output)
+        filter_imgs=get_filter_img_grid(shape,feature_extractor)
+        lst.append(filter_imgs)
+    return lst
+
+def show_imglst(display_list,col,row):
+    plt.figure(figsize=(col,row))
+    for i in range(len(display_list)):
+        plt.subplot(len(display_list),1,i+1)
+        plt.axis('off')
+        plt.imshow(display_list[i].astype('uint8'))
+    plt.tight_layout()
+    plt.show()
+
+imgs=get_convs_filter_imgs((28,28,1),mnist_model,layer_names)
+
+show_imglst(imgs,6,24)
+

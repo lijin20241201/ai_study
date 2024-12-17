@@ -1,0 +1,693 @@
+from functools import partial
+import os
+import sys
+import random
+import time
+
+from scipy import stats
+import numpy as np
+import paddle
+import paddle.nn.functional as F
+
+from paddlenlp.transformers import AutoModel, AutoTokenizer
+from paddlenlp.data import Stack, Tuple, Pad
+from paddlenlp.datasets import load_dataset
+from paddlenlp.transformers import LinearDecayWithWarmup
+from visualdl import LogWriter
+
+import paddle.nn as nn
+
+save_dir='./checkpoint'
+max_seq_length=60
+batch_size=8
+output_emb_size=256
+learning_rate=5e-5
+weight_decay=0.0
+epochs=1
+warmup_proportion=0.0
+init_from_ckpt=None
+seed=1000
+device='gpu'
+train_set_file='./datasets/yysy/recall/train_unsupervised_s.csv'
+test_set_file='./datasets/yysy/recall/dev.csv'
+margin=0.1
+scale=20
+dropout=0.2
+infer_with_fc_pooler=True
+model_name_or_path='rocketqa-zh-base-query-encoder'
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    paddle.seed(seed)
+
+paddle.set_device(device)
+
+set_seed(seed)
+
+writer=LogWriter(logdir="./log/yysy/recall_train")
+
+def read_simcse_text(data_path):
+    with open(data_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            data = line.rstrip()
+            yield {'text_a': data, 'text_b': data}
+
+train_ds = load_dataset(
+    read_simcse_text, data_path=train_set_file, lazy=False)
+
+pretrained_model = AutoModel.from_pretrained(
+       model_name_or_path,
+       hidden_dropout_prob=dropout,
+       attention_probs_dropout_prob=dropout)
+
+tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+
+def convert_example(example, tokenizer, max_seq_length=512, do_evalute=False):
+    result = []
+    for key, text in example.items():
+        if 'label' in key:
+            # do_evaluate
+            result += [example['label']]
+        else:
+            # do_train
+            encoded_inputs = tokenizer(text=text, max_seq_len=max_seq_length)
+            input_ids = encoded_inputs["input_ids"]
+            token_type_ids = encoded_inputs["token_type_ids"]
+            result += [input_ids, token_type_ids]
+    return result
+
+trans_func = partial(
+        convert_example,
+        tokenizer=tokenizer,
+        max_seq_length=max_seq_length)
+
+batchify_fn = lambda samples, fn=Tuple(
+    Pad(axis=0, pad_val=tokenizer.pad_token_id, dtype="int64"),  # query_input
+    Pad(axis=0, pad_val=tokenizer.pad_token_type_id, dtype="int64"),  # query_segment
+    Pad(axis=0, pad_val=tokenizer.pad_token_id, dtype="int64"),  # title_input
+    Pad(axis=0, pad_val=tokenizer.pad_token_type_id, dtype="int64"),  # tilte_segment
+): [data for data in fn(samples)]
+
+def create_dataloader(dataset,
+                      mode='train',
+                      batch_size=1,
+                      batchify_fn=None,
+                      trans_fn=None):
+    if trans_fn:
+        dataset = dataset.map(trans_fn)
+    shuffle = True if mode == 'train' else False
+    if mode == 'train':
+        batch_sampler = paddle.io.DistributedBatchSampler(dataset,
+                                                          batch_size=batch_size,
+                                                          shuffle=shuffle)
+    else:
+        batch_sampler = paddle.io.BatchSampler(dataset,
+                                               batch_size=batch_size,
+                                               shuffle=shuffle)
+
+    return paddle.io.DataLoader(dataset=dataset,
+                                batch_sampler=batch_sampler,
+                                collate_fn=batchify_fn,
+                                return_list=True)
+
+train_data_loader = create_dataloader(
+        train_ds,
+        mode='train',
+        batch_size=batch_size,
+        batchify_fn=batchify_fn,
+        trans_fn=trans_func)
+
+for i in train_data_loader:
+    print(i)
+    break
+
+class SimCSE(nn.Layer):
+    def __init__(self,
+                 pretrained_model,
+                 dropout=None,
+                 margin=0.0,
+                 scale=20,
+                 output_emb_size=None):
+        super().__init__()
+        self.ptm = pretrained_model
+        self.dropout = nn.Dropout(dropout if dropout is not None else 0.1)
+        self.output_emb_size = output_emb_size
+        if output_emb_size > 0:
+            weight_attr = paddle.ParamAttr(
+                initializer=paddle.nn.initializer.TruncatedNormal(std=0.02))
+            self.emb_reduce_linear = paddle.nn.Linear(768,
+                                                      output_emb_size,
+                                                      weight_attr=weight_attr)
+        self.margin = margin
+        # Used scaling cosine similarity to ease converge
+        self.sacle = scale
+
+    @paddle.jit.to_static(input_spec=[
+        paddle.static.InputSpec(shape=[None, None], dtype='int64'),
+        paddle.static.InputSpec(shape=[None, None], dtype='int64')
+    ])
+    def get_pooled_embedding(self,
+                             input_ids,
+                             token_type_ids=None,
+                             position_ids=None,
+                             attention_mask=None,
+                             with_pooler=True):
+
+        # Note: cls_embedding is poolerd embedding with act tanh
+        sequence_output, cls_embedding = self.ptm(input_ids, token_type_ids,
+                                                  position_ids, attention_mask)
+
+        if with_pooler == False:
+            cls_embedding = sequence_output[:, 0, :]
+
+        if self.output_emb_size > 0:
+            cls_embedding = self.emb_reduce_linear(cls_embedding)
+
+        cls_embedding = self.dropout(cls_embedding)
+        cls_embedding = F.normalize(cls_embedding, p=2, axis=-1)#语义向量单位化(n,d)
+
+        return cls_embedding
+
+    def get_semantic_embedding(self, data_loader):
+        self.eval()
+        with paddle.no_grad():
+            for batch_data in data_loader:
+                input_ids, token_type_ids = batch_data
+                input_ids = paddle.to_tensor(input_ids)
+                token_type_ids = paddle.to_tensor(token_type_ids)
+                text_embeddings = self.get_pooled_embedding(
+                    input_ids, token_type_ids=token_type_ids)
+
+                yield text_embeddings#(n,d)
+
+    def cosine_sim(self,
+                   query_input_ids,
+                   title_input_ids,
+                   query_token_type_ids=None,
+                   query_position_ids=None,
+                   query_attention_mask=None,
+                   title_token_type_ids=None,
+                   title_position_ids=None,
+                   title_attention_mask=None,
+                   with_pooler=True):
+        #(n,d)
+        query_cls_embedding = self.get_pooled_embedding(query_input_ids,
+                                                        query_token_type_ids,
+                                                        query_position_ids,
+                                                        query_attention_mask,
+                                                        with_pooler=with_pooler)
+        #(n,d)
+        title_cls_embedding = self.get_pooled_embedding(title_input_ids,
+                                                        title_token_type_ids,
+                                                        title_position_ids,
+                                                        title_attention_mask,
+                                                        with_pooler=with_pooler)
+        #(n,1),余弦相似
+        cosine_sim = paddle.sum(query_cls_embedding * title_cls_embedding,
+                                axis=-1)
+        return cosine_sim
+
+    def forward(self,
+                query_input_ids,
+                title_input_ids,
+                query_token_type_ids=None,
+                query_position_ids=None,
+                query_attention_mask=None,
+                title_token_type_ids=None,
+                title_position_ids=None,
+                title_attention_mask=None):
+
+        query_cls_embedding = self.get_pooled_embedding(query_input_ids,
+                                                        query_token_type_ids,
+                                                        query_position_ids,
+                                                        query_attention_mask)
+
+        title_cls_embedding = self.get_pooled_embedding(title_input_ids,
+                                                        title_token_type_ids,
+                                                        title_position_ids,
+                                                        title_attention_mask)
+        #（n,d）@(d,n)=(n,n)
+        cosine_sim = paddle.matmul(query_cls_embedding,
+                                   title_cls_embedding,
+                                   transpose_y=True)
+
+        # substract margin from all positive samples cosine_sim()
+        margin_diag = paddle.full(shape=[query_cls_embedding.shape[0]],
+                                  fill_value=self.margin,
+                                  dtype=paddle.get_default_dtype())
+
+        cosine_sim = cosine_sim - paddle.diag(margin_diag)#余弦相似
+        # scale cosine to ease training converge
+        cosine_sim *= self.sacle
+        labels = paddle.arange(0, query_cls_embedding.shape[0], dtype='int64')#0-batch_size
+        labels = paddle.reshape(labels, shape=[-1, 1])
+        loss = F.cross_entropy(input=cosine_sim, label=labels)
+        return loss
+
+model = SimCSE(
+        pretrained_model,
+        margin=margin,
+        scale=scale,
+        output_emb_size=output_emb_size)
+
+if init_from_ckpt and os.path.isfile(init_from_ckpt):
+        state_dict = paddle.load(init_from_ckpt)
+        model.set_dict(state_dict)
+        print("warmup from:{}".format(init_from_ckpt))
+
+model = paddle.DataParallel(model)
+
+num_training_steps = len(train_data_loader) * epochs
+
+lr_scheduler = LinearDecayWithWarmup(learning_rate, num_training_steps,
+                                     warmup_proportion)
+
+decay_params = [
+        p.name for n, p in model.named_parameters()
+        if not any(nd in n for nd in ["bias", "norm"])
+    ]
+optimizer = paddle.optimizer.AdamW(
+    learning_rate=lr_scheduler,
+    parameters=model.parameters(),
+    weight_decay=weight_decay,
+    apply_decay_param_fun=lambda x: x in decay_params)
+
+def train(model,dataloader,optimizer,scheduler,global_step):
+    model.train()
+    total_loss=0.
+    for step, batch in enumerate(dataloader, start=1):
+        query_input_ids, query_token_type_ids, title_input_ids, title_token_type_ids = batch
+        loss = model(
+            query_input_ids=query_input_ids,
+            title_input_ids=title_input_ids,
+            query_token_type_ids=query_token_type_ids,
+            title_token_type_ids=title_token_type_ids)
+        loss.backward()#反向传播
+        optimizer.step()#梯度更新
+        scheduler.step()#更新学习率
+        optimizer.clear_grad()#梯度归0
+        global_step += 1
+        total_loss += loss.item()
+        if global_step % 30 == 0 and global_step!=0:
+            print("global_step %d - batch: %d -loss: %.5f "
+                  %(global_step,step,loss.item()))
+    avg_loss=total_loss/len(dataloader)
+    return avg_loss,global_step
+
+def train_epochs(epochs,save_path):
+    global_step = 0#全局步
+    best_loss=float('inf')#最好的损失
+    for epoch in range(1,epochs+1):
+        avg_loss,global_step = train(model,train_data_loader,optimizer,\
+        lr_scheduler,global_step)
+        print("epoch:%d - global_step:%d - avg_loss: %.4f - best_loss: %.4f -lr:%.8f" \
+          % (epoch,global_step,avg_loss,best_loss,optimizer.get_lr()))
+        if avg_loss < best_loss:#avg_loss< best_loss才会更新保存模型
+            paddle.save(model.state_dict(),\
+                save_path+'yysy_recall_best_2.pdparams')
+            tokenizer.save_pretrained(save_path)
+            best_loss=avg_loss#更新best_loss
+
+save_dir=save_dir+'/yxsy/'
+if not os.path.exists(save_dir): os.makedirs(save_dir)
+
+train_epochs(epochs,save_dir)
+
+from functools import partial
+import os
+import sys
+import random
+import time
+
+import hnswlib
+
+import numpy as np
+import paddle
+import paddle.nn.functional as F
+from paddlenlp.transformers import AutoModel, AutoTokenizer
+from paddlenlp.data import Stack, Tuple, Pad
+from paddlenlp.datasets import load_dataset, MapDataset
+from paddlenlp.utils.log import logger
+import paddle.nn as nn
+
+device='gpu'
+
+paddle.set_device(device)
+
+model_name_or_path='rocketqa-zh-base-query-encoder'
+
+tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+
+max_seq_length=64
+
+def convert_example_test(example,
+                         tokenizer,
+                         max_seq_length=512,
+                         pad_to_max_seq_len=False):
+    result = []
+    for key, text in example.items():
+        encoded_inputs = tokenizer(text=text,
+                                   max_seq_len=max_seq_length,
+                                   pad_to_max_seq_len=pad_to_max_seq_len)
+        input_ids = encoded_inputs["input_ids"]
+        token_type_ids = encoded_inputs["token_type_ids"]
+        result += [input_ids, token_type_ids]
+    return result
+
+trans_func = partial(convert_example_test,
+                     tokenizer=tokenizer,
+                     max_seq_length=max_seq_length)
+
+batchify_fn = lambda samples, fn=Tuple(
+    Pad(axis=0, pad_val=tokenizer.pad_token_id, dtype="int64"
+        ),  # text_input
+    Pad(axis=0, pad_val=tokenizer.pad_token_type_id, dtype="int64"
+        ),  # text_segment
+): [data for data in fn(samples)]
+
+ pretrained_model = AutoModel.from_pretrained(model_name_or_path)
+
+output_emb_size=256
+
+class SimCSE(nn.Layer):
+    def __init__(self,
+                 pretrained_model,
+                 dropout=None,
+                 margin=0.0,
+                 scale=20,
+                 output_emb_size=None):
+        super().__init__()
+        self.ptm = pretrained_model
+        self.dropout = nn.Dropout(dropout if dropout is not None else 0.1)
+        # if output_emb_size is greater than 0, then add Linear layer to reduce embedding_size,
+        # we recommend set output_emb_size = 256 considering the trade-off beteween
+        # recall performance and efficiency
+        self.output_emb_size = output_emb_size
+        if output_emb_size > 0:
+            weight_attr = paddle.ParamAttr(
+                initializer=paddle.nn.initializer.TruncatedNormal(std=0.02))
+            self.emb_reduce_linear = paddle.nn.Linear(768,
+                                                      output_emb_size,
+                                                      weight_attr=weight_attr)
+
+        self.margin = margin
+        # Used scaling cosine similarity to ease converge
+        self.sacle = scale
+
+    @paddle.jit.to_static(input_spec=[
+        paddle.static.InputSpec(shape=[None, None], dtype='int64'),
+        paddle.static.InputSpec(shape=[None, None], dtype='int64')
+    ])
+    def get_pooled_embedding(self,
+                             input_ids,
+                             token_type_ids=None,
+                             position_ids=None,
+                             attention_mask=None,
+                             with_pooler=True):
+
+        # Note: cls_embedding is poolerd embedding with act tanh
+        sequence_output, cls_embedding = self.ptm(input_ids, token_type_ids,
+                                                  position_ids, attention_mask)
+
+        if with_pooler == False:
+            cls_embedding = sequence_output[:, 0, :]
+
+        if self.output_emb_size > 0:
+            cls_embedding = self.emb_reduce_linear(cls_embedding)
+
+        cls_embedding = self.dropout(cls_embedding)
+        cls_embedding = F.normalize(cls_embedding, p=2, axis=-1)
+
+        return cls_embedding
+
+    def get_semantic_embedding(self, data_loader):
+        self.eval()
+        with paddle.no_grad():
+            for batch_data in data_loader:
+                input_ids, token_type_ids = batch_data
+                input_ids = paddle.to_tensor(input_ids)
+                token_type_ids = paddle.to_tensor(token_type_ids)
+
+                text_embeddings = self.get_pooled_embedding(
+                    input_ids, token_type_ids=token_type_ids)
+
+                yield text_embeddings
+
+    def cosine_sim(self,
+                   query_input_ids,
+                   title_input_ids,
+                   query_token_type_ids=None,
+                   query_position_ids=None,
+                   query_attention_mask=None,
+                   title_token_type_ids=None,
+                   title_position_ids=None,
+                   title_attention_mask=None,
+                   with_pooler=True):
+
+        query_cls_embedding = self.get_pooled_embedding(query_input_ids,
+                                                        query_token_type_ids,
+                                                        query_position_ids,
+                                                        query_attention_mask,
+                                                        with_pooler=with_pooler)
+
+        title_cls_embedding = self.get_pooled_embedding(title_input_ids,
+                                                        title_token_type_ids,
+                                                        title_position_ids,
+                                                        title_attention_mask,
+                                                        with_pooler=with_pooler)
+
+        cosine_sim = paddle.sum(query_cls_embedding * title_cls_embedding,
+                                axis=-1)
+        return cosine_sim
+
+    def forward(self,
+                query_input_ids,
+                title_input_ids,
+                query_token_type_ids=None,
+                query_position_ids=None,
+                query_attention_mask=None,
+                title_token_type_ids=None,
+                title_position_ids=None,
+                title_attention_mask=None):
+
+        query_cls_embedding = self.get_pooled_embedding(query_input_ids,
+                                                        query_token_type_ids,
+                                                        query_position_ids,
+                                                        query_attention_mask)
+
+        title_cls_embedding = self.get_pooled_embedding(title_input_ids,
+                                                        title_token_type_ids,
+                                                        title_position_ids,
+                                                        title_attention_mask)
+
+        cosine_sim = paddle.matmul(query_cls_embedding,
+                                   title_cls_embedding,
+                                   transpose_y=True)
+
+        # substract margin from all positive samples cosine_sim()
+        margin_diag = paddle.full(shape=[query_cls_embedding.shape[0]],
+                                  fill_value=self.margin,
+                                  dtype=paddle.get_default_dtype())
+
+        cosine_sim = cosine_sim - paddle.diag(margin_diag)
+
+        # scale cosine to ease training converge
+        cosine_sim *= self.sacle
+
+        labels = paddle.arange(0, query_cls_embedding.shape[0], dtype='int64')
+        labels = paddle.reshape(labels, shape=[-1, 1])
+
+        loss = F.cross_entropy(input=cosine_sim, label=labels)
+
+        return loss
+
+model = SimCSE(pretrained_model, output_emb_size=output_emb_size)
+
+ model = paddle.DataParallel(model)
+
+params_path='./checkpoint/bd_paddle_yysy/model_state.pdparams'
+
+if  params_path and os.path.isfile(params_path):
+    state_dict = paddle.load(params_path)
+    model.set_dict(state_dict)
+    logger.info("Loaded parameters from %s" % params_path)
+else:
+    raise ValueError(
+        "Please set --params_path with correct pretrained model file")
+
+corpus_file='./datasets/yysy/recall/corpus_s.csv'
+
+def gen_id2corpus(corpus_file):
+    id2corpus = {}
+    with open(corpus_file, 'r', encoding='utf-8') as f:
+        for idx, line in enumerate(f):
+            id2corpus[idx] = line.rstrip()
+    return id2corpus
+
+ id2corpus = gen_id2corpus(corpus_file)
+
+[{k:v} for k,v in id2corpus.items()][:3]
+
+corpus_list = [{idx: text} for idx, text in id2corpus.items()]
+
+  corpus_ds = MapDataset(corpus_list)
+
+batch_size=128
+
+def create_dataloader(dataset,
+                      mode='train',
+                      batch_size=1,
+                      batchify_fn=None,
+                      trans_fn=None):
+    if trans_fn:
+        dataset = dataset.map(trans_fn)
+
+    shuffle = True if mode == 'train' else False
+    if mode == 'train':
+        batch_sampler = paddle.io.DistributedBatchSampler(dataset,
+                                                          batch_size=batch_size,
+                                                          shuffle=shuffle)
+    else:
+        batch_sampler = paddle.io.BatchSampler(dataset,
+                                               batch_size=batch_size,
+                                               shuffle=shuffle)
+
+    return paddle.io.DataLoader(dataset=dataset,
+                                batch_sampler=batch_sampler,
+                                collate_fn=batchify_fn,
+                                return_list=True)
+
+corpus_data_loader = create_dataloader(corpus_ds,
+                                       mode='predict',
+                                       batch_size=batch_size,
+                                       batchify_fn=batchify_fn,
+                                       trans_fn=trans_func)
+
+for i in corpus_data_loader:
+    print(i)
+    break
+
+inner_model = model._layers
+
+hnsw_max_elements=1000000
+hnsw_ef=100
+hnsw_m=100
+
+def build_index(data_loader, model):
+    index = hnswlib.Index(space='ip', dim=output_emb_size)
+    index.init_index(max_elements=hnsw_max_elements,
+                     ef_construction=hnsw_ef,
+                     M=hnsw_m)
+    index.set_ef(hnsw_ef)
+    index.set_num_threads(8)
+    logger.info("start build index..........")
+    all_embeddings = []
+    for text_embeddings in model.get_semantic_embedding(data_loader):
+        all_embeddings.append(text_embeddings.numpy())
+    all_embeddings = np.concatenate(all_embeddings, axis=0)
+    index.add_items(all_embeddings)
+    logger.info("Total index number:{}".format(index.get_current_count()))
+    return index
+
+final_index = build_index(corpus_data_loader, inner_model)
+
+similar_text_pair_file='./datasets/yysy/recall/dev_s.csv'
+
+def gen_text_file(similar_text_pair_file):
+    text2similar_text = {}# 文本到相似文本
+    texts = []
+    with open(similar_text_pair_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            splited_line = line.rstrip().split("\t")
+            if len(splited_line) != 2:
+                continue
+            text, similar_text =  splited_line
+            if not text or not similar_text:
+                continue
+            text2similar_text[text] = similar_text
+            texts.append({"text": text})
+    return texts, text2similar_text
+
+text_list, text2similar_text = gen_text_file(similar_text_pair_file)
+
+query_ds = MapDataset(text_list)
+
+query_ds[100:110]
+
+query_data_loader = create_dataloader(query_ds,
+                                      mode='predict',
+                                      batch_size=batch_size,
+                                      batchify_fn=batchify_fn,
+                                      trans_fn=trans_func)
+
+query_embedding = inner_model.get_semantic_embedding(query_data_loader)
+
+recall_result_dir='recall_result_dir'
+
+if not os.path.exists(recall_result_dir):
+    os.mkdir(recall_result_dir)
+
+recall_result_file='yysy_recall_result.txt'
+
+recall_result_file = os.path.join(recall_result_dir,
+                                      recall_result_file)
+
+recall_num=50
+
+with open(recall_result_file, 'w', encoding='utf-8') as f:
+    for batch_index, batch_query_embedding in enumerate(query_embedding):
+        recalled_idx, cosine_sims = final_index.knn_query(
+            batch_query_embedding.numpy(), recall_num)
+        batch_size = len(cosine_sims)
+        for row_index in range(batch_size):
+            text_index = batch_size * batch_index + row_index
+            for idx, doc_idx in enumerate(recalled_idx[row_index]):
+                f.write("{}\t{}\t{}\n".format(
+                    text_list[text_index]["text"], id2corpus[doc_idx],
+                    1.0 - cosine_sims[row_index][idx]))
+
+recall_result_file='./recall_result_dir/yysy_recall_result.txt'
+
+similar_text_pair='./datasets/yysy/recall/dev_s.csv'
+
+recall_num=50
+
+def recall(rs, N=10):
+    recall_flags = [np.sum(r[0:N]) for r in rs]
+    return np.mean(recall_flags)
+
+text2similar = {}
+with open(similar_text_pair, 'r', encoding='utf-8') as f:
+    for line in f:
+        text, similar_text = line.rstrip().split("\t")#文本，相似文本
+        text2similar[text] = similar_text
+
+[{k,v} for k,v in text2similar.items()][:3]
+
+rs = []
+with open(recall_result_file, 'r', encoding='utf-8') as f:
+    relevance_labels = []#存放每一批的召回标记,如果召回到标记1,否则0
+    for index, line in enumerate(f):
+        if index % recall_num == 0 and index != 0:#够召回数的话，就继续下一个查询文本的召回
+            rs.append(relevance_labels)
+            relevance_labels = []
+        text, recalled_text, cosine_sim = line.rstrip().split("\t")
+        if text2similar[text] == recalled_text:
+            relevance_labels.append(1)
+        else:
+            relevance_labels.append(0)
+
+recall_N = []
+recall_num = [1, 5, 10, 20, 50]
+# result = open('./recall_result_dir/yysy_recallN_result.tsv', 'a')
+res = []
+for topN in recall_num:
+    R = round(100 * recall(rs, N=topN), 3)
+    # print(R)
+    recall_N.append(str(R))
+for key, val in zip(recall_num, recall_N):
+    print('recall@{}={}'.format(key, val))
+    res.append(str(val))
+# result.write('\t'.join(res) + '\n')
+# result.close()

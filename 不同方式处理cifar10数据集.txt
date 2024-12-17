@@ -1,0 +1,413 @@
+这些方式都轻轻松松获取85%以上的测试准确率
+
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ["KERAS_BACKEND"] = "tensorflow"
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
+import keras
+from keras import layers
+import matplotlib.pyplot as plt
+import tensorflow as tf
+import numpy as np
+
+learning_rate = 2e-3
+weight_decay = 1e-4
+batch_size = 128
+num_epochs = 10
+
+(x_train, y_train), (x_test, y_test) = keras.datasets.cifar10.load_data()
+
+print(x_train.shape,y_train.shape,x_train.max(),x_test.shape)
+
+val_split = 0.1
+
+print(x_train.max(),x_train.min(),np.unique(y_train))
+
+plt.figure(figsize=(15,15),dpi=100)
+for i in range(64):
+    plt.subplot(8,8,i+1)
+    plt.xticks([])
+    plt.yticks([])
+    plt.xlabel(y_train[i])
+    plt.imshow(x_train[i])
+
+val_indices = int(len(x_train) * val_split)
+
+new_x_train, new_y_train = x_train[val_indices:], y_train[val_indices:]
+
+x_val, y_val = x_train[:val_indices], y_train[:val_indices]
+
+image_size = 32
+auto = tf.data.AUTOTUNE
+augmentation_layers = [
+    # keras.layers.Resizing(34,34),
+    keras.layers.RandomCrop(image_size, image_size),#随机裁剪
+    keras.layers.RandomFlip("horizontal"),#随机水平翻转
+    # keras.layers.RandomRotation(0.06),#随机旋转
+    # keras.layers.RandomZoom(0.06)#随机缩放
+]
+def augment_images(images):
+    for layer in augmentation_layers:#连续处理images
+        images = layer(images, training=True)
+    return images
+#构造数据集,对于train,刷新,构建批次,应用数据增强,对于其他,只构建批次    
+def make_datasets(images, labels, is_train=False):
+    dataset = tf.data.Dataset.from_tensor_slices((images, labels))
+    if is_train:
+        dataset = dataset.shuffle(batch_size * 20)
+    dataset = dataset.batch(batch_size)
+    if is_train:
+        dataset = dataset.map(
+            lambda x, y: (augment_images(x), y), num_parallel_calls=auto
+        )
+    return dataset.prefetch(auto)
+train_dataset = make_datasets(new_x_train, new_y_train, is_train=True)
+val_dataset = make_datasets(x_val, y_val)
+test_dataset = make_datasets(x_test, y_test)
+
+for images,labels in train_dataset.take(1):
+    print(images.shape,images.numpy().max(),images.numpy().min())
+    images=images.numpy()
+    images=np.clip(images,0,255).astype('uint8')
+    plt.figure(figsize=(12,12))
+    for i in range(9):
+        plt.subplot(3,3,i+1)
+        plt.imshow(images[i])
+        plt.axis('off')
+plt.show()
+
+# kernel_size=patch_size：定义了卷积核的大小，这个大小决定了每次卷积操作覆盖的区域。
+# strides=patch_size：定义了卷积核在输入数据上滑动的步长。由于步长设置为 patch_size，
+# # 每次卷积操作后，输出特征图在宽度和高度上都会减少 patch_size 个单位。
+# 因此，当这个卷积层应用到输入图像 x 上时，它会将图像分割成大小为 patch_size x patch_size 的块，
+# 并将这些块作为输出特征图的一部分。由于步长设置得与卷积核大小相同，输出特征图在空间维度上（宽度和高度）
+# 会大大减小，每个输出特征都对应于输入图像中的一个不重叠的块。
+
+def activation_block(x):#激活函数,批次标准化块
+    x = layers.Activation("gelu")(x)#gelu与relu不同,gelu允许负值存在
+    return layers.BatchNormalization()(x)
+#卷积块
+def conv_stem(x, filters: int, patch_size: int):
+    x = layers.Conv2D(filters, kernel_size=patch_size, strides=patch_size)(x)
+    return activation_block(x)
+
+# 深度卷积（Depthwise Convolution）
+# 假设输入特征图的形状为 (height, width, channels)，其中 height 和 width 是特征图的高和宽，channels 是通道数。
+# 在深度卷积中，每个输入通道都会与一个独立的卷积核进行卷积。
+# 权重（w）的形状
+#     对于每个输入通道，都会有一个对应的（卷积核高度，卷积核宽度）的卷积核。
+#     如果卷积核的大小是 (kernel_height, kernel_width)，那么每个卷积核的形状就是 (kernel_height, kernel_width, 1)。
+#     由于有 channels 个输入通道，所以整个深度卷积层的权重形状是 (kernel_height, kernel_width, channels)。
+#     注意这里没有输出通道数的维度，因为深度卷积不会改变通道数（除非使用 depth_multiplier）。
+# 偏置（b）的形状
+#     偏置的数量与输出通道数相同，在深度卷积中输出通道数等于输入通道数（除非使用 depth_multiplier）。
+#     因此，偏置的形状是 (channels,)，即一个一维向量，长度等于输入通道数。
+# 普通卷积（Standard Convolution）
+# 在普通卷积中，每个输出通道都是由所有输入通道经过卷积运算并混合得到的。
+# 权重（w）的形状
+#     对于每个输出通道，都会有一个对应的卷积核，这个卷积核的深度与输入通道数相匹配。
+#     如果卷积核的大小是 (kernel_height, kernel_width)，输出通道数是 output_channels，那么每个卷积核的形状就是
+#     (kernel_height, kernel_width, channels)。
+#     整个普通卷积层的权重形状则是 (output_channels, kernel_height, kernel_width, channels)。这是一个四维张量，
+#     其中第一个维度是输出通道数。
+# 偏置（b）的形状
+#     与深度卷积相同，偏置的数量与输出通道数相同。
+#     因此，偏置的形状是 (output_channels,)，即一个一维向量，长度等于输出通道数。
+
+#这个conv_mixer_block函数定义了一个包含深度可分离卷积（depthwise separable convolution）的块。
+# 深度可分离卷积由两部分组成：深度卷积（depthwise convolution）和逐点卷积（pointwise convolution）
+# 使用layers.Conv2D层进行逐点卷积，其中kernel_size=1意味着卷积核的大小为1x1。这种卷积的目的是改变通道数，
+# 将深度卷积的输出转换为所需的filters数量。
+def conv_mixer_block(x, filters: int, kernel_size: int):
+    x0 = x#这个是浅拷贝,每次残差连接的对象是前一次处理后的x
+    # Depthwise convolution.
+    #深度卷积,这个是捕捉像素间的位置信息,每个通道卷积核不同,每个卷积核的形状是(k_size,k_size,1),每个卷积核处理一个通道
+    x = layers.DepthwiseConv2D(kernel_size=kernel_size, padding="same")(x)#这里的x指向的是新的内存空间
+    x = layers.Add()([activation_block(x), x0]) # 残差连接,对应位置数据相加
+    # 逐点卷积,这个捕捉像素间的空间信息,线性运算
+    x = layers.Conv2D(filters, kernel_size=1)(x)
+    x = activation_block(x)
+    return x
+
+sample=x_train[0]/255
+
+sample=np.expand_dims(sample,0)
+
+print(sample.shape,sample.max(),sample.min())
+
+aa=layers.Conv2D(32,2,2)(sample)
+
+print(aa.shape,aa.numpy().max(),aa.numpy().min())
+
+plt.figure(figsize=(15,15))
+for i in range(64):
+    plt.subplot(8,8,i+1)
+    plt.axis('off')
+    plt.imshow(np.clip(nn[0,:,:,i],0,1))
+
+# 使用的模型称为 ConvMixer-256/8，其中256 表示 通道数和8表示深度。生成的模型只有 80 万 参数
+def get_conv_mixer_256_8(
+    image_size=32, filters=256, depth=8, kernel_size=5, patch_size=2, num_classes=10
+):
+    inputs = keras.Input((image_size, image_size, 3))
+    x = layers.Rescaling(scale=1.0 / 255)(inputs)#0-1归一化
+    #卷积块处理(如果步长和卷积核大小相同,卷积操作就相当于把图像进行了分块
+    x = conv_stem(x, filters, patch_size)
+    # 可分离卷积块处理,重复利用8次
+    for _ in range(depth):#每次都会经过激活标准化块处理
+        x = conv_mixer_block(x, filters, kernel_size)
+    # 分类块
+    x = layers.GlobalAvgPool2D()(x)#全局平均池化,可以把特征图的特征归一汇总
+    x=layers.Dropout(0.5)(x)
+    logits = layers.Dense(num_classes)(x)
+    return keras.Model(inputs,logits)
+
+def run_experiment(model):
+    optimizer = keras.optimizers.AdamW(
+        learning_rate=learning_rate, weight_decay=weight_decay
+    )
+    model.compile(
+        optimizer=optimizer,#优化器,带权重衰减
+        loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),#标签做了独热编码
+        metrics=[
+        keras.metrics.SparseCategoricalAccuracy(name="acc"),#准确率
+    ]
+    )
+    checkpoint_filepath = "./checkpoint/best_convmixer.keras"
+    callbacks = [ keras.callbacks.ModelCheckpoint(
+    filepath=checkpoint_filepath,monitor='val_loss',\
+        verbose=1,save_best_only=True,mode='min'),
+    keras.callbacks.EarlyStopping(monitor="val_loss", patience=4),#超过四次验证损失不减少就停止
+    ReduceLROnPlateau(monitor='val_loss', factor=0.5,  
+                               patience=2, min_lr=1e-5)
+]
+    history = model.fit(
+        train_dataset,
+        validation_data=val_dataset,
+        epochs=30,
+        callbacks=[callbacks]
+    )
+    return history, model
+
+conv_mixer_model = get_conv_mixer_256_8()
+
+#2*2*3*256+256,5*5*1*256+256,256*256+256
+conv_mixer_model.summary()
+
+history, conv_mixer_model = run_experiment(conv_mixer_model)
+
+conv_mixer_model=keras.models.load_model('./checkpoint/best_convmixer.keras')
+_, accuracy = conv_mixer_model.evaluate(test_dataset)
+print(f"Test accuracy: {round(accuracy * 100, 2)}%")
+
+#使用普通的卷积池化
+def get_conv_pooling(image_size=32, num_classes=10):
+    inputs = keras.Input((image_size, image_size, 3))
+    x = layers.Rescaling(scale=1.0 / 255)(inputs)#0-1归一化
+    for filter_ in (64,128,256):
+        x=layers.BatchNormalization()(x)
+        x=layers.Conv2D(filter_,3,padding='same',activation='gelu')(x)
+        x=layers.Conv2D(filter_,3,padding='same',activation='gelu')(x)
+        x=layers.MaxPool2D()(x)
+    x=layers.Flatten()(x)
+    x=layers.Dropout(0.5)(x)
+    x=layers.Dense(256,activation='relu')(x)
+    logits = layers.Dense(num_classes)(x)
+    return keras.Model(inputs,logits) 
+
+def run_experiment_2(model):
+    optimizer = keras.optimizers.AdamW(
+        learning_rate=learning_rate, weight_decay=weight_decay
+    )
+    model.compile(
+        optimizer=optimizer,
+        loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        metrics=[
+        keras.metrics.SparseCategoricalAccuracy(name="acc"),
+    ]
+    )
+    checkpoint_filepath = "./checkpoint/best_convmixer_2.keras"
+    callbacks = [ keras.callbacks.ModelCheckpoint(
+    filepath=checkpoint_filepath,monitor='val_loss',\
+        verbose=1,save_best_only=True,mode='min'),
+    keras.callbacks.EarlyStopping(monitor="val_loss", patience=4),#超过三次验证损失不减少就停止
+    ReduceLROnPlateau(monitor='val_loss', factor=0.5,  
+                               patience=2, min_lr=1e-5)
+]
+    history = model.fit(
+        train_dataset,
+        validation_data=val_dataset,
+        epochs=30,
+        callbacks=[callbacks]
+    )
+    return history, model
+
+history,model2 = run_experiment_2(model2)
+
+model2.load_weights('./checkpoint/best_convmixer_2.keras')
+_, accuracy = model2.evaluate(test_dataset)
+print("Test accuracy: %.2f" %(accuracy))
+def get_conv_mixer_2(
+    image_size=32, depth=4, kernel_size=5, patch_size=2, num_classes=10):
+    inputs = keras.Input((image_size, image_size, 3))
+    x = layers.Rescaling(scale=1.0 / 255)(inputs)#0-1归一化
+    #卷积块处理(如果步长和卷积核大小相同,卷积操作就相当于把图像进行了分块
+    x = conv_stem(x,256,patch_size)
+    # 可分离卷积块处理,重复利用4次
+    for _ in range(depth):
+        x = conv_mixer_block(x, 256, kernel_size)
+    x = conv_stem(x,512,patch_size)
+    for _ in range(depth):
+        x = conv_mixer_block(x,512,kernel_size)
+    x=layers.Flatten()(x)
+    x=layers.Dropout(0.5)(x)
+    x=layers.Dense(256,activation='relu')(x)
+    logits = layers.Dense(num_classes)(x)
+    return keras.Model(inputs,logits)
+
+model3=get_conv_mixer_2()
+
+
+model3.summary()
+
+hist,model3 = run_experiment_2(model3)
+
+model3.load_weights('./checkpoint/best_convmixer_3.keras')
+_, accuracy = model3.evaluate(test_dataset)
+print("Test accuracy: %.2f %%" %(accuracy))
+
+def run_experiment_3(model):
+    optimizer = keras.optimizers.AdamW(
+        learning_rate=learning_rate, weight_decay=weight_decay
+    )
+    model.compile(
+        optimizer=optimizer,
+        loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        metrics=[
+        keras.metrics.SparseCategoricalAccuracy(name="acc"),
+    ]
+    )
+    checkpoint_filepath = "./checkpoint/best_convmixer_5.keras"
+    callbacks = [ keras.callbacks.ModelCheckpoint(
+    filepath=checkpoint_filepath,monitor='val_loss',\
+        verbose=1,save_best_only=True,mode='min'),
+    keras.callbacks.EarlyStopping(monitor="val_loss", patience=3),#超过三次验证损失不减少就停止
+    ReduceLROnPlateau(monitor='val_loss', factor=0.5,  
+                               patience=1, min_lr=5e-6)
+]
+    history = model.fit(
+        train_dataset,
+        validation_data=val_dataset,
+        epochs=30,
+        callbacks=[callbacks]
+    )
+    return history, model
+
+def get_conv_mixer_3(
+    image_size=32, depth=4, kernel_size=5, patch_size=2, num_classes=10):
+    inputs = keras.Input((image_size, image_size, 3))
+    x = layers.Rescaling(scale=1.0 / 255)(inputs)#0-1归一化
+    #卷积块处理(如果步长和卷积核大小相同,卷积操作就相当于把图像进行了分块
+    x = conv_stem(x,256,patch_size)
+    # 可分离卷积块处理,重复利用4次
+    for _ in range(depth):
+        x = conv_mixer_block(x, 256, kernel_size)
+    x = conv_stem(x,512,patch_size)
+    for _ in range(depth):
+        x = conv_mixer_block(x,512,kernel_size)
+    x=layers.GlobalAveragePooling2D()(x)
+    x=layers.Dropout(0.5)(x)
+    logits = layers.Dense(num_classes)(x)
+    return keras.Model(inputs,logits)
+
+model4=get_conv_mixer_3()
+
+hist_,model4=run_experiment_3(model4)
+
+model4.load_weights('./checkpoint/best_convmixer_4.keras')
+_, acc= model4.evaluate(test_dataset)
+print("Test accuracy: %.2f %%" %(acc))
+
+def conv_mixer_block_2(x, filters: int, kernel_size: int):
+    x0 = x
+    x = layers.DepthwiseConv2D(kernel_size=kernel_size, padding="same")(x)#这里的x指向的是新的内存空间
+    # 逐点卷积,这个捕捉像素间的空间信息,线性运算
+    x = layers.Conv2D(filters, kernel_size=1)(x)
+    x = layers.Add()([activation_block(x), x0]) # 残差连接,对应位置数据相加
+    x = activation_block(x)
+    return x
+
+def get_conv_mixer_256_8_2(
+    image_size=32, filters=256, depth=8, kernel_size=5, patch_size=2, num_classes=10
+):
+    inputs = keras.Input((image_size, image_size, 3))
+    x = layers.Rescaling(scale=1.0 / 255)(inputs)#0-1归一化
+    #卷积块处理(如果步长和卷积核大小相同,卷积操作就相当于把图像进行了分块
+    x = conv_stem(x, filters, patch_size)
+    # 可分离卷积块处理,重复利用8次
+    for _ in range(depth):#每次都会经过激活标准化块处理
+        x = conv_mixer_block_2(x, filters, kernel_size)
+    # 分类块
+    x = layers.GlobalAvgPool2D()(x)#全局平均池化,可以把特征图的特征归一汇总
+    x=layers.Dropout(0.5)(x)
+    logits = layers.Dense(num_classes)(x)
+    return keras.Model(inputs,logits)
+
+model5=get_conv_mixer_256_8_2()
+
+model5.summary()
+
+hi_,model5=run_experiment_3(model5)
+
+#只有把各个参数搞清楚,才证明你有点懂了,2*2*3*256+256,每个卷积层内部是w和b,在这里
+#w形状会是(k_size,k_size,deep_in),每个卷积的参数个数其实是这个权重w的元素个数k_size*k_size*deep_in
+#这里的deep_in就是这个卷积层之前的通道数(在这里是3),但是k_size*k_size*deep_in只是一个卷积的参数个数
+#最后还要乘于256,才是这个卷积层整体的w参数个数,但是还有一个b,一个卷积核一个b,最后还要加上256,
+# 至于batch_norm参数为啥1024,256*4=1024,但是batch_norm它可训练的参数是512,不可训练的也是一半,
+#depthwise_conv2d_5,5*5*1*256+256,每个通道都用不同的卷积核,核权重是(k_height,k_width,1)
+# conv_mixer_model.summary()
+
+# 可视化卷积权重
+def visualization_plot(weights, idx=1):
+    # print(weights.shape,weights.max(),weights.min())
+    # 做了min-max归一化
+    p_min, p_max = weights.min(), weights.max()
+    weights = (weights - p_min) / (p_max - p_min)
+    # Visualize all the filters.
+    num_filters = 256
+    plt.figure(figsize=(10, 10))
+    for i in range(num_filters):
+        current_weight = weights[:, :, :, i]#当前的通道,256(特征)
+        # print(f'{current_weight.shape=}')#(2,2,3)
+        if current_weight.shape[-1] == 1:#
+            current_weight = current_weight.squeeze()#紧凑维度
+        ax = plt.subplot(16, 16,i+1)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        plt.imshow(current_weight)
+# 获取的是w,(2,2,3,256),2,2代表核,3代表输入通道(特征),256代表输出的通道(特征)
+#每个卷积权重中每个通道的权重都不一样,对于一张(32,32,3)的图像,(32,32)共用一个(2,2)的权重
+#一个卷积一次扫描所有输入通道
+patch_embeddings = conv_mixer_model.layers[2].get_weights()[0]
+visualization_plot(patch_embeddings)
+
+for i, layer in enumerate(conv_mixer_model.layers):
+    if isinstance(layer, layers.DepthwiseConv2D):
+        if layer.get_config()["kernel_size"] == (5, 5):
+            print(i, layer)
+
+conv_mixer_model.layers[26].get_weights()[0].shape
+
+idx = 26  # Taking a kernel from the middle of the network.
+#(5, 5, 256, 1)#输入深度256,输出1
+# 256 表示卷积核的深度，也就是输入通道的数量。这意味着对于256个输入通道，每个通道都有一个独立的(5, 5)卷积核
+#1 表示输出的通道数。在深度可分离卷积中，这一步通常被称为“深度卷积”或“depthwise convolution”，因为它对每个输入通道独立进行空间卷积。
+kernel = conv_mixer_model.layers[idx].get_weights()[0]
+# print(f'{kernel.shape=}')#(5,5,256,1)
+kernel = np.expand_dims(kernel.squeeze(), axis=2)
+print(kernel.shape)
+visualization_plot(kernel)#可视化深度卷积
+
+len(conv_mixer_model.layers)
+

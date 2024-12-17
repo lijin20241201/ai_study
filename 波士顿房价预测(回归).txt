@@ -1,0 +1,203 @@
+import keras as ks
+import numpy as np
+from keras.datasets import boston_housing
+#下载训练和测试数据,boston房价预测,训练数据404个样本房子,每个房子13个特征
+# 每个房子都对应13个特征数据,有加分的特征数据,有减分的特征数据
+#一般分类用label标签命名训练和测试数据,回归用target目标命名
+(train_data,train_target),(test_data,test_target)=boston_housing.load_data()
+# 波士顿房价目标值是连续型的,所以不能用分类方法,应该用回归,最小二乘法
+display(type(train_data),train_data[:1],test_data.shape,train_target.shape,test_target.shape,len(np.unique(train_target)))
+np.set_printoptions(suppress=True)
+a=train_data[:3].mean(axis=0)
+print(train_data[:3],a)
+#对数据处理,标准化
+#训练数据在0坐标轴的期望(就是平均值)
+mean=train_data.mean(axis=0)
+#在0轴的标准差(每个值和期望的差的平方再求平均值),之后开方
+std=train_data.std(axis=0)
+train_data-=mean
+train_data/=std
+#注意,测试数据用的是训练数据的平均值和标准差,至于为何不用测试数据
+#自己的平均值和标准差,我的理解是测试数据量太少,只有100多笔,
+#用那么少的资料得到的均值和标准差是不准确的,虽然训练数据也少
+#但是相对来说,算多了
+test_data-=mean
+test_data/=std
+from keras import models
+from keras import layers
+#创建模型
+def get_model():
+    model=models.Sequential()
+    #64个神经元,隐层一,激活函数relu,test_data.shape[1],shape中的0索引,是样本数,1是13个特征
+    # 我们只要告诉输入是13个特征就好
+    model.add(layers.Dense(64,activation='relu',input_shape=(train_data.shape[1],)))
+    #64个神经元,隐层二,激活函数relu
+    model.add(layers.Dense(64,activation='relu'))
+    #回归问题,最后一层只需要一个神经元,不需要非线性函数转化为概率
+    model.add(layers.Dense(1))
+    # 参数:优化器,一阶导数,之后调和平均,损失函数:误差平方均数,mae:绝对值误差均值
+    # 回归问题,别用acc,这个是准确率,回归哪来的准确率
+    model.compile(optimizer='RMSProp',loss='mse',metrics=['mae'])
+    return model
+# k-fold validation
+# 因为训练数据太少,这里把训练数据分成四份,
+#每次切割位置不同,所以就有四次,
+#又不能打乱,因为打乱的话,每次验证集就有重复的
+# 之后用分割的训练数据训练,之后评估验证集
+np.set_printoptions(suppress=True)
+k=4
+#整除,不整除会有小数
+mcqg=train_data.shape[0]//k
+#存的是绝对值误差
+maes=[]
+EPOCHS=100
+#把训练数据分4份,验证集1份,训练集3份
+#一共四种切割法
+for i in range(k):
+    print('i;',i)
+    #验证特征数据
+    val_data=train_data[i*mcqg:(i+1)*mcqg]
+    #训练特征数据
+    xl_data=np.vstack((train_data[:i*mcqg],train_data[(i+1)*mcqg:]))
+    print('val_data:',val_data.shape)
+    print('-------xl_data:',xl_data.shape)
+    # 验证目标数据
+    val_target=train_target[i*mcqg:(i+1)*mcqg]
+    display(train_target[:i*mcqg].shape,train_target[(i+1)*mcqg:].shape)
+    #训练目标数据,因为目标数据是1维的ndarray,垂直拼接形状不一样,那就水平拼接
+    #目标数据只有一列,横着连和竖着连一样的
+    xl_target=np.hstack((train_target[:i*mcqg],train_target[(i+1)*mcqg:]))
+    print('----val_target:',val_target)
+    print('-------xl_target:',xl_target)
+    model=get_model()
+    # verbose=2显示详细,verbose=0,1的话显示不好,我们要安心知道训练状态,
+    #最好verbose=2
+    model.fit(xl_data,xl_target,epochs=EPOCHS,batch_size=1,verbose=2)
+    #把验证数据丢进去,返回mse,mae
+    _,mae_=model.evaluate(val_data,val_target,verbose=2)
+    print('mse,mae:',_,mae_)
+    maes.append(mae_)
+maes
+maes=np.array(maes)
+maes.mean() #2.154739946126938
+# np.hstack()
+a=np.array([2.5,8.2])
+b=np.array([])
+ab=np.hstack((a,b),dtype=np.float32)
+ab
+# del model
+model
+# 每次用不同的训练集和验证集训练,对确定的训练集和验证集
+#循环训练500次,返回每次的绝对值误差
+#把训练数据分成4分,每次切割其中一份做验证数据
+#为了均匀,验证数据就有4种情况,,训练数据是每次切割验证数据后留下的
+#之后用模型训练,每次训练有训练数据,也有验证数据,
+# batch_size=1每次只放一个,更新404次,500次迭代就是404*500
+#存放4X500次循环的mae
+all_val_mae_hs=[]
+all_train_mae_hs=[]
+k=4
+#整除,不整除会有小数
+mcqg=train_data.shape[0]//k
+epochs=500
+cnt=0
+for i in range(k):
+    #验证特征数据
+    val_data=train_data[i*mcqg:(i+1)*mcqg]
+    #训练特征数据
+    xl_data=np.vstack((train_data[:i*mcqg],train_data[(i+1)*mcqg:]))
+    print('val_data:',val_data.shape)
+    print('-------xl_data:',xl_data.shape)
+    # 验证目标数据
+    val_target=train_target[i*mcqg:(i+1)*mcqg]
+    display(train_target[:i*mcqg].shape,train_target[(i+1)*mcqg:].shape)
+    #训练目标数据,因为目标数据是1维的ndarray,垂直拼接形状不一样,那就水平拼接
+    #目标数据只有一列,横着连和竖着连一样的
+#     xl_target=train_target[(i+1)*mcqg:] if train_target[:i*mcqg].shape==(0,)\
+#     else np.hstack((train_target[:i*mcqg],train_target[(i+1)*mcqg:]))
+    xl_target=np.hstack((train_target[:i*mcqg],train_target[(i+1)*mcqg:]))
+    print('----val_target:',val_target)
+    print('-------xl_target:',xl_target)
+    model=get_model()
+    # verbose=2显示详细,verbose=0,1的话显示不好,我们要安心知道训练状态,
+    #最好verbose=2
+    history=model.fit(xl_data,xl_target,batch_size=1,epochs=epochs,\
+                      validation_data=(val_data,val_target),verbose=2)
+    #验证mae
+    val_mae_history=history.history['val_mae']
+    #训练mae
+    train_mae_history=history.history['mae']
+    #四次分割的maes加进集合,一共4个列表,每个列表500数据
+    all_val_mae_hs.append(val_mae_history)
+    all_train_mae_hs.append(train_mae_history)
+    cnt+=1
+print('cnt',cnt)
+# 这里的x是每个特定的验证集保存的500次迭代的mae,是个列表,
+#后边那个指定了是第几次迭代
+[np.mean([x[i] for x in all_val_mae_hs]) for i in range(epochs)][:10]
+# all_val_mae_hs的长度是4,存放的是4次不同的val切割
+# 每次不同的验证集对应500次迭代的mae,先变成ndarray
+all_val_mae_hs=np.array(all_val_mae_hs)
+print(all_val_mae_hs.shape)
+all_val_mae_hs_mean=all_val_mae_hs.mean(axis=0)
+print(all_val_mae_hs_mean)
+all_val_mae_hs_mean[:10]
+#这个没有经过曲线平滑,在第35次迭代时,验证mae平均值最小,索引是从0开始的,
+#索引0是第一次迭代
+display(np.min(all_val_mae_hs_mean),np.argmin(all_val_mae_hs_mean))
+import matplotlib.pyplot as plt
+#根据迭代次数画的图表,未做处理
+x=range(1,len(val_mae_history)+1)
+plt.plot(x,all_val_mae_hs_mean,'b')
+plt.xlabel('epochs')
+plt.ylabel('val_mae')
+plt.show()
+#因为上面的图看不出来啥,所以在这里去除了前十次迭代
+#做了个EMA(指数平滑),旧的信息占比大,占0.9,新的信息
+# 占比0.1
+def smth_(points,w=0.9):
+    #装平滑点的集合
+    smt_ps=[]
+    for point in points:
+        if not smt_ps:# 这个集合是空,就是刚进来,没有前一个资讯
+            print(smt_ps)
+            smt_ps.append(point)
+        else:
+            # 平滑点集合里的最后一个,就是上一个点
+            syg_ps=smt_ps[-1]
+            smt_ps.append(w*syg_ps+(1-w)*point)
+    return smt_ps
+#前十个不要,因为误差太过大,新的集合都经过了指数平滑
+# 变化不会太剧烈,会缓慢变化
+smt_ps=smth_(all_val_mae_hs_mean[10:])
+# x轴循环次数,y轴平滑过的验证集均值绝对值误差mae
+print(len(smt_ps))
+x_=range(1,len(smt_ps)+1)
+plt.figure(figsize=(9,6),dpi=100)
+#没做曲线平滑的mae
+plt.plot(x_,all_val_mae_hs_mean[10:],'g')
+#做了曲线平滑的mae
+plt.plot(x_,smt_ps,'r')
+plt.xlabel('epochs')
+plt.ylabel('val_mae')
+plt.show()
+#这里面的最小误差索引是33,但是前面有10次循环被剔除了,
+#那经过指数平滑过的最小均值误差就是第44次迭代
+# 和之前我们算的第35次迭代有区别,现在的mae是2.355,之前的是2.219
+# 一个是经过35次迭代得到最小,一个经过44次迭代最小
+# 决定跑两次,一次跑35次,一次跑44次
+display(np.min(smt_ps),np.argmin(smt_ps),len(smt_ps))
+smt_ps[33]
+#  训练数据跑到第44次时,loss: 7.9710 - mae: 1.9970
+# 得到的测试数据 loss: 18.6866 - mae: 2.6794
+model2=get_model()
+model2.fit(train_data,train_target,epochs=44,batch_size=16,verbose=2)
+test_mse,test_mae=model2.evaluate(test_data,test_target)
+# 训练数据跑到35次的loss: 8.2320 - mae: 2.0318
+# 得到的测试数据 loss: 23.9797 - mae: 3.0710
+model3=get_model()
+model3.fit(train_data,train_target,epochs=35,batch_size=16,verbose=2)
+test_mse,test_mae=model3.evaluate(test_data,test_target)
+# 可以看出,经过指数平滑后得到的迭代次数要比上面没有经过指数平滑的得到的效果好
+# 不要开太大的网络,太深或太宽都不行,尤其在数据很少的情况下,像这种
+# 只有506个样本,实在太少,无米之炊难做

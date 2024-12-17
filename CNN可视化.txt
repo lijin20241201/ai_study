@@ -1,0 +1,237 @@
+import keras
+import tensorflow as tf
+import numpy as np
+import matplotlib.pyplot as plt
+from keras import models 
+from keras import layers
+import os,shutil
+from keras.preprocessing.image import ImageDataGenerator
+from keras.utils import image_utils
+def img2tensor(img_path,):
+    # img目前是Image对象,还是一张图片
+    img=image_utils.load_img(img_path,target_size=(150,150))
+    # 变成3d张量
+    img_tensor=image_utils.img_to_array(img)
+    #变成4d张量
+    img_tensor2=np.expand_dims(img_tensor,axis=0)#在索引0的轴增加一维,就是样本数
+    print(img_tensor.shape,img_tensor2.shape)
+    img_tensor2/=255.#在jupyter里不能重复执行
+    return img_tensor2
+img_path='../datasets/cats_dogs_s/yz/cats/cat.1700.jpg'
+img_tensor2=img2tensor(img_path)
+#一张关在铁窗里的猫,电脑在抓取特征的时候,是一直在抓笼子特征的
+#说明电脑识别的时候还是有问题,如果在反向传播时,能告诉电脑,这个数据
+#它判断对了,这个数据它判断错了,就好了,这样它就不会抓那些次要的特征
+#而会知道,哦,这个图片我没判断对,是因为抓取的东西是错的
+#还有一张毛图片被移到一个绿色的背景里,电脑直接忽视了猫
+#抓背景去了
+plt.imshow(img_tensor2[0])
+plt.show()
+model=models.load_model('../data/cats_and_dogs_small2.h5')
+ 提取前8层的输出,是由卷积层或池化层作用后的特征图
+#形状像这样[None, 148, 148, 32]
+layer_outputs=[layer.output for layer in model.layers[:8]]
+# 输入:一张图片,输出:前8层的输出,卷积或池化后的特征图
+activation_model=models.Model(inputs=model.input,outputs=layer_outputs)
+# 根据上面的猫图片,得到8层滤镜处理后的特征图
+activations=activation_model.predict(img_tensor2)
+print(img_tensor2.std(),img_tensor2.mean(),img_tensor2.max(),img_tensor2.min())
+# 我说的滤镜就是每一层的神经元,一层有几个神经元,就有几个滤镜
+#说滤镜是因为它做的事就是在过滤图片,每个滤镜在图片上要找的特征不一样
+#比如一张猫图片,电脑模型看一个图片是不是猫,抓的是猫的脸
+#不过有的滤镜抓猫脸的整体,有的滤镜只抓猫的眼睛,耳朵
+#还有的滤镜要抓的特征图片上不存在,那得到的特征图就是全黑
+#每层的输出,形状形如(1,34, 34, 128)这样,是每一层
+#处理后的3维图片,可以想象成图片堆叠起来,
+# 每层有几个神经元,就有几个图片堆叠
+first_layer_ac=activations[2]#索引6的那层,索引从0开始
+# 每个输出的滤镜层数:32,32,64,64,128,128,128,128
+n_cols=8# 每列8张图片
+ljs=first_layer_ac.shape[-1]# 每层输出的滤镜数
+n_rows=ljs//n_cols# 例如:索引0的输出层32个滤镜,就是4行
+# 这个设置的原则是(列,行),乘以2是为了整体大一些
+plt.figure(figsize=(n_cols*2,n_rows*2),dpi=150)
+# plt.title('1')
+plt.axis('off')#不显示轴
+for i in range(ljs):# 遍历得到的是第i个滤镜处理后的特征图
+    plt.subplot(n_rows,n_cols,i+1)# 32行4列子视图
+    plt.axis('off')#不显示轴
+    plt.imshow(first_layer_ac[0,:,:,i],cmap='viridis')# 显示第i个滤镜处理后的特征图
+plt.show()
+# 获取前8层的输出,每一层所有滤镜处理后的特征图
+layer_outputs=[layer.output for layer in model.layers[:8]]
+# 输入是某张图片,输出是前8层的特征图
+activation_model=models.Model(inputs=model.input,outputs=layer_outputs)
+# 得到上面的猫图片的前8层特征图
+activations=activation_model.predict(img_tensor2)
+#可以看到有颜色的那些事电脑抓取的特征
+#有些滤镜抓猫的整体脸部,有的只抓取猫的眼睛,耳朵
+#所以在识别的时候,电脑是根据猫脸的耳朵,眼睛等来识别猫的
+# 获取前8层名称
+layer_names=[layer.name for layer in model.layers[:8]]
+#每行8个图片
+n_cols=8
+# zip有打包作用,就是把两个东西关联起来
+for layer_name,layer_activation in zip(layer_names,activations):
+    n_features=layer_activation.shape[-1]# 每层的滤镜数
+    n_rows=n_features//n_cols# 如果一层32个滤镜,那这层就四行
+    plt.figure(figsize=(n_cols*2,n_rows*2))
+    plt.title(layer_name)# 标题
+    plt.axis('off')#不显示轴
+    for i in range(n_features):
+        plt.subplot(n_rows,n_cols,i+1)# 32行4列子视图
+        plt.imshow(layer_activation[0,:,:,i],cmap='viridis',aspect='equal')# 显示第i个滤镜处理过的特征图 
+        plt.axis('off')#不显示轴
+plt.show()
+# a=[1,2,3]
+# b=np.zeros_like(a)
+# print(b)
+img_path='../datasets/cats_dogs_s/yz/cats/cat.1700.jpg'
+img_tensor2=img2tensor(img_path)
+print(img_tensor2.min(),img_tensor2.max())
+# 得到上面的猫图片的前8层特征图
+activations=activation_model.predict(img_tensor2)
+print(img_tensor2.min(),img_tensor2.max())
+# 获取前8层名称
+layer_names=[layer.name for layer in model.layers[:8]]
+#每行8个图片
+n_cols=8
+# zip有打包作用
+for layer_name,layer_activation in zip(layer_names,activations):
+#     print(layer_name,layer_activation.shape)
+    n_features=layer_activation.shape[-1]# 每层的滤镜数
+    size=layer_activation.shape[1]# 图片的大小,这个每一层大小不一样,越往后越小
+    n_rows=n_features//n_cols# 如果一层32个滤镜,那这层就四行
+    #弄一个容器来装每一层的滤镜处理后的特征图
+    display_grid=np.zeros((n_rows*size,n_cols*size))
+#     print(n_features,n_rows,size,display_grid.shape)
+    i=0
+    for row in range(n_rows):#row,col索引都从0开始
+        for col in range(n_cols):
+            i=row*n_cols+col
+            #某一层的第i个滤镜
+            img_i=layer_activation[0,:,:,i]
+            # 原图经过处理,最大值是1.0,最小值是0.0
+            #这个是经过了卷积处理后的图片数据,所以有正有负
+#             print('特征图:',img_i.max(),img_i.min())
+            # 标准差和均值: 0.0 0.0,这样的滤镜没抓取到想要的特征
+            # 所以处理后的图片数据全0.0,就是黑色
+#             print('原始特征图的标准差和均值:',img_i.std(),img_i.mean())
+            img_i-=img_i.mean()
+#             print('中心化后的标准差和均值:',img_i.std(),img_i.mean())
+            zero=np.zeros_like(img_i)
+            #标准差是0.0或者nan,就是滤镜没抓到要的特征
+            if img_i.std()==0.0 or np.isnan(img_i.std()):
+                img_i=zero
+#                 print('黑色:',img_i.max(),img_i.min())
+            else:
+                img_i=img_i/img_i.std()
+#             print('标准化后的标准差和均值:',img_i.std(),img_i.mean())
+            img_i*=32
+#             print('*32后的标准差和均值:',img_i.std(),img_i.mean())
+            img_i+=128
+#             print('标准差32,均值128:',img_i.max(),img_i.min())
+#             print('+128后的标准差和均值:',img_i.std(),img_i.mean())
+            #因为裁剪会把小于0的变为0,大于255的变为255.0,所以裁剪后标准差和均值会变化
+#             print('裁剪前的最大,最小值:',img_i.max(),img_i.min())
+            img_i=np.clip(img_i,0,255)
+#             print('裁剪后的最大,最小值:',img_i.max(),img_i.min())
+#             print('裁剪后的标准差和均值:',img_i.std(),img_i.mean())
+            img_i=img_i.astype('uint8')
+#             print('uint8后的最大,最小值:',img_i.max(),img_i.min())
+#             print('uint8后的标准差和均值:',img_i.std(),img_i.mean())
+            # 把第i个滤镜放进容器里
+            display_grid[row*size:(row+1)*size,\
+                         col*size:(col+1)*size]=img_i
+    plt.figure(figsize=(n_cols*2,n_rows*2),dpi=150)
+    plt.axis('off')# 不显示轴
+    plt.title(layer_name)# 标题
+    # aspect:像素的形状,equal方形,auto通常不是方形
+    # display_grid,某一层的所有特征图
+    plt.imshow(display_grid,cmap='viridis',aspect='auto')
+plt.show()
+import numpy as np  
+data = np.array([1, 2, np.nan, 4, np.nan])  
+isnan_mask = np.isnan(data)  
+print(isnan_mask)  # 输出: [False False  True False  True]
+data = 0.00000001  # 一个非常小的正数，接近于0.0  
+epsilon = 1e-6   # 容差值  
+if abs(data) < epsilon:  
+    print("数据几乎是0.0")  
+else:  
+    print("数据不是0.0")
+data = 0.0
+if data == 0.0:  
+    print("数据是0.0")  
+else:  
+    print("数据不是0.0")
+img_path='../datasets/cats_dogs_s/yz/cats/cat.1700.jpg'
+img_tensor2=img2tensor(img_path)
+print(img_tensor2.min(),img_tensor2.max())
+# 得到上面的猫图片的前8层特征图
+activations=activation_model.predict(img_tensor2)
+# 获取前8层名称,没特殊指定,就是conv2d_1这样的
+layer_names=[layer.name for layer in model.layers[:8]]
+#每行8个图片
+n_cols=8
+# zip有打包作用,就是把两个东西关联起来
+for layer_name,layer_activation in zip(layer_names,activations):
+    n_features=layer_activation.shape[-1]# 每层的滤镜数
+    size=layer_activation.shape[1]# 特征图的大小,这个每一层大小不一样,越往后越小
+    n_rows=n_features//n_cols# 如果一层32个滤镜,那这层就四行
+    #弄一个容器来装这些特征图
+    display_grid=np.zeros((n_rows*size,n_cols*size))
+#     print(n_features,n_rows,size,display_grid.shape)
+    i=0
+    for row in range(n_rows):#row,col索引都从0开始
+        for col in range(n_cols):
+            i=row*n_cols+col
+            #某一层的第i个滤镜
+            img_i=layer_activation[0,:,:,i]
+#             print('第{}个滤镜的形状,均值,标准差:'.format(i),img_i.shape,img_i.mean(),img_i.std())
+            img_i-=img_i.mean()# 中心化,以0为中心,方差和前面方差一样
+#             print('中心化后的标准差,均值:',img_i.std(),img_i.mean())
+            zero=np.zeros_like(img_i,dtype=np.uint8)
+            #标准差是0.0或者nan,就是滤镜没抓到要的特征,所以特征图里的数据全为0.0
+            if img_i.std()==0.0 or np.isnan(img_i.std()):
+                img_i=zero
+#                 print('黑色:',img_i.max(),img_i.min())
+            else:
+                img_i=img_i/img_i.std()# 方差单位化为1,平均值还是0,标准正太
+#             print('标准化后的标准差,均值:',img_i.std(),img_i.mean())
+            #下面做的处理是放大数据之间的差异,把滤镜想抓取的特征放大
+            img_i*=64
+#             print('乘以64后的标准差,均值:',img_i.std(),img_i.mean())# 方差变成64
+            img_i+=128# 平均值变成128
+#             print('加128后的标准差,均值:',img_i.std(),img_i.mean())
+#             print('裁剪前的最大,最小值:',img_i.max(),img_i.min())
+            #裁剪小于0的会变成0,大于255的会变成255
+            img_i=np.clip(img_i,0,255)# 裁剪
+            img_i=img_i.astype('uint8')#无符号整型,0-255之间
+#             print('裁剪后的最大,最小值:',img_i.max(),img_i.min())
+            # 把第i个滤镜放进容器里
+            display_grid[row*size:(row+1)*size,\
+                         col*size:(col+1)*size]=img_i
+#     scale=1./size# 对于第一层来说,scale=1/148
+#     # figsize=((1/148)*8*148,(1/148)*4*148)=(8,4)--对应宽和高
+#     plt.figure(figsize=(scale*display_grid.shape[1],\
+#                        scale*display_grid.shape[0]))
+    plt.figure(figsize=(n_cols*2,n_rows*2),dpi=150)
+    plt.axis('off')# 不显示轴
+    plt.title(layer_name)# 标题
+#     print('display_grid的形状',display_grid.shape)
+    # aspect:像素的形状,equal方形,auto通常不是方形
+    # display_grid,某一层的所有滤镜
+    plt.imshow(display_grid,cmap='viridis',aspect='auto')
+plt.show()
+# a=np.array([245,256,1,-0.1,-1.0,0.0,255,255.0])
+a=np.array([-0.1,-1.0,0.0])
+#超过255的会被截断
+b=a.astype('uint8')
+print(b)
+print(np.isnan(b))
+#zip小例子,zip就是打包,对应索引位置元素打包在一起
+a1=[1,2,3]
+a2=[5,6,7]
+for i,j in zip(a1,a2):
+    print(i,j)

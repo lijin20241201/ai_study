@@ -1,0 +1,168 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+
+# Image datasets and image manipulation
+import torchvision
+import torchvision.transforms as transforms
+
+# Image display
+import matplotlib.pyplot as plt
+import numpy as np
+
+# PyTorch TensorBoard support
+from torch.utils.tensorboard import SummaryWriter
+
+# 定义转换器
+transform = transforms.Compose(
+    [transforms.ToTensor(),
+    #均值方差0.5
+    transforms.Normalize((0.5,), (0.5,))])
+
+# 训练集和验证集
+training_set = torchvision.datasets.FashionMNIST('./data',
+    download=True,
+    train=True,
+    transform=transform)
+validation_set = torchvision.datasets.FashionMNIST('./data',
+    download=True,
+    train=False,
+    transform=transform)
+
+# shuffle=True 刷新数据,num_workers 开两个进程
+training_loader = torch.utils.data.DataLoader(training_set,
+                                              batch_size=4,
+                                              shuffle=True,
+                                              num_workers=2)
+
+
+validation_loader = torch.utils.data.DataLoader(validation_set,
+                                                batch_size=4,
+                                                shuffle=False,
+                                                num_workers=2)
+
+# Class labels
+classes = ('T-shirt/top', 'Trouser', 'Pullover', 'Dress', 'Coat',
+        'Sandal', 'Shirt', 'Sneaker', 'Bag', 'Ankle Boot')
+
+# Helper function for inline image display
+def matplotlib_imshow(img, one_channel=False):
+    if one_channel:
+        img = img.mean(dim=0)
+    img = img / 2 + 0.5     # unnormalize
+    npimg = img.numpy()
+    if one_channel:
+        plt.imshow(npimg, cmap="Greys")
+    else:
+        plt.imshow(np.transpose(npimg, (1, 2, 0)))
+
+# Extract a batch of 4 images
+dataiter = iter(training_loader)
+images, labels = next(dataiter)
+
+# Create a grid from the images and show them
+img_grid = torchvision.utils.make_grid(images)
+matplotlib_imshow(img_grid, one_channel=True)
+
+writer = SummaryWriter('runs/fashion_mnist_experiment_1')
+
+# Write image data to TensorBoard log dir
+writer.add_image('Four Fashion-MNIST Images', img_grid)
+writer.flush()
+
+# To view, start TensorBoard on the command line with:
+#   tensorboard --logdir=./runs
+# ...and open a browser tab to http://localhost:6006/
+
+切换到runs父目录
+
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        self.conv1 = nn.Conv2d(1, 6, 5)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.conv2 = nn.Conv2d(6, 16, 5)
+        self.fc1 = nn.Linear(16 * 4 * 4, 120)
+        self.fc2 = nn.Linear(120, 84)
+        self.fc3 = nn.Linear(84, 10)
+
+    def forward(self, x):
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        x = x.view(-1, 16 * 4 * 4)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+net = Net()
+criterion = nn.CrossEntropyLoss() #损失函数，多元交叉熵
+optimizer = optim.SGD(net.parameters(), lr=0.001, momentum=0.9)#优化器，SGD
+
+print(len(validation_loader))
+for epoch in range(1):  # loop over the dataset multiple times
+    running_loss = 0.0
+    for i, data in enumerate(training_loader, 0):
+        # basic training loop
+        inputs, labels = data #拆包输入和标记
+        optimizer.zero_grad() # 梯度归0
+        outputs = net(inputs) #获取模型预测
+        loss = criterion(outputs, labels) #根据模型预测和真实标签计算批次平均损失
+        loss.backward() #反向传播
+        optimizer.step() # 更新参数
+
+        running_loss += loss.item() #累积损失
+        if i % 1000 == 999:    # 每隔1000个小批次
+            print('Batch {}'.format(i + 1)) #打印当前批次
+            # 初始化验证损失
+            running_vloss = 0.0
+            #设置测试模式
+            net.train(False) 
+            for j, vdata in enumerate(validation_loader, 0):
+                vinputs, vlabels = vdata#拆包验证批次输入数据和标签，是类似列表
+                voutputs = net(vinputs) #预测
+                vloss = criterion(voutputs, vlabels) #计算损失
+                running_vloss += vloss.item() #累计损失
+            net.train(True) # 切换回训练模式，训练模式更新参数，测试模式不更新参数
+            #每1000个小批次的训练平均损失
+            avg_loss = running_loss / 1000
+            #每1000个训练批次的验证平均损失
+            avg_vloss = running_vloss / len(validation_loader)
+            #每隔1000个小批次，把训练平均损失，验证平均损失，标记是第几个批次
+            writer.add_scalars('Training vs. Validation Loss',
+                            { 'Training' : avg_loss, 'Validation' : avg_vloss },
+                            epoch * len(training_loader) + i)
+            # 最后把训练累计损失归0,因为我们不需要累计之前的批次的损失
+            running_loss = 0.0
+print('Finished Training')
+
+writer.flush()
+
+# Again, grab a single mini-batch of images
+dataiter = iter(training_loader)
+images, labels = next(dataiter)
+
+# add_graph() will trace the sample input through your model,
+# and render it as a graph.
+writer.add_graph(net, images)
+writer.flush()
+
+# Select a random subset of data and corresponding labels
+def select_n_random(data, labels, n=100):
+    assert len(data) == len(labels) #断言：如果错误，会报错，程序不会向下执行
+
+    perm = torch.randperm(len(data)) #刷新过的索引
+    return data[perm][:n], labels[perm][:n] #返回刷新后的数据切片
+
+# 取的是经过刷新后的前100个数据和标签
+images, labels = select_n_random(training_set.data, training_set.targets)
+print(images.shape,labels.shape)
+#得到文本标签列表
+class_labels = [classes[label] for label in labels]
+features = images.view(-1, 28 * 28) #扁平处理输入
+global_step = 100  # 假设这是当前的训练步骤或迭代次数 
+writer.add_embedding(features,
+                    metadata=class_labels,
+                    label_img=images.unsqueeze(1),global_step=global_step) #加一维层（通道）
+writer.flush()
+writer.close()

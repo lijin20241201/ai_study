@@ -1,0 +1,74 @@
+# 批次:1,头:2,每个头的嵌入:4,5x5:表示5x5的二维空间面(矩阵)
+a=torch.randn((1,2,4,5,5))
+
+ 多维张量有一个看法，从最外面的[往里数,像这种5维的往里数,数4个中括号的个数,那就是批次,之后依次往里数,到最后5x5那就不用数了,我们脑子里已经把它当矩阵,也就是表示图片的空间区域(高,宽)
+
+b=torch.randn((1,3,2,4))
+
+m=torch.einsum("bmchw,bnmc->bmhwn", a, b)
+
+爱因斯坦约定就是遵从具有相同形状的mc对应元素做乘法,这里因为结果没有c了,那就只能是聚和相加了
+
+display(a[0,:,:,0,0],b[0,0,:,:],m[0,:,0,0,0])
+
+我这里是a中指定0的就是只取一个元素,只有m,c是取所有,最后一验证torch.sum(a[0,:,:,0,0]*b[0,0,:,:],axis=1),你会发现结果一样,说明einsum内部确实对mc维度做了元素乘积后的聚合相加操作,我一直把矩阵看成行向量或列向量的集,因为矩阵乘法其实 就是对应的行向量或列向量之间做点积,所以这里别看这么高维,最后还是要归结为向量间的点积,点积就是和余弦夹角对应,就是余弦相似，就是两个向量间的相似性,所以这里就是做了个注意力
+
+m_sig=m.max(dim=-1)[0].sigmoid()
+
+m_sig=m_sig.unsqueeze(2)
+
+display(a[0,0,:1],m_sig[0,0],(a*m_sig)[0,0,:1],a[0,0,:1]*m_sig[0,0])
+
+可以看到m_sig对m加权
+
+display(m[0,0,:,:,:],m[0,0].max(dim=-1))
+
+class MaxSigmoidAttnBlock(nn.Module):
+    # gc 是引导向量（guide）的维度。scale 决定是否使用可学习的缩放因子
+    def __init__(self, c1, c2, nh=1, ec=128, gc=512, scale=False):
+        super().__init__()
+        self.nh = nh # 注意力头的数量
+        self.hc = c2 // nh
+        self.ec = Conv(c1, ec, k=1, act=False) if c1 != ec else None # 点卷积切换通道
+        # ec 是嵌入通道数，用于调整输入特征图的维度
+        self.gl = nn.Linear(gc, ec) # 创建一个线性层 gl
+        self.bias = nn.Parameter(torch.zeros(nh)) # 创建一个可学习的截距项 bias
+        # 创建一个卷积层 proj_conv 用于调整输入的维度到期望的输出通道数 c2
+        self.proj_conv = Conv(c1, c2, k=3, s=1, act=False)  # 普通卷积
+        # 如果 scale 参数为 True，则创建一个可学习的缩放因子；否则，使用常数值 1.0
+        self.scale = nn.Parameter(torch.ones(1, nh, 1, 1)) if scale else 1.0
+    def forward(self, x, guide): # x:(b,c1,h,w),guide:(b,gc),引导向量
+        bs, _, h, w = x.shape
+        guide = self.gl(guide) # (b,gc)-->(b,ec)
+        # (b,ec)-->(b,n,m,dc)
+        guide = guide.view(bs, -1, self.nh, self.hc)
+        # (b,c1,h,w)-->(b,ec,...),用来切换原特征图通道到嵌入通道
+        embed = self.ec(x) if self.ec is not None else x
+        # (b,ec,h,w)-->(b,m,dc,h,w)
+        embed = embed.view(bs, self.nh, self.hc, h, w)
+        # (b,m,dc,h,w) (b,n,m,dc)-->(b,m,h,w,n)
+        aw = torch.einsum("bmchw,bnmc->bmhwn", embed, guide)
+        # 在n的维度聚合最大值,[0]表示不要argmax
+        aw = aw.max(dim=-1)[0]
+        # 缩放
+        aw = aw / (self.hc**0.5)
+        # [None, :, None, None]就是[1,m,1,1]
+        aw = aw + self.bias[None, :, None, None]
+        # 给空间位置打分,区分空间位置的重要性
+        aw = aw.sigmoid() * self.scale # (b,m,h,w)
+        # (b,c1,h,w)-->(b,c2,h,w)
+        x = self.proj_conv(x)
+        x = x.view(bs, self.nh, -1, h, w) # (b,m,dc,h,w)
+        # (b,m,dc,h,w)*(b,m,1,h,w)-->(b,m,dc,h,w)
+        # 用aw对x做加权,这样得到的空间数据就受到空间注意力权重的影响
+        # 图片数据应该会和引导向量相关
+        x = x * aw.unsqueeze(2)
+        return x.view(bs, -1, h, w) # (b,c2,h,w)
+
+a=torch.randint(10,size=(1,5,6))
+
+b=torch.randint(10,size=(1,5,6))
+
+torch.matmul(a,b.transpose(-2,-1))
+
+torch.einsum("bqd,bkd->bqk",a,b)

@@ -1,0 +1,274 @@
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ["KERAS_BACKEND"] = "tensorflow"
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
+import keras_nlp
+import pathlib
+import random
+
+import keras
+from keras import ops
+
+import tensorflow as tf
+
+from tensorflow_text.tools.wordpiece_vocab import bert_vocab_from_dataset as bert_vocab
+
+BATCH_SIZE = 64
+EPOCHS = 5
+MAX_SEQUENCE_LENGTH = 40#序列长度统一40
+ENG_VOCAB_SIZE = 15000#词汇大小
+SPA_VOCAB_SIZE = 15000
+EMBED_DIM = 256#嵌入维度,就是一个词汇用多少维向量来表示
+INTERMEDIATE_DIM = 2048#
+NUM_HEADS = 8#注意力头
+
+text_file='./datasets/spa-eng/'
+
+text_file = pathlib.Path(text_file).parent / "spa-eng" / "spa.txt"
+
+def get_text_pairs():#获取句子对列表
+    text_pairs = []
+    with open(text_file) as f:
+        for line in f:
+            line_lst=line.strip().split('\t')
+            text_pairs.append(tuple(line_lst))
+    return text_pairs
+
+for _ in range(5):#一共选取5次
+    print(random.choice(get_text_pairs()))#随机选取句子对
+
+text_pairs=get_text_pairs()
+
+random.shuffle(text_pairs)
+
+num_val_samples = int(0.15 * len(text_pairs))#验证集,17844
+
+num_train_samples = len(text_pairs) - 2 * num_val_samples#83276
+
+train_pairs = text_pairs[:num_train_samples]#训练集
+val_pairs = text_pairs[num_train_samples : num_train_samples + num_val_samples]#验证集
+test_pairs = text_pairs[num_train_samples + num_val_samples :]#测试集
+
+#训练子词分词,返回词汇集
+def train_word_piece(text_samples, vocab_size, reserved_tokens):
+    word_piece_ds = tf.data.Dataset.from_tensor_slices(text_samples)
+    vocab = keras_nlp.tokenizers.compute_word_piece_vocabulary(
+        word_piece_ds.batch(1000).prefetch(2),
+        vocabulary_size=vocab_size,
+        reserved_tokens=reserved_tokens,
+    )
+    return vocab
+
+reserved_tokens = ["[PAD]", "[UNK]", "[START]", "[END]"]#保留token
+eng_samples = [text_pair[0] for text_pair in train_pairs]#英语样本
+#训练英语分词,返回英语词汇集,用训练集
+eng_vocab = train_word_piece(eng_samples, ENG_VOCAB_SIZE, reserved_tokens)
+spa_samples = [text_pair[1] for text_pair in train_pairs]#西班牙语在句子对的索引1位置
+spa_vocab = train_word_piece(spa_samples, SPA_VOCAB_SIZE, reserved_tokens)#西班牙词汇
+
+#构建翻译任务的原语言分词器和目标语言分词器
+eng_tokenizer = keras_nlp.tokenizers.WordPieceTokenizer(#token子词到数字索引的映射
+    vocabulary=eng_vocab, lowercase=False
+)
+spa_tokenizer = keras_nlp.tokenizers.WordPieceTokenizer(
+    vocabulary=spa_vocab, lowercase=False
+)
+
+eng_input_ex = text_pairs[0][0]#英语文本序列
+
+eng_tokens_ex = eng_tokenizer.tokenize(eng_input_ex)
+
+print("English sentence: ", eng_input_ex)#文本
+print("Tokens: ", eng_tokens_ex)#文本对应的标记索引
+
+print(
+    "Recovered text after detokenizing: ",
+    eng_tokenizer.detokenize(eng_tokens_ex),#索引到文本
+)
+
+spa_input_ex = text_pairs[0][1]
+spa_tokens_ex = spa_tokenizer.tokenize(spa_input_ex)
+print("Spanish sentence: ", spa_input_ex)
+print("Tokens: ", spa_tokens_ex)
+print("Recovered text after detokenizing: ",
+    spa_tokenizer.detokenize(spa_tokens_ex),
+)
+
+def preprocess_batch(eng, spa):
+    batch_size = ops.shape(spa)[0]#批次大小
+    eng = eng_tokenizer(eng)#构建分词器
+    spa = spa_tokenizer(spa)
+    # 处理序列数据的开始和结束位置,处理长度不一,填充
+    eng_start_end_packer = keras_nlp.layers.StartEndPacker(#不足的填充
+        sequence_length=MAX_SEQUENCE_LENGTH,
+        pad_value=eng_tokenizer.token_to_id("[PAD]"),
+    )
+    eng = eng_start_end_packer(eng)
+    # 它提供了目标句子中的下一个单词——模型将尝试预测的内容。
+    spa_start_end_packer = keras_nlp.layers.StartEndPacker(
+        sequence_length=MAX_SEQUENCE_LENGTH + 1,
+        start_value=spa_tokenizer.token_to_id("[START]"),#2
+        end_value=spa_tokenizer.token_to_id("[END]"),
+        pad_value=spa_tokenizer.token_to_id("[PAD]"),#0
+    )
+    spa = spa_start_end_packer(spa)#SymbolicTensor
+    return (
+        {
+            "encoder_inputs": eng,#编码输入:英语
+            "decoder_inputs": spa[:, :-1],#解码输入,最后一个词汇之前的词汇
+        },
+        spa[:, 1:],#索引1的词汇之后的,预测下一个字
+    )
+
+
+def make_dataset(pairs):
+    eng_texts, spa_texts = zip(*pairs)#自动拆包
+    eng_texts = list(eng_texts)#所有英语序列的集合
+    spa_texts = list(spa_texts)
+    dataset = tf.data.Dataset.from_tensor_slices((eng_texts, spa_texts))#形成句子对数据集
+    dataset = dataset.batch(BATCH_SIZE)
+    dataset = dataset.map(preprocess_batch, num_parallel_calls=tf.data.AUTOTUNE)
+    return dataset.shuffle(2048).prefetch(16).cache()
+train_ds = make_dataset(train_pairs)
+val_ds = make_dataset(val_pairs)
+
+for inputs, targets in train_ds.take(1):
+    print(f'inputs["encoder_inputs"].shape: {inputs["encoder_inputs"].shape}')#(64,40)
+    print(f'inputs["decoder_inputs"].shape: {inputs["decoder_inputs"].shape}')#(64,40)
+    print(f"targets.shape: {targets.shape}")#(64, 40)
+
+# 结束标记：当解码器预测出结束标记（如<EOS>）时，解码过程通常会停止。然而，在训练过程中，
+# 即使解码器在某个步骤预测出了结束标记，训练仍然会继续进行，直到达到最大序列长度或满足其
+# 他停止条件。这样做的目的是为了
+# 确保模型能够学习到在何时何地预测结束标记。
+
+# 损失计算：在每个解码步骤中，解码器都会输出一个概率分布，表示下一个单词的可能性。
+# 这个概率分布会与目标序列中对应位置的单词进行比较，并计算损失（如交叉熵损失）。
+# 这个过程会包括目标序列的最后一个单词，即使它没有被用作解码器的输入。
+# 在计算总损失时，所有步骤的损失会被累加起来。
+
+encoder_inputs = keras.Input(shape=(None,), name="encoder_inputs")#源序列输入(seq_len,)
+x = keras_nlp.layers.TokenAndPositionEmbedding(#源序列位置嵌入和词嵌入(seq_en,d_dim)
+    vocabulary_size=ENG_VOCAB_SIZE,
+    sequence_length=MAX_SEQUENCE_LENGTH,
+    embedding_dim=EMBED_DIM,
+)(encoder_inputs)
+#编码器输出(seq_en,d_dim)
+encoder_outputs = keras_nlp.layers.TransformerEncoder(
+    intermediate_dim=INTERMEDIATE_DIM, num_heads=NUM_HEADS
+)(x)# intermediate_dim前馈网络输入维度,因为编码器有自注意力和前馈全连接两个部分
+#目标序列输入部分(seq_len,)是除去最后一个字的部分
+decoder_inputs = keras.Input(shape=(None,), name="decoder_inputs")
+x = keras_nlp.layers.TokenAndPositionEmbedding(#目标序列位置编码和词嵌入
+    vocabulary_size=SPA_VOCAB_SIZE,
+    sequence_length=MAX_SEQUENCE_LENGTH,
+    embedding_dim=EMBED_DIM,
+)(decoder_inputs)
+x = keras_nlp.layers.TransformerDecoder(
+    intermediate_dim=INTERMEDIATE_DIM, num_heads=NUM_HEADS
+#decoder_sequence:目标序列部分,encoder_sequence:编码器输出
+)(decoder_sequence=x, encoder_sequence=encoder_outputs)
+# decoder_sequence 通常是一个带有 <start> 或 <SOS> 标记的目标序列的偏移版本（在训练时），
+# 或者是一个起始标记（在测试/预测时）,encoder_sequence 是编码器的输出，它包含了源序列的编码信息。
+# 解码器首先会对其输入（decoder_sequence）应用自注意力机制。这允许解码器考虑已经生成的目标序列部分
+# （在训练时）或之前预测的部分（在测试时）来预测下一个单词
+# 接下来，解码器会使用编码器-解码器注意力机制来关注编码器的输出（encoder_sequence）。
+# 这允许解码器在生成目标序列时考虑到源序列的上下文信息。
+# 在训练时，解码器的输入通常是目标序列的一个偏移版本，即除了最后一个单词外的所有单词。
+# 解码器会基于这些输入和编码器的输出来预测下一个单词。
+# 这个过程是迭代进行的，每一步都使用前一步的输出作为输入。
+x = keras.layers.Dropout(0.5)(x)
+#返回的是概率分布,表示词汇在词汇集中可能的位置
+decoder_outputs = keras.layers.Dense(SPA_VOCAB_SIZE, activation="softmax")(x)
+transformer = keras.Model(#transformer模型
+    [encoder_inputs, decoder_inputs],
+    decoder_outputs,
+    name="transformer",
+)
+
+def prepare_model(lr=1e-3,wc=1e-4,model=None):
+    optimizer = keras.optimizers.AdamW(lr,wc)
+    model.compile(
+        optimizer=optimizer,
+        loss=keras.losses.SparseCategoricalCrossentropy(),
+        metrics=[
+        keras.metrics.SparseCategoricalAccuracy(name="acc"),
+    ])
+    callbacks = [
+    keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5,  
+                               patience=3, min_lr=5e-6)
+    ]
+    return callbacks
+
+callbacks=prepare_model(model=transformer)
+
+transformer.fit(train_ds, epochs=5, validation_data=val_ds,callbacks=callbacks)
+
+def decode_sequences(input_sentences):#根据输入源序列解码
+    batch_size = 1
+    #输入的tokens
+    encoder_input_tokens = ops.convert_to_tensor(eng_tokenizer(input_sentences))
+    if len(encoder_input_tokens[0]) < MAX_SEQUENCE_LENGTH:#不足就填充
+        #(1,n_pad)
+        pads = ops.full((1, MAX_SEQUENCE_LENGTH - len(encoder_input_tokens[0])), 0)
+        encoder_input_tokens = ops.concatenate(#在序列轴合并填充值0
+            [encoder_input_tokens.to_tensor(), pads], axis=-1
+        )
+    def next(prompt, cache, index):#内嵌方法
+        #根据源输入和目标输入预测下一个单词,目标序列中序列中每个词汇的得分
+        logits = transformer([encoder_input_tokens, prompt])[:, index - 1, :]
+        hidden_states = None
+        return logits, hidden_states, cache
+    length = 40
+    start = ops.full((batch_size, 1), spa_tokenizer.token_to_id("[START]"))
+    pad = ops.full((batch_size, length - 1), spa_tokenizer.token_to_id("[PAD]"))
+    prompt = ops.concatenate((start, pad), axis=-1)#(2,0,o,...)长度40
+    #根据一个开始标记生成分词序列
+    generated_tokens = keras_nlp.samplers.GreedySampler()(#生成目标分词
+        next,
+        prompt,
+        stop_token_ids=[spa_tokenizer.token_to_id("[END]")],#结束标记,3
+        index=1, #索引从1开始,因为0是填充
+    )
+    generated_sentences = spa_tokenizer.detokenize(generated_tokens)#解码分词到文本
+    return generated_sentences
+
+test_eng_texts = [pair[0] for pair in test_pairs]#获取源序列
+for i in range(2):
+    input_sentence = random.choice(test_eng_texts)#随机选一个序列
+    translated = decode_sequences([input_sentence])#生成翻译文本
+    translated = translated.numpy()[0].decode("utf-8")#按utf8解码
+    translated =  (translated.replace("[PAD]", "")#用括号包起来是长程序的换行方法
+        .replace("[START]", "")
+        .replace("[END]", "")
+        .strip())
+    print(f"** Example {i} **")
+    print(input_sentence)
+    print(translated)
+    print()
+
+! pip install rouge-score
+
+transformer.load_weights('./checkpoint/en_spa_transformer_1.weights.h5')
+
+# ROUGE 是一种常用于评估自动摘要和机器翻译系统性能的指
+rouge_1 = keras_nlp.metrics.RougeN(order=1)
+rouge_2 = keras_nlp.metrics.RougeN(order=2)
+for test_pair in test_pairs[:30]:
+    input_sentence = test_pair[0]#源文本
+    reference_sentence = test_pair[1]#目标文本
+    translated_sentence = decode_sequences([input_sentence])#翻译文本
+    translated_sentence = translated_sentence.numpy()[0].decode("utf-8")
+    translated_sentence = (
+        translated_sentence.replace("[PAD]", "")
+        .replace("[START]", "")
+        .replace("[END]", "")
+        .strip()
+    )
+
+    rouge_1(reference_sentence, translated_sentence)#比较真实和预测
+    rouge_2(reference_sentence, translated_sentence)
+print("ROUGE-1 Score: ", rouge_1.result())
+print("ROUGE-2 Score: ", rouge_2.result())
+

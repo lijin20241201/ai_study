@@ -1,0 +1,385 @@
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'#设置tensorflow的日志级别
+from tensorflow.python.platform import build_info
+
+import tensorflow as tf
+
+# 列出所有物理GPU设备  
+gpus = tf.config.list_physical_devices('GPU')  
+if gpus:  
+    # 如果有GPU，设置GPU资源使用率  
+    try:  
+        # 允许GPU内存按需增长  
+        for gpu in gpus:  
+            tf.config.experimental.set_memory_growth(gpu, True)  
+        # 设置可见的GPU设备（这里实际上不需要，因为已经通过内存增长设置了每个GPU）  
+        # tf.config.set_visible_devices(gpus, 'GPU')  
+        print("GPU可用并已设置内存增长模式。")  
+    except RuntimeError as e:  
+        # 虚拟设备未就绪时可能无法设置GPU  
+        print(f"设置GPU时发生错误: {e}")  
+else:  
+    # 如果没有GPU  
+    print("没有检测到GPU设备。")
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+PATH = os.path.join(os.path.dirname(path_to_zip), 'cats_and_dogs_filtered')
+
+train_dir = os.path.join(PATH, 'train')
+validation_dir = os.path.join(PATH, 'validation')
+
+BATCH_SIZE = 32
+IMG_SIZE = (160, 160)
+train_dataset = tf.keras.utils.image_dataset_from_directory(train_dir,
+                                                            shuffle=True,
+                                                            batch_size=BATCH_SIZE,
+                                                            image_size=IMG_SIZE)
+
+validation_dataset = tf.keras.utils.image_dataset_from_directory(validation_dir,
+                                                                 shuffle=True,
+                                                                 batch_size=BATCH_SIZE,
+                                                                 image_size=IMG_SIZE)
+
+class_names = train_dataset.class_names
+class_names=['猫' if i=='cats' else '狗' for i in class_names]
+print(class_names)
+
+plt.figure(figsize=(10, 10))
+plt.rcParams['font.family'] = 'WenQuanYi Micro Hei'  # 设置字体为中文字体
+for images, labels in train_dataset.take(1):#从训练集取出一个批次
+  for i in range(25):#显示前25张图片
+    plt.subplot(5,5, i + 1)#5行5列子视图
+    plt.xticks([])#不带刻度
+    plt.yticks([])
+    plt.grid(False) #不带网格
+    plt.imshow(images[i].numpy().astype('uint8'))
+    plt.xlabel(class_names[labels[i]])
+plt.show()
+
+# 由于原始数据集不包含测试集，因此您需要创建一个。为此，请使用 tf.data.experimental.cardinality
+# 确定验证集中有多少批次的数据，然后将其中的 20% 移至测试集。
+
+val_batches = tf.data.experimental.cardinality(validation_dataset)
+
+val_batches.numpy()
+
+# 注意，这种分割是“惰性”的，即数据集不会被立即加载到内存中，而是在需要时
+# （例如，在迭代数据集时）才会进行实际的分割操作。
+
+test_dataset = validation_dataset.take(val_batches // 5)#获取前6个批次
+validation_dataset = validation_dataset.skip(val_batches // 5)#获取余下的批次
+
+print('验证集批次: %d' % tf.data.experimental.cardinality(validation_dataset))
+print('测试集批次: %d' % tf.data.experimental.cardinality(test_dataset))
+
+len(train_dataset)*BATCH_SIZE
+
+AUTOTUNE = tf.data.AUTOTUNE
+train_dataset = train_dataset.shuffle(len(train_dataset)*BATCH_SIZE).prefetch(buffer_size=AUTOTUNE)
+validation_dataset = validation_dataset.prefetch(buffer_size=AUTOTUNE)
+test_dataset = test_dataset.prefetch(buffer_size=AUTOTUNE)
+
+# 当您没有较大的图像数据集时，最好将随机但现实的转换应用于训练图像（例如旋转或水平翻转）来人为引入样本多样性
+# 。这有助于使模型暴露于训练数据的不同方面并减少过拟合。
+
+data_augmentation = tf.keras.Sequential([
+  tf.keras.layers.RandomFlip('horizontal'),#随机镜像
+  tf.keras.layers.RandomRotation(0.2),#随机旋转指定角度
+  tf.keras.layers.RandomZoom(0.1),#随机缩放
+])
+
+#当调用 Model.fit 时，这些层仅在训练过程中才会处于有效状态。在 Model.evaluate评估模式
+# 或 Model.predict推断模式下使用模型时，它们处于停用状态。
+
+for image, _ in train_dataset.take(1):#获取1个批次
+  print(image.shape)
+  plt.figure(figsize=(10, 10))#设置画布大小
+  first_image = image[0]#获取批次中的第一个图片
+  for i in range(9):
+    plt.subplot(3, 3, i + 1)
+    #增加一维是因为序列也好,层也好,模型也好,需要4维张量
+    augmented_image = data_augmentation(tf.expand_dims(first_image, 0))
+    plt.imshow(augmented_image[0] / 255)
+    plt.axis('off')
+
+# 您将下载 tf.keras.applications.MobileNetV2 作为基础模型。
+# 此模型期望像素值处于 [-1, 1] 范围内，但此时，图像中的像素值处于
+# [0, 255] 范围内。要重新缩放这些像素值，请使用模型随附的预处理方法
+
+preprocess_input = tf.keras.applications.mobilenet_v2.preprocess_input
+
+# 缩放因子 1./127.5：这个值通常用于将像素值从 [0, 255] 范围（这是8位无符号整数的标准范围）缩放到 [0, 2] 范围。
+# 这种缩放是许多深度学习模型在处理图像数据时常用的预处理步骤，因为它有助于模型更快地收敛。偏移量 -1：这个值用于将
+# 缩放后的数据范围从 [0, 2] 偏移到 [-1, 1]。这种范围调整在某些模型中可能更为方便，因为它将数据的中心点置于零，
+# 这有助于某些类型的神经网络（如某些类型的激活函数）更好地学习数据的特征。
+
+rescale = tf.keras.layers.Rescaling(1./127.5, offset=-1)
+
+#注：如果使用其他 tf.keras.applications，请确保查阅 API 文档以确定它们是否期望 [-1,1] 或 [0, 1] 范围内的像素
+
+a=preprocess_input(np.random.randint(0,255,size=(20,20)))
+print(a.max(),a.min())
+
+# Create the base model from the pre-trained model MobileNet V2
+IMG_SHAPE = IMG_SIZE + (3,)
+
+print(IMG_SHAPE,type(IMG_SHAPE),type(IMG_SIZE))
+
+base_model = tf.keras.applications.MobileNetV2(input_shape=IMG_SHAPE,
+                                               include_top=False,
+                                               weights='imagenet')
+
+base_model.summary()
+
+#此特征提取程序将每个 160x160x3 图像转换为 5x5x1280 的特征图。
+
+image_batch, label_batch = next(iter(train_dataset))
+feature_batch = base_model(image_batch)
+print(feature_batch.shape)
+
+#冻结（通过设置 layer.trainable = False）可避免在训练期间更新给定层中的权重。
+base_model.trainable = False
+
+# 设置 layer.trainable = False 时，BatchNormalization
+# 层将以推断模式运行，并且不会更新其均值和方差统计信息。
+
+# 解冻包含 BatchNormalization 层的模型以进行微调时，应在调用基础模型时
+# 通过传递 training = False 来使 BatchNormalization 层保持在推断模式下
+#否则，应用于不可训练权重的更新将破坏模型已经学习到的内容。
+
+#在 5x5 空间位置内取平均值，以将特征图转换成一个向量（包含 1280 个元素）
+global_average_layer = tf.keras.layers.GlobalAveragePooling2D()
+feature_batch_average = global_average_layer(feature_batch)
+print(feature_batch_average.shape)
+
+prediction_layer = tf.keras.layers.Dense(1)
+prediction_batch = prediction_layer(feature_batch_average)
+print(prediction_batch.shape)
+
+# Dense层将这些特征转换成每个图像一个预测。您在此处不需要激活函数，因为此预测将被视为 logits
+# 或原始预测值。正数预测 1 类，负数预测 0 类。
+
+# 通过使用 Keras 函数式 API 将数据扩充、重新缩放、base_model
+# 和特征提取程序层链接在一起来构建模型。如前面所述，由于我们的模型包含
+# BatchNormalization 层，因此请使用 training = False。
+
+inputs = tf.keras.Input(shape=(160, 160, 3))
+x = data_augmentation(inputs)#增强过的数据
+x = preprocess_input(x)#图像预处理,把数据标准化为(-1,1)
+x = base_model(x, training=False)#设置参数不可训练
+x = global_average_layer(x)#在(5*5)特征图内取均值形成特征向量
+x = tf.keras.layers.Dropout(0.2)(x)#随机失活
+outputs = prediction_layer(x)#输出层,二分类,logits
+model = tf.keras.Model(inputs, outputs)
+
+model.summary()
+
+base_learning_rate =1e-4
+model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=base_learning_rate),
+              #from_logits=True,模型最后一层是线性输出的话,这个要设置为True
+              #如果是概率输出,就是设置了sigmoid或softmax激活函数,这个要设置
+              #成False
+              loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),
+              metrics=['acc'])
+
+len(model.trainable_variables)#w(权重)和b(偏距)
+
+initial_epochs = 10
+loss0, accuracy0 = model.evaluate(validation_dataset)
+
+print("initial loss: {:.2f}".format(loss0))
+print("initial accuracy: {:.2f}".format(accuracy0))
+
+history = model.fit(train_dataset,
+                    epochs=initial_epochs,
+                    validation_data=validation_dataset)
+
+history.history.keys()
+
+len(history.history['acc'])
+
+acc = history.history['acc']#训练准确率
+val_acc = history.history['val_acc']#验证准确率
+loss = history.history['loss']#训练损失
+val_loss = history.history['val_loss']#验证损失
+
+plt.rcParams['font.family'] = 'WenQuanYi Micro Hei'
+plt.figure(figsize=(8, 8))#设置画布大小
+plt.subplot(2, 1, 1)#两行一列第一个子视图
+plt.plot(acc, label='训练准确率')
+plt.plot(val_acc, label='验证准确率')
+plt.legend(loc='lower right')#右下
+plt.ylabel('准确率')
+plt.ylim([min(plt.ylim()),1])
+plt.title('训练与验证准确率')
+plt.subplot(2, 1, 2)#两行一列第二个子视图
+plt.plot(loss, label='训练损失')
+plt.plot(val_loss, label='验证损失')
+plt.legend(loc='upper right')#右上
+plt.ylabel('交叉熵损失')
+plt.ylim([0,1.0])
+plt.title('训练与验证损失')
+plt.xlabel('训练轮次')
+plt.show()
+
+# 注：如果您想知道为什么验证指标明显优于训练指标，主要原因是 tf.keras
+# .layers.BatchNormalization 和 tf.keras.layers.Dropout
+# 等层会影响训练期间的准确率。在计算验证损失时，它们处于关闭状态
+
+# 在较小程度上，这也是因为训练指标报告的是某个周期的平均值，而验证
+# 指标则在经过该周期后才进行评估，因此验证指标会看到训练时间略长一些的模型
+
+# 进一步提高性能的一种方式是在训练（或“微调”）预训练模型顶层的权重的同时，另外训练您添加的分类器。
+# 训练过程将强制权重从通用特征映射调整为专门与数据集相关联的特征。
+
+# 注：只有在您使用设置为不可训练的预训练模型训练顶级分类器之后，才能尝试这样做。
+# 如果您在预训练模型的顶部添加一个随机初始化的分类器并尝试共同训练所有层，则梯
+# 度更新的幅度将过大（由于分类器的随机权重所致），这将导致您的预训练模型忘记它已经学习的内容。
+
+# 另外，您还应尝试微调少量顶层而不是整个 MobileNet 模型。在大多数卷积网络中，层越高，
+# 它的专门程度就越高。前几层学习非常简单且通用的特征，这些特征可以泛化到几乎所有类型
+# 的图像。随着您向上层移动，这些特征越来越特定于训练模型所使用的数据集。微调的目标是
+# 使这些专用特征适应新的数据集，而不是覆盖通用学习。
+
+# 您需要做的是解冻 base_model 并将底层设置为不可训练。随后，您应该重新编译模型
+# （使这些更改生效的必需操作），然后恢复训练。
+
+base_model.trainable = True
+
+#看看base_model有多少层
+print("Number of layers in the base model: ", len(base_model.layers))
+#从101层之后做微调
+fine_tune_at = 100
+# 冻结前100层(索引0-99的层被冻结)
+for layer in base_model.layers[:fine_tune_at]:
+  layer.trainable = False
+
+# 当您正在训练一个大得多的模型并且想要重新调整预训练权重时，
+# 请务必在此阶段使用较低的学习率。否则，您的模型可能会很快过拟合。
+
+model.compile(loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),#二元交叉熵损失
+              # 之前优化器是Adam,现在是RMSprop,之前学习率是1e-4,现在学习率是1e-5
+              optimizer = tf.keras.optimizers.RMSprop(learning_rate=base_learning_rate/10),
+              metrics=['acc'])
+
+model.summary()
+
+len(model.trainable_variables)
+
+# 如果您已提前训练至收敛，则此步骤将使您的准确率提高几个百分点。
+fine_tune_epochs = 10
+total_epochs =  initial_epochs + fine_tune_epochs
+print(fine_tune_epochs,total_epochs)
+
+history.epoch
+
+# epochs参数指定了模型应该遍历整个训练数据集多少次。每一次遍历整个数据集都被
+# 称为一个epoch。在这个例子中，epochs=total_epochs意味着模型将遍历训练数
+# 据集total_epochs次。如果你设置total_epochs=20，那么模型将训练20个epoch。
+
+# initial_epoch参数通常用于在继续训练一个先前已经训练过的模型时使用。它指定了开始训练的epoch索引。
+# 在你的代码中，initial_epoch=history.epoch[-1]意味着训练将从history.epoch[-1]指定的epoch
+# 开始。history.epoch[-1]获取了history对象中最后一个epoch的索引。通常，当你想要从一个已经训练过
+# 的模型继续训练时，你会保存模型的训练历史到history对象中，并使用这个对象的epoch属性来跟踪已经完成
+# 的epoch数量。然后，在下次训练时，你可以设置initial_epoch为最后一次训练的epoch数加一，以便从那
+# 个点继续训练，而不是从头开始。在你的例子中，假设history.epoch[-1]的值为9，那么initial_epoch将
+# 被设置为10。这意味着模型将从第10个epoch开始继续训练，而不是从头开始。
+
+# 举个例子，假设 history.epoch[3] 的值是3（这意味着 history 对象记录了到第4个epoch的训练历史），
+# 当你设置 initial_epoch=3 并调用 model.fit 时，实际的模型权重更新会从第4个epoch结束后的状态
+# 开始。但是，新的训练历史将从 epoch 4 开始记录，因为 TensorFlow 会认为下一个 epoch 是4
+# （即 initial_epoch + 1）。
+# 因此，不论你将 initial_epoch 设置为什么值，都不会影响模型实际的训练起点，它只会影响训练历史的
+# 记录起点。实际的训练起点是由模型上一次训练结束时的状态决定的。
+
+# 因为那个模型数据还在内存里,你就是不设置这个值,模型还是接着之前的状态训练,这个值影响的
+# 是history里的epoch列表从那开始连续
+
+# 如果您设置了initial_epoch参数，比如initial_epoch=history.epoch[-1]，
+# 那么TensorFlow会从history.epoch[-1]指定的epoch数加一的位置开始记录新
+# 的训练历史。这样做的好处是，您可以保持训练历史的连续性，
+# 并在继续训练时能够清晰地看到每个epoch的性能指标。
+
+history_fine = model.fit(train_dataset,
+                         epochs=total_epochs,#20
+                         initial_epoch=history.epoch[-1],#就是9
+                         validation_data=validation_dataset)
+
+#经过微调后，模型在验证集上的准确率最高达到99.35%
+
+acc += history_fine.history['acc']#训练准确率
+val_acc += history_fine.history['val_acc']#验证准确率
+loss += history_fine.history['loss']#训练损失
+val_loss += history_fine.history['val_loss']#验证损失
+
+plt.figure(figsize=(8, 8))
+plt.subplot(2, 1, 1)
+plt.plot(acc, label='Training Accuracy')
+plt.plot(val_acc, label='Validation Accuracy')
+plt.ylim([0.8, 1])
+plt.plot([initial_epochs-1,initial_epochs-1],
+          plt.ylim(), label='Start Fine Tuning')
+plt.legend(loc='lower right')
+plt.title('Training and Validation Accuracy')
+
+plt.subplot(2, 1, 2)
+plt.plot(loss, label='Training Loss')
+plt.plot(val_loss, label='Validation Loss')
+plt.ylim([0, 1.0])
+plt.plot([initial_epochs-1,initial_epochs-1],
+         plt.ylim(), label='Start Fine Tuning')
+plt.legend(loc='upper right')
+plt.title('Training and Validation Loss')
+plt.xlabel('epoch')
+plt.show()
+
+#最后，您可以使用测试集在新数据上验证模型的性能。
+
+loss, accuracy = model.evaluate(test_dataset)
+print('Test accuracy :', accuracy)
+
+#现在，您可以使用此模型来预测您的宠物是猫还是狗。
+
+# as_numpy_iterator(),转换成np迭代器
+image_batch, label_batch = test_dataset.as_numpy_iterator().next()#获取一个批次
+print(image_batch.shape,image_batch[0].max(),image_batch[0].min())
+predictions = model.predict_on_batch(image_batch).flatten()
+#sigmoid返回概率
+predictions = tf.nn.sigmoid(predictions)
+print(np.round(predictions,2))
+predictions = tf.where(predictions < 0.5, 0, 1)#概率小于0.5,设置为0,大于0.5设置为1
+print('Predictions:\n', predictions.numpy())
+print('Labels:\n', label_batch)
+plt.figure(figsize=(10, 10))
+for i in range(9):
+  plt.subplot(3, 3, i + 1)
+  plt.imshow(image_batch[i].astype("uint8"))
+  plt.title(class_names[predictions[i]])
+  plt.axis("off")#关闭坐标轴显示
+
+# model.predict_on_batch() 方法用于对单个批次的数据进行预测，并返回预测结果。
+# 这个方法不会使用 TensorFlow 的数据管道功能（如批处理、打乱等），而是直接对传入
+# 的 NumPy 数组进行预测。因此，它通常比 model.predict() 更快，
+# 因为它避免了额外的数据预处理和批次处理步骤。
+
+#使用 predict_on_batch() 时，你需要确保传入的数据已经是正确形状和类型的 NumPy 数组。
+
+# model.predict() 方法则更灵活，它接受一个 tf.data.Dataset 对象或一个 NumPy 数组作为输入，
+# 并返回一个包含预测结果的 NumPy 数组。与 predict_on_batch() 不同，predict() 方法会利用
+# TensorFlow 的数据管道功能，这包括批次处理、打乱等。这使得 predict() 在处理大型数
+# 据集时更加高效，特别是当需要利用 GPU 加速时。
+
+# 此外，predict() 方法还提供了更多的选项，如设置 batch_size（批次大小）、verbose
+# （日志显示级别）和 steps（处理的步数）等参数。
+
+# 输入类型：predict_on_batch() 通常接受 NumPy 数组作为输入，而 predict() 可以接受 NumPy
+# 数组或 tf.data.Dataset 对象。
+# 数据管道：predict_on_batch() 不使用 TensorFlow 的数据管道功能，而 predict() 会使用。
+# 性能：对于单个批次的预测，predict_on_batch() 通常更快，因为它避免了额外的数据预处理步骤。然而，对于大型数据集，
+# 使用 predict() 并利用其数据管道功能可能更高效。
+# 灵活性：predict() 提供了更多的选项和参数，使得它在处理复杂的数据集和预测任务时更加灵活
+# 在你的代码中，由于你已经通过 as_numpy_iterator().next() 获取了 NumPy 数组形式的单个
+# 批次数据，因此使用 predict_on_batch() 是合适的。但如果你有一个 tf.data.Dataset 对象并希望利用
+# TensorFlow 的数据管道功能进行预测，那么你应该使用 predict() 方法。

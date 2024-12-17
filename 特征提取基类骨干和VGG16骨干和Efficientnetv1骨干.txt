@@ -1,0 +1,770 @@
+# 骨干网络的基础类。
+# 骨干网络是在标准任务上训练的可重用模型层，例如在Imagenet分类任务上训练的模型层，它们可以在其他任务中复用。
+# 用户可以通过指定的模块路径 keras_cv.models.Backbone 来访问该类。这意味着当用户安装了 Keras CV 库后，
+# 就可以通过这个路径来导入并使用 Backbone 类。
+@keras_cv_export("keras_cv.models.Backbone")
+class Backbone(keras.Model):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs) # 调用父类的初始化方法
+        self._pyramid_level_inputs = {} # 金字塔层级的输入
+        # 用于存储当前模型中所有层的唯一标识符（ID）。这些 ID 将用于过滤掉那些不应该出现在 __dir__ 方法
+        # 返回结果中的层属性。
+        self._functional_layer_ids = set(
+            id(layer) for layer in self._flatten_layers()
+        )
+    # __dir__ 方法覆盖了默认的行为，用于过滤掉那些由函数式 API 自动创建的内部层对象，使得动态属性列表更清晰、
+    # 更简洁。这有助于在交互式环境中（如 Python shell 或 Jupyter Notebook）查看类的可用属性时，避免列出那
+    # 些内部实现细节。
+    def __dir__(self):
+        def filter_fn(attr):
+            try:
+                return id(getattr(self, attr)) not in self._functional_layer_ids
+            except:
+                return True
+
+        return filter(filter_fn, super().__dir__())
+    # get_config 方法返回一个配置字典，包含了当前实例的一些关键属性
+    # 这里没有调用父类的 get_config 方法，因为默认的功能性模型的 get_config 方法返回的是嵌套结构，
+    # 不适合传递给 Backbone 构造函数。
+    def get_config(self):
+        # 在功能型模型中，get_config 方法通常会返回一个包含模型结构的信息的嵌套字典。对于 Backbone 类来说，这样的配
+        # 置可能过于复杂，无法直接用于重新构造一个新的 Backbone 实例。因此，Backbone 类需要覆盖 get_config 方法，
+        # 以便返回一个简化后的配置，这个配置可以直接传递给 Backbone 的构造函数。
+        return {
+            "name": self.name,
+            "trainable": self.trainable,
+        }
+    # from_config 是一个类方法，用于从配置字典中重建一个 Backbone 实例。默认的功能性模型的 from_config 方法会返回一
+    # 个普通的 keras.Model 实例，而这里我们覆盖它以确保返回的是 Backbone 的子类实例。
+    @classmethod
+    def from_config(cls, config):
+        # 功能型模型的默认 `from_config()` 方法会返回一个普通的 `keras.Model` 实例。
+        # 我们覆盖它是为了得到一个子类的实例。
+        return cls(**config)
+    # presets 类属性,
+    @classproperty
+    def presets(cls):
+        return {}
+    # 这个字典用于存储带有权重的预设配置，即那些已经经过预训练并带有权重的模型配置
+    @classproperty
+    def presets_with_weights(cls):
+        return {}
+    # 这个字典通过从 presets 中排除 presets_with_weights 中的项来生成，即所有不在 presets_with_weights 中的预设配置。
+    # 示例：如果 presets 包含 "base"、"large"、"pretrained_base"、"pretrained_large"，而 presets_with_weights 包含
+    # "pretrained_base"、"pretrained_large"，那么 presets_without_weights 将只包含 "base" 和 "large"。
+    @classproperty
+    def presets_without_weights(cls):
+        return {
+            preset: cls.presets[preset]
+            for preset in set(cls.presets) - set(cls.presets_with_weights)
+        }
+    # preset：预设配置的名称，用于标识一个特定的模型配置。load_weights：可选参数，指定是否加载权重。
+    # 默认为 None，表示按照预设配置决定是否加载权重。
+    @classmethod
+    def from_preset(
+        cls,
+        preset,
+        load_weights=None,
+        **kwargs,
+    ):
+        # 如果提供的 preset 名称存在于 cls.presets 字典中，则从中提取 "kaggle_handle"
+        # 字段的值作为新的 preset 名称。
+        if preset in cls.presets:
+            preset = cls.presets[preset]["kaggle_handle"]
+        # 检查预设配置,调用 check_preset_class 函数，检查 preset 是否适用于当前类 cls。
+        check_preset_class(preset, cls)
+        # 调用 load_from_preset 函数，传入 preset 名称、是否加载权重的标志以及任何需要覆盖的配置参数。
+        # config_overrides 参数将传递 **kwargs 中的所有关键字参数，用于覆盖预设配置中的某些设置。
+        return load_from_preset(
+            preset,
+            load_weights=load_weights,
+            config_overrides=kwargs,
+        )
+
+    def __init_subclass__(cls, **kwargs):
+        # 当一个子类被创建时，首先调用基类的 __init_subclass__ 方法，这样可以确保基类的初始化逻辑被执行。
+        super().__init_subclass__(**kwargs)
+        # 检查子类的字典 __dict__ 是否包含 from_preset 键，如果没有，则定义一个默认的 from_preset 方法。
+        if "from_preset" not in cls.__dict__:
+            # 这个默认的 from_preset 方法会调用父类的 from_preset 方法，并传递相同的参数。
+            def from_preset(calling_cls, *args, **kwargs):
+                return super(cls, calling_cls).from_preset(*args, **kwargs)
+            # 将定义好的 from_preset 方法作为类方法（classmethod）赋值给子类的 from_preset 属性
+            # 这里定义了一个名为 from_preset 的函数，并将其转换为类方法后赋值给 cls.from_preset。
+            cls.from_preset = classmethod(from_preset)
+        # 如果子类的 presets 字典为空（即没有预设配置），则为 from_preset 方法设置一个默认的文档字符串，指示
+        # 该类没有可用的预设配置。
+        if not cls.presets:
+            cls.from_preset.__func__.__doc__ = """Not implemented.
+
+            No presets available for this class.
+            """
+        # 这里检查 from_preset 方法的文档字符串是否为空。如果是空的，说明子类没有覆盖或重写这个方法的文档字符串。
+        if cls.from_preset.__doc__ is None:
+            # 如果文档字符串为空，则从基类 Backbone 中复制 from_preset 方法的文档字符串到子类的 from_preset 方法中。
+            # 这一步是为了保证至少有一个默认的文档字符串，即使子类没有显式定义。
+            cls.from_preset.__func__.__doc__ = Backbone.from_preset.__doc__
+            # 使用 format_docstring 函数来格式化 from_preset 方法的文档字符串。
+            format_docstring(
+                model_name=cls.__name__,
+                example_preset_name=next(iter(cls.presets_with_weights), ""),
+                preset_names='", "'.join(cls.presets),
+                preset_with_weights_names='", "'.join(cls.presets_with_weights),
+            )(cls.from_preset.__func__)
+
+    @property
+    def pyramid_level_inputs(self):
+        # 中间模型输出用于特征提取。
+        # 格式是一个字典，其键为字符串，值为层名。
+        # 字符串键代表特征输出的层级。一个典型的特征金字塔有五个层级，对应于骨干网络中的尺度 "P3"、"P4"、"P5"、
+        # "P6"、"P7"。尺度 Pn 代表比输入图像宽度和高度小 2^n 倍的特征图。
+        # 示例：
+        # {
+        #     'P3': 'v2_stack_1_block4_out',
+        #     'P4': 'v2_stack_2_block6_out',
+        #     'P5': 'v2_stack_3_block3_out',
+        # }
+        return self._pyramid_level_inputs
+    @pyramid_level_inputs.setter
+    def pyramid_level_inputs(self, value):
+        self._pyramid_level_inputs = value
+# vgg卷积池化块(特征提取)
+def apply_vgg_block(
+    x,
+    num_layers,
+    filters,
+    kernel_size,
+    activation,
+    padding,
+    max_pool,
+    name,
+):
+    # 卷积的层数,卷积中带设置激活函数
+    for num in range(1, num_layers + 1):
+        x = layers.Conv2D(
+            filters,
+            kernel_size,
+            activation=activation,
+            padding=padding,
+            name=f"{name}_conv{num}",
+        )(x)
+    # 如果设置了max_pool,那就应用最大池化(步长是2,下采样)
+    if max_pool:
+        x = layers.MaxPooling2D((2, 2), (2, 2), name=f"{name}_pool")(x)
+    return x
+
+@keras_cv_export("keras_cv.models.VGG16Backbone")
+class VGG16Backbone(Backbone):
+    def __init__(
+        self,
+        include_rescaling,
+        include_top,
+        input_tensor=None,
+        num_classes=None,
+        input_shape=(224, 224, 3),
+        pooling=None,
+        classifier_activation="softmax",
+        name="VGG16",
+        **kwargs,
+    ):
+        # 检验输入
+        # 如果include_top是True,表示使用预训练模型的分类头,这时就要指定num_classes
+        if include_top and num_classes is None:
+            raise ValueError(
+                "If `include_top` is True, you should specify `num_classes`. "
+                f"Received: num_classes={num_classes}"
+            )
+        # 如果指定了带分类头,就不应该指定pooling
+        if include_top and pooling:
+            raise ValueError(
+                f"`pooling` must be `None` when `include_top=True`."
+                f"Received pooling={pooling} and include_top={include_top}. "
+            )
+        # 获取模型输入
+        img_input = utils.parse_model_inputs(input_shape, input_tensor)
+        x = img_input # (224,224,3)
+        # 归一化
+        if include_rescaling:
+            x = layers.Rescaling(scale=1 / 255.0)(x)
+        # 经过第一个卷积池化块的处理,同时下采样
+        x = apply_vgg_block( # (112,112,3)
+            x=x,
+            num_layers=2,
+            filters=64,
+            kernel_size=(3, 3),
+            activation="relu",
+            padding="same", # 填充
+            max_pool=True,
+            name="block1",
+        )
+        
+        x = apply_vgg_block( # (56,56,3)
+            x=x,
+            num_layers=2,
+            filters=128,
+            kernel_size=(3, 3),
+            activation="relu",
+            padding="same",
+            max_pool=True,
+            name="block2",
+        )
+
+        x = apply_vgg_block( # (28,28,3)
+            x=x,
+            num_layers=3,
+            filters=256,
+            kernel_size=(3, 3),
+            activation="relu",
+            padding="same",
+            max_pool=True,
+            name="block3",
+        )
+
+        x = apply_vgg_block( # (14,14,3)
+            x=x,
+            num_layers=3,
+            filters=512,
+            kernel_size=(3, 3),
+            activation="relu",
+            padding="same",
+            max_pool=True,
+            name="block4",
+        )
+
+        x = apply_vgg_block( # (7,7,3)
+            x=x,
+            num_layers=3,
+            filters=512,
+            kernel_size=(3, 3),
+            activation="relu",
+            padding="same",
+            max_pool=True,
+            name="block5",
+        )
+        # 如果包括分类头
+        if include_top:
+            x = layers.Flatten(name="flatten")(x) # 扁平化,变成向量(b,d)
+            # 投影,浓缩特征
+            x = layers.Dense(4096, activation="relu", name="fc1")(x)
+            x = layers.Dense(4096, activation="relu", name="fc2")(x)
+            # 分类,softmax归一化
+            x = layers.Dense(
+                num_classes,
+                activation=classifier_activation,
+                name="predictions",
+            )(x)
+        # 如果不包括分类头,看传入的pooling
+        else:
+            if pooling == "avg": # 如果是avg,就是全局平均池化
+                x = layers.GlobalAveragePooling2D()(x)
+            elif pooling == "max":# 如果是max,就是全局最大池化
+                x = layers.GlobalMaxPooling2D()(x)
+        # 调用父类的初始化方法
+        super().__init__(inputs=img_input, outputs=x, name=name, **kwargs)
+        # 设置这些属性为实例属性
+        self.include_rescaling = include_rescaling
+        self.include_top = include_top
+        self.num_classes = num_classes
+        self.input_tensor = input_tensor
+        self.pooling = pooling
+        self.classifier_activation = classifier_activation
+    # 获取配置
+    def get_config(self):
+        return {
+            "include_rescaling": self.include_rescaling, # 是否包含归一化
+            "include_top": self.include_top, # 是否包含分类头
+            "name": self.name,
+            "input_shape": self.input_shape[1:], # (h,w,c)
+            "input_tensor": self.input_tensor,
+            "pooling": self.pooling, # 传入的池化方式
+            "num_classes": self.num_classes, # 几分类
+            # 分类器激活函数
+            "classifier_activation": self.classifier_activation,
+            "trainable": self.trainable,  # 是否训练状态
+        }
+
+m=VGG16Backbone(include_rescaling=True,include_top=True,num_classes=10)
+
+m.summary()
+
+from keras.applications.vgg16 import VGG16
+
+vgg=VGG16(input_shape=(224,224,3),classes=10,weights=None)
+
+vgg.summary()
+
+vgg最大的问题是最后那个扁平化操作,大败笔,这次摊平,模型参数一下多到1个亿,这是它的模型参数太多的重要原因,而且特征提取模块也太简单,模式化的两卷积一池化,或三卷积一池化,之后的模型基本用到的技术中可以没有池化,但是一般是残差网络,深度卷积,或者可分离卷积提取特征,最后肯定用平均池化,因为那样效果最好,参数也能控制住.
+
+def apply_efficientnet_block(
+    inputs,
+    filters_in=32,
+    filters_out=16,
+    kernel_size=3,
+    strides=1,
+    activation="swish",
+    expand_ratio=1,
+    se_ratio=0.0,
+    dropout_rate=0.0,
+    name="",
+):
+   
+    filters = filters_in * expand_ratio # 内部通道数
+    # 如果扩张系数不是1
+    if expand_ratio != 1:
+        # 点卷积切换通道
+        x = keras.layers.Conv2D(
+            filters=filters,
+            kernel_size=1,
+            strides=1,
+            padding="same",
+            use_bias=False,
+            kernel_initializer=conv_kernel_initializer(),
+            name=name + "expand_conv",
+        )(inputs)
+        # 批次标准化块
+        x = keras.layers.BatchNormalization(
+            axis=3,
+            name=name + "expand_bn",
+        )(x)
+        x = keras.layers.Activation(
+            activation, name=name + "expand_activation"
+        )(x)
+    # 如果扩张系数==1,不改变
+    else:
+        x = inputs
+
+    # 深度卷积,如果步长是2,要用自定义的填充,否则用conv_pad = "same"
+    if strides == 2:
+        x = keras.layers.ZeroPadding2D(
+            padding=utils.correct_pad_downsample(x, kernel_size),
+            name=name + "dwconv_pad",
+        )(x)
+        conv_pad = "valid"
+    else:
+        conv_pad = "same"
+    # 深度卷积
+    x = keras.layers.DepthwiseConv2D(
+        kernel_size=kernel_size,
+        strides=strides,
+        padding=conv_pad,
+        use_bias=False,
+        depthwise_initializer=conv_kernel_initializer(),
+        name=name + "dwconv",
+    )(x)
+    # 批次激活块
+    x = keras.layers.BatchNormalization(
+        axis=3,
+        name=name + "dwconv_bn",
+    )(x)
+    x = keras.layers.Activation(activation, name=name + "dwconv_activation")(x)
+    # 压缩激励阶段
+    if 0 < se_ratio <= 1:
+        # 压缩比例
+        filters_se = max(1, int(filters_in * se_ratio))
+        # 先全局平均池化
+        se = keras.layers.GlobalAveragePooling2D(name=name + "se_squeeze")(x)
+        se_shape = (1, 1, filters)
+        # 变形
+        se = keras.layers.Reshape(se_shape, name=name + "se_reshape")(se)
+        # 压缩点卷积切换到压缩通道,压缩步骤实际上起到了特征浓缩的作用。通过减少通道数，模型可以更
+        # 高效地学习到通道间的相互依赖关系。
+        se = keras.layers.Conv2D(
+            filters_se,
+            1,
+            padding="same",
+            activation=activation,
+            kernel_initializer=conv_kernel_initializer(),
+            name=name + "se_reduce",
+        )(se)
+        # 还原到原通道数的点卷积,激活函数用sigmoid,给通道打分
+        se = keras.layers.Conv2D(
+            filters,
+            1,
+            padding="same",
+            activation="sigmoid",
+            kernel_initializer=conv_kernel_initializer(),
+            name=name + "se_expand",
+        )(se)
+        # 对se模块之前的输入特征图进行通道加权
+        x = keras.layers.multiply([x, se], name=name + "se_excite")
+    
+    # 输出阶段,点卷积切换通道
+    x = keras.layers.Conv2D(
+        filters=filters_out,
+        kernel_size=1,
+        strides=1,
+        padding="same",
+        use_bias=False,
+        kernel_initializer=conv_kernel_initializer(),
+        name=name + "project",
+    )(x)
+    # 批次激活块
+    x = keras.layers.BatchNormalization(
+        axis=3,
+        name=name + "project_bn",
+    )(x)
+    x = keras.layers.Activation(activation, name=name + "project_activation")(x)
+    # 如果步长等于1,并且filters_in == filters_out,残差连接
+    if strides == 1 and filters_in == filters_out:
+        if dropout_rate > 0: # dropout
+            x = keras.layers.Dropout(
+                dropout_rate,
+                noise_shape=(None, 1, 1, 1),
+                name=name + "drop",
+            )(x)
+        x = keras.layers.Add(name=name + "add")([x, inputs])
+    return x
+
+@keras_cv_export("keras_cv.models.EfficientNetV1Backbone")
+@keras.saving.register_keras_serializable(package="keras_cv.models")
+class EfficientNetV1Backbone(Backbone):
+    def __init__(
+        self,
+        *,
+        include_rescaling,# 是否对输入进行缩放
+        width_coefficient, # 网络宽度的缩放系数。
+        depth_coefficient, # 网络深度的缩放系数。
+        stackwise_kernel_sizes,  # 列表形式的整数，每个卷积块使用的内核大小。
+        stackwise_num_repeats, # 列表形式的整数，每个卷积块重复的次数。
+        stackwise_input_filters, # 列表形式的整数，每个卷积块的输入滤波器数量
+        stackwise_output_filters,# 列表形式的整数，每个卷积堆栈中每个卷积块的输出滤波器数量。
+        stackwise_expansion_ratios,# 列表形式的浮点数，传递给挤压和激励块的扩展比率。
+        stackwise_strides, # 列表形式的整数，每个卷积块的步长。
+        stackwise_squeeze_and_excite_ratios, # 列表形式的浮点数，传递给挤压和激励块的挤压和激励比率。
+        dropout_rate=0.2, # 在最终分类层之前的丢弃率。
+        drop_connect_rate=0.2, # 在跳过连接处的丢弃率。默认值设置为 0.2。
+        depth_divisor=8, # 网络宽度的一个单位。默认值设置为 8。
+        input_shape=(None, None, 3), # 可选的形状元组，应该正好有 3 个输入通道。
+        input_tensor=None,# 可选的 Keras 张量的输出作为模型的图像输入。
+        activation="swish", # 在每两个卷积层之间使用的激活函数。
+        **kwargs,
+    ):  
+        img_input = utils.parse_model_inputs(input_shape, input_tensor) # (b,h,w,c)
+        x = img_input
+        # 如果include_rescaling为True,就归一化
+        if include_rescaling:
+            x = keras.layers.Rescaling(1.0 / 255.0)(x)
+        # 正确的填充,确保输入尺寸是偶数时,也能正确填充
+        x = keras.layers.ZeroPadding2D(
+            padding=utils.correct_pad_downsample(x, 3), name="stem_conv_pad"
+        )(x)
+        # 确保输入的通道数是depth_divisor的整数倍
+        stem_filters = round_filters(
+            filters=stackwise_input_filters[0],
+            width_coefficient=width_coefficient,
+            divisor=depth_divisor,
+        )
+        # 卷积下采样(112,112,3)
+        x = keras.layers.Conv2D(
+            filters=stem_filters,
+            kernel_size=3,
+            strides=2,
+            padding="valid",
+            use_bias=False,
+            kernel_initializer=conv_kernel_initializer(),
+            name="stem_conv",
+        )(x)
+        # 批次标准化和激活函数处理块
+        x = keras.layers.BatchNormalization(
+            axis=3,
+            name="stem_bn",
+        )(x)
+        x = keras.layers.Activation(activation, name="stem_activation")(x)
+
+        # 统计所有层级中特征提取块的数目
+        block_id = 0
+        blocks = float(sum(stackwise_num_repeats)) # 提取块的总数
+        # 金字塔层级的特征提取块
+        pyramid_level_inputs = []
+        # 遍历每个层级
+        for i in range(len(stackwise_kernel_sizes)):
+            num_repeats = stackwise_num_repeats[i] # 块深度
+            input_filters = stackwise_input_filters[i] # 块输入通道数
+            output_filters = stackwise_output_filters[i] # 块输出通道数
+
+            # 规范化输入输出通道数
+            input_filters = round_filters(
+                filters=input_filters,
+                width_coefficient=width_coefficient,
+                divisor=depth_divisor,
+            )
+            output_filters = round_filters(
+                filters=output_filters,
+                width_coefficient=width_coefficient,
+                divisor=depth_divisor,
+            )
+            # 重复次数
+            repeats = round_repeats(
+                repeats=num_repeats,
+                depth_coefficient=depth_coefficient,
+            )
+            strides = stackwise_strides[i] # 步长
+            squeeze_and_excite_ratio = stackwise_squeeze_and_excite_ratios[i]
+            # 特征图被提取特征的重复次数,一个层级内的多个提取块
+            for j in range(repeats):
+                # j大于0,是指第二个开始
+                if j > 0:
+                    strides = 1
+                    input_filters = output_filters
+                # 只有第一次时,步长不等于1,那时是下采样,金字塔层级输入里添加之前的特征图名称
+                if strides != 1:
+                    pyramid_level_inputs.append(utils.get_tensor_input_name(x))
+
+                # 97是小写字母的开头,字母标志符
+                letter_identifier = chr(j + 97)
+                x = apply_efficientnet_block(
+                    inputs=x,
+                    filters_in=input_filters,
+                    filters_out=output_filters,
+                    kernel_size=stackwise_kernel_sizes[i],
+                    strides=strides,
+                    expand_ratio=stackwise_expansion_ratios[i],
+                    se_ratio=squeeze_and_excite_ratio,
+                    activation=activation,
+                    dropout_rate=drop_connect_rate * block_id / blocks,
+                    name="block{}{}_".format(i + 1, letter_identifier),
+                )
+                block_id += 1
+
+        # 规范化特征提取顶部输出通道数
+        top_filters = round_filters(
+            filters=1280,
+            width_coefficient=width_coefficient, # 宽度系数
+            divisor=depth_divisor,
+        )
+        # 点卷积混合切换通道数
+        x = keras.layers.Conv2D(
+            filters=top_filters,
+            kernel_size=1,
+            padding="same",
+            strides=1,
+            kernel_initializer=conv_kernel_initializer(),
+            use_bias=False,
+            name="top_conv",
+        )(x)
+        # 批次激活块
+        x = keras.layers.BatchNormalization(
+            axis=3,
+            name="top_bn",
+        )(x)
+        x = keras.layers.Activation(
+            activation=activation, name="top_activation"
+        )(x)
+        # 加入FPN
+        pyramid_level_inputs.append(utils.get_tensor_input_name(x))
+        # Create model.
+        super().__init__(inputs=img_input, outputs=x, **kwargs)
+        # 设置实例属性
+        self.include_rescaling = include_rescaling
+        self.width_coefficient = width_coefficient
+        self.depth_coefficient = depth_coefficient
+        self.dropout_rate = dropout_rate
+        self.drop_connect_rate = drop_connect_rate
+        self.depth_divisor = depth_divisor
+        self.activation = activation
+        self.input_tensor = input_tensor
+        # 构建金字塔层级的特征提取字典,idx-->name
+        self.pyramid_level_inputs = {
+            f"P{i + 1}": name for i, name in enumerate(pyramid_level_inputs)
+        }
+        self.stackwise_kernel_sizes = stackwise_kernel_sizes
+        self.stackwise_num_repeats = stackwise_num_repeats
+        self.stackwise_input_filters = stackwise_input_filters
+        self.stackwise_output_filters = stackwise_output_filters
+        self.stackwise_expansion_ratios = stackwise_expansion_ratios
+        self.stackwise_strides = stackwise_strides
+        self.stackwise_squeeze_and_excite_ratios = (
+            stackwise_squeeze_and_excite_ratios
+        )
+    # 这个方法的主要目的是为了让模型可以被序列化，也就是说，可以将模型的配置信息保存下来，以便以后可以重新构建相同的模型。
+    def get_config(self):
+        # get_config() 方法是一个用于获取模型配置信息的方法。它通常返回一个字典，这个字典包含了模型的各种配置参数。
+        config = super().get_config()
+        config.update( # 这部分代码更新了基础配置字典，加入了当前类实例特有的配置项。
+            {
+                "include_rescaling": self.include_rescaling,# 是否包含输入的归一化处理。
+                "width_coefficient": self.width_coefficient, # 用于控制模型宽度和深度的系数。
+                "depth_coefficient": self.depth_coefficient,
+                "dropout_rate": self.dropout_rate, # 用于控制模型的正则化程度。
+                "drop_connect_rate": self.drop_connect_rate,
+                "depth_divisor": self.depth_divisor, # 用于调整通道数的除数。
+                "activation": self.activation, # 激活函数。
+                "input_tensor": self.input_tensor, # 输入张量和形状。
+                "input_shape": self.input_shape[1:],
+                "trainable": self.trainable,# 权重是否冻结
+                "stackwise_kernel_sizes": self.stackwise_kernel_sizes, # 各个层级的配置信息。
+                "stackwise_num_repeats": self.stackwise_num_repeats,
+                "stackwise_input_filters": self.stackwise_input_filters,
+                "stackwise_output_filters": self.stackwise_output_filters,
+                "stackwise_expansion_ratios": self.stackwise_expansion_ratios,
+                "stackwise_strides": self.stackwise_strides,
+                "stackwise_squeeze_and_excite_ratios": (
+                    self.stackwise_squeeze_and_excite_ratios
+                ),
+            }
+        )
+        return config
+    # presets 是一个类属性，用于存储预设的配置信息。这些预设通常包含了一些预先定义好的模型配置，方便用户
+    # 快速选择和使用
+    @classproperty
+    def presets(cls):
+        return copy.deepcopy(backbone_presets)
+
+# 创建一个 EfficientNetV1Backbone 实例
+model = EfficientNetV1Backbone(
+    include_rescaling=True,
+    width_coefficient=1.0,
+    depth_coefficient=1.0,
+    dropout_rate=0.2,
+    drop_connect_rate=0.2,
+    depth_divisor=8,
+    activation="swish",
+    input_tensor=None,
+    input_shape=(224, 224, 3),
+    trainable=True,
+    stackwise_kernel_sizes=[3, 3, 5, 3, 5, 5, 3],
+    stackwise_num_repeats=[1, 2, 2, 3, 3, 4, 1],
+    stackwise_input_filters=[32, 16, 24, 40, 80, 112, 192, 320],
+    stackwise_output_filters=[16, 24, 40, 80, 112, 192, 320, 1280],
+    stackwise_expansion_ratios=[1, 6, 6, 6, 6, 6, 6],
+    stackwise_strides=[1, 2, 2, 2, 1, 2, 1],
+    stackwise_squeeze_and_excite_ratios=[0.25] * 7,
+)
+
+# 查看预设配置
+# print(EfficientNetV1Backbone.presets)
+
+from keras.applications.efficientnet import EfficientNetB0
+
+eff=EfficientNetB0(input_shape=(224,224,3),include_top=False)
+
+# metadata：
+#     description：描述了该模型的架构特点，指出这是一个 EfficientNet B-style 架构，具有 7 个卷积块，
+#     并且 width_coefficient 和 depth_coefficient 均为 1.0。
+#     params：模型的参数数量，这里是 4,050,716 个参数。
+#     official_name：官方命名，这里是 EfficientNetV1。
+#     path：模型文件所在的路径，这里是 efficientnetv1。
+# kaggle_handle：
+#     指定了模型文件在 Kaggle 上的存储位置，这里是 gs://keras-cv-kaggle/efficientnetv1_b0。
+
+backbone_presets_no_weights = {
+    "efficientnetv1_b0": {
+        "metadata": {
+            "description": (
+                "EfficientNet B-style architecture with 7 "
+                "convolutional blocks. This B-style model has "
+                "`width_coefficient=1.0` and `depth_coefficient=1.0`."
+            ),
+            "params": 4050716,
+            "official_name": "EfficientNetV1",
+            "path": "efficientnetv1",
+        },
+        "kaggle_handle": "gs://keras-cv-kaggle/efficientnetv1_b0",
+    },
+    "efficientnetv1_b1": {
+        "metadata": {
+            "description": (
+                "EfficientNet B-style architecture with 7 "
+                "convolutional blocks. This B-style model has "
+                "`width_coefficient=1.0` and `depth_coefficient=1.1`."
+            ),
+            "params": 6576704,
+            "official_name": "EfficientNetV1",
+            "path": "efficientnetv1",
+        },
+        "kaggle_handle": "gs://keras-cv-kaggle/efficientnetv1_b1",
+    },
+    "efficientnetv1_b2": {
+        "metadata": {
+            "description": (
+                "EfficientNet B-style architecture with 7 "
+                "convolutional blocks. This B-style model has "
+                "`width_coefficient=1.1` and `depth_coefficient=1.2`."
+            ),
+            "params": 7770034,
+            "official_name": "EfficientNetV1",
+            "path": "efficientnetv1",
+        },
+        "kaggle_handle": "gs://keras-cv-kaggle/efficientnetv1_b2",
+    },
+    "efficientnetv1_b3": {
+        "metadata": {
+            "description": (
+                "EfficientNet B-style architecture with 7 "
+                "convolutional blocks. This B-style model has "
+                "`width_coefficient=1.2` and `depth_coefficient=1.4`."
+            ),
+            "params": 10785960,
+            "official_name": "EfficientNetV1",
+            "path": "efficientnetv1",
+        },
+        "kaggle_handle": "gs://keras-cv-kaggle/efficientnetv1_b3",
+    },
+    "efficientnetv1_b4": {
+        "metadata": {
+            "description": (
+                "EfficientNet B-style architecture with 7 "
+                "convolutional blocks. This B-style model has "
+                "`width_coefficient=1.4` and `depth_coefficient=1.8`."
+            ),
+            "params": 17676984,
+            "official_name": "EfficientNetV1",
+            "path": "efficientnetv1",
+        },
+        "kaggle_handle": "gs://keras-cv-kaggle/efficientnetv1_b4",
+    },
+    "efficientnetv1_b5": {
+        "metadata": {
+            "description": (
+                "EfficientNet B-style architecture with 7 "
+                "convolutional blocks. This B-style model has "
+                "`width_coefficient=1.6` and `depth_coefficient=2.2`."
+            ),
+            "params": 28517360,
+            "official_name": "EfficientNetV1",
+            "path": "efficientnetv1",
+        },
+        "kaggle_handle": "gs://keras-cv-kaggle/efficientnetv1_b5",
+    },
+    "efficientnetv1_b6": {
+        "metadata": {
+            "description": (
+                "EfficientNet B-style architecture with 7 "
+                "convolutional blocks. This B-style model has "
+                "`width_coefficient=1.8` and `depth_coefficient=2.6`."
+            ),
+            "params": 40965800,
+            "official_name": "EfficientNetV1",
+            "path": "efficientnetv1",
+        },
+        "kaggle_handle": "gs://keras-cv-kaggle/efficientnetv1_b6",
+    },
+    "efficientnetv1_b7": {
+        "metadata": {
+            "description": (
+                "EfficientNet B-style architecture with 7 "
+                "convolutional blocks. This B-style model has "
+                "`width_coefficient=2.0` and `depth_coefficient=3.1`."
+            ),
+            "params": 64105488,
+            "official_name": "EfficientNetV1",
+            "path": "efficientnetv1",
+        },
+        "kaggle_handle": "gs://keras-cv-kaggle/efficientnetv1_b7",
+    },
+}
+
+backbone_presets_with_weights = {}
+
+backbone_presets = {
+    **backbone_presets_no_weights,
+    **backbone_presets_with_weights,
+}
+
+model.pyramid_level_inputs
+
+{'P1': 'block1a_project_activation',
+ 'P2': 'block2b_add',
+ 'P3': 'block3b_add',
+ 'P4': 'block5c_add',
+ 'P5': 'top_activation'}

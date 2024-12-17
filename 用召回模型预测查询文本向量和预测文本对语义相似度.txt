@@ -1,0 +1,327 @@
+from functools import partial
+import os
+import sys
+import random
+import time
+
+import numpy as np
+import paddle
+import paddle.nn.functional as F
+from paddlenlp.data import Stack, Tuple, Pad
+from paddlenlp.datasets import load_dataset, MapDataset
+from paddlenlp.transformers import AutoModel, AutoTokenizer
+from paddlenlp.utils.log import logger
+
+import paddle.nn as nn
+
+def create_dataloader(dataset,
+                      mode='train',
+                      batch_size=1,
+                      batchify_fn=None,
+                      trans_fn=None):
+    if trans_fn:
+        dataset = dataset.map(trans_fn)
+
+    shuffle = True if mode == 'train' else False
+    if mode == 'train':
+        batch_sampler = paddle.io.DistributedBatchSampler(dataset,
+                                                          batch_size=batch_size,
+                                                          shuffle=shuffle)
+    else:
+        batch_sampler = paddle.io.BatchSampler(dataset,
+                                               batch_size=batch_size,
+                                               shuffle=shuffle)
+
+    return paddle.io.DataLoader(dataset=dataset,
+                                batch_sampler=batch_sampler,
+                                collate_fn=batchify_fn,
+                                return_list=True)
+
+class SimCSE(nn.Layer):
+    def __init__(self,
+                 pretrained_model,
+                 dropout=None,
+                 margin=0.0,
+                 scale=20,
+                 output_emb_size=None):
+        super().__init__()
+        self.ptm = pretrained_model
+        self.dropout = nn.Dropout(dropout if dropout is not None else 0.1)
+        # if output_emb_size is greater than 0, then add Linear layer to reduce embedding_size,
+        # we recommend set output_emb_size = 256 considering the trade-off beteween
+        # recall performance and efficiency
+        self.output_emb_size = output_emb_size
+        if output_emb_size > 0:
+            weight_attr = paddle.ParamAttr(
+                initializer=paddle.nn.initializer.TruncatedNormal(std=0.02))
+            self.emb_reduce_linear = paddle.nn.Linear(768,
+                                                      output_emb_size,
+                                                      weight_attr=weight_attr)
+        self.margin = margin
+        # Used scaling cosine similarity to ease converge
+        self.sacle = scale
+
+    @paddle.jit.to_static(input_spec=[
+        paddle.static.InputSpec(shape=[None, None], dtype='int64'),
+        paddle.static.InputSpec(shape=[None, None], dtype='int64')
+    ])
+    def get_pooled_embedding(self,
+                             input_ids,
+                             token_type_ids=None,
+                             position_ids=None,
+                             attention_mask=None,
+                             with_pooler=True):
+
+        # Note: cls_embedding is poolerd embedding with act tanh
+        sequence_output, cls_embedding = self.ptm(input_ids, token_type_ids,
+                                                  position_ids, attention_mask)
+        if with_pooler == False:
+            cls_embedding = sequence_output[:, 0, :]
+        if self.output_emb_size > 0:
+            cls_embedding = self.emb_reduce_linear(cls_embedding)
+        cls_embedding = self.dropout(cls_embedding)
+        cls_embedding = F.normalize(cls_embedding, p=2, axis=-1)#(n,d)
+        return cls_embedding
+    def get_semantic_embedding(self, data_loader):
+        self.eval()
+        with paddle.no_grad():
+            for batch_data in data_loader:
+                input_ids, token_type_ids = batch_data
+                input_ids = paddle.to_tensor(input_ids)
+                token_type_ids = paddle.to_tensor(token_type_ids)
+
+                text_embeddings = self.get_pooled_embedding(
+                    input_ids, token_type_ids=token_type_ids)
+                yield text_embeddings
+    def cosine_sim(self,
+                   query_input_ids,
+                   title_input_ids,
+                   query_token_type_ids=None,
+                   query_position_ids=None,
+                   query_attention_mask=None,
+                   title_token_type_ids=None,
+                   title_position_ids=None,
+                   title_attention_mask=None,
+                   with_pooler=True):
+        query_cls_embedding = self.get_pooled_embedding(query_input_ids,
+                                                        query_token_type_ids,
+                                                        query_position_ids,
+                                                        query_attention_mask,
+                                                        with_pooler=with_pooler)
+        title_cls_embedding = self.get_pooled_embedding(title_input_ids,
+                                                        title_token_type_ids,
+                                                        title_position_ids,
+                                                        title_attention_mask,
+                                                        with_pooler=with_pooler)
+
+        cosine_sim = paddle.sum(query_cls_embedding * title_cls_embedding,
+                                axis=-1)#(相当于对应向量做内积),(n,1)，又因为是单位向量，相当于向量夹角余弦值
+        return cosine_sim
+
+    def forward(self,
+                query_input_ids,
+                title_input_ids,
+                query_token_type_ids=None,
+                query_position_ids=None,
+                query_attention_mask=None,
+                title_token_type_ids=None,
+                title_position_ids=None,
+                title_attention_mask=None):
+
+        query_cls_embedding = self.get_pooled_embedding(query_input_ids,
+                                                        query_token_type_ids,
+                                                        query_position_ids,
+                                                        query_attention_mask)
+
+        title_cls_embedding = self.get_pooled_embedding(title_input_ids,
+                                                        title_token_type_ids,
+                                                        title_position_ids,
+                                                        title_attention_mask)
+
+        cosine_sim = paddle.matmul(query_cls_embedding,
+                                   title_cls_embedding,
+                                   transpose_y=True)
+
+        # substract margin from all positive samples cosine_sim()
+        margin_diag = paddle.full(shape=[query_cls_embedding.shape[0]],
+                                  fill_value=self.margin,
+                                  dtype=paddle.get_default_dtype())
+
+        cosine_sim = cosine_sim - paddle.diag(margin_diag)
+
+        # scale cosine to ease training converge
+        cosine_sim *= self.sacle
+
+        labels = paddle.arange(0, query_cls_embedding.shape[0], dtype='int64')
+        labels = paddle.reshape(labels, shape=[-1, 1])
+
+        loss = F.cross_entropy(input=cosine_sim, label=labels)
+
+        return loss
+
+def convert_example(example, tokenizer, max_seq_length=512, do_evalute=False):
+    result = []
+    for key, text in example.items():
+        encoded_inputs = tokenizer(text=text, max_seq_len=max_seq_length)
+        input_ids = encoded_inputs["input_ids"]
+        token_type_ids = encoded_inputs["token_type_ids"]
+        result += [input_ids, token_type_ids]
+    return result
+
+device = 'gpu'
+max_seq_length = 64
+output_emb_size = 256
+batch_size = 1
+
+params_path ='checkpoint/bd_paddle_yysy/model_state.pdparams'
+
+id2corpus = {0: '国有企业引入非国有资本对创新绩效的影响——基于制造业国有上市公司的经验证据'}
+model_name_or_path = "rocketqa-zh-base-query-encoder"
+
+paddle.set_device(device)
+
+tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+
+ trans_func = partial(convert_example,
+                         tokenizer=tokenizer,
+                         max_seq_length=max_seq_length)
+
+  batchify_fn = lambda samples, fn=Tuple(
+        Pad(axis=0, pad_val=tokenizer.pad_token_id),  # text_input
+        Pad(axis=0, pad_val=tokenizer.pad_token_type_id),  # text_segment
+    ): [data for data in fn(samples)]
+
+ pretrained_model = AutoModel.from_pretrained(model_name_or_path)
+
+ model = SimCSE(pretrained_model, output_emb_size=output_emb_size)
+
+if params_path and os.path.isfile(params_path):
+        state_dict = paddle.load(params_path)
+        model.set_dict(state_dict)
+        print("Loaded parameters from %s" % params_path)
+else:
+    raise ValueError(
+        "Please set --params_path with correct pretrained model file")
+
+corpus_list = [{idx: text} for idx, text in id2corpus.items()]
+
+corpus_ds = MapDataset(corpus_list)
+
+corpus_data_loader = create_dataloader(corpus_ds,
+                                       mode='predict',
+                                       batch_size=batch_size,
+                                       batchify_fn=batchify_fn,
+                                       trans_fn=trans_func)
+
+for i in corpus_data_loader:
+    print(i)
+
+all_embeddings = []
+model.eval()
+with paddle.no_grad():
+    for batch_data in corpus_data_loader:
+        input_ids, token_type_ids = batch_data
+        text_embeddings = model.get_pooled_embedding(
+            input_ids, token_type_ids)
+        print(text_embeddings.shape)
+        all_embeddings.append(text_embeddings)
+
+def read_text_pair(data_path, is_test=False):
+    with open(data_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            data = line.rstrip().split("\t")
+            if is_test == False:
+                if len(data) != 3:
+                    continue
+                yield {'text_a': data[0], 'text_b': data[1], 'label': data[2]}
+            else:
+                if len(data) != 2:
+                    continue
+                yield {'text_a': data[0], 'text_b': data[1]}
+
+def convert_example_pair(example, tokenizer, max_seq_length=512, do_evalute=False):
+    result = []
+    for key, text in example.items():
+        if 'label' in key:
+            # do_evaluate
+            result += [example['label']]
+        else:
+            # do_train
+            encoded_inputs = tokenizer(text=text, max_seq_len=max_seq_length)
+            input_ids = encoded_inputs["input_ids"]
+            token_type_ids = encoded_inputs["token_type_ids"]
+            result += [input_ids, token_type_ids]
+    return result
+
+text_pair_file='./datasets/yysy/recall/test.csv'
+
+batch_size=128
+
+margin=0.0
+
+scale=20
+
+def predict(model, data_loader):
+    cosine_sims = []
+    model.eval()
+    with paddle.no_grad():
+        for batch_data in data_loader:
+            query_input_ids, query_token_type_ids, title_input_ids, title_token_type_ids = batch_data
+            batch_cosine_sim = model.cosine_sim(
+                query_input_ids=query_input_ids,
+                title_input_ids=title_input_ids,
+                query_token_type_ids=query_token_type_ids,
+                title_token_type_ids=title_token_type_ids) #（n,1）
+            print(batch_cosine_sim.shape)
+            cosine_sims.append(batch_cosine_sim.numpy())
+        cosine_sims = np.concatenate(cosine_sims, axis=0)#在样本轴合并
+        return cosine_sims
+
+trans_func_pair = partial(convert_example_pair,
+                     tokenizer=tokenizer,
+                     max_seq_length=max_seq_length)
+
+batchify_fn = lambda samples, fn=Tuple(
+        Pad(axis=0, pad_val=tokenizer.pad_token_id),  # query_input
+        Pad(axis=0, pad_val=tokenizer.pad_token_type_id),  # query_segment
+        Pad(axis=0, pad_val=tokenizer.pad_token_id),  # title_input
+        Pad(axis=0, pad_val=tokenizer.pad_token_type_id),  # tilte_segment
+    ): [data for data in fn(samples)]
+
+valid_ds = load_dataset(read_text_pair,#用方法读取文件为dataset
+                        data_path=text_pair_file,
+                        lazy=False,
+                        is_test=True)
+
+valid_data_loader = create_dataloader(valid_ds,
+                                      mode='predict',
+                                      batch_size=batch_size,
+                                      batchify_fn=batchify_fn,
+                                      trans_fn=trans_func)
+
+for i in valid_data_loader:
+    print(i)
+    break
+
+ model = SimCSE(pretrained_model,
+                   margin=margin,
+                   scale=scale,
+                   output_emb_size=output_emb_size)
+
+ if params_path and os.path.isfile(params_path):
+        state_dict = paddle.load(params_path)
+        model.set_dict(state_dict)
+        print("Loaded parameters from %s" % params_path)
+else:
+    raise ValueError(
+        "Please set --params_path with correct pretrained model file")
+
+cosin_sim = predict(model, valid_data_loader)
+
+text_pairs=load_dataset(read_text_pair,#用方法读取文件为dataset
+                        data_path=text_pair_file,
+                        lazy=False,
+                        is_test=True)
+
+for i in range(10):
+    print('{}\t{}'.format(text_pairs[i],cosin_sim[i]))

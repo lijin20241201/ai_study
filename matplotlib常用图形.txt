@@ -1,0 +1,246 @@
+折线图
+
+# 0-10的15个随机数
+y=np.random.randint(0,10,15)
+display(y)
+display(y.cumsum())
+# 两行一列子视图
+fig,ax=plt.subplots(2,1)
+fig.set_figwidth=12
+fig.set_figheight=9
+# 没有x坐标时默认是0,1...n的自然数
+ax[0].plot(y,color='red',marker='*',ls='-.')
+_=ax[1].plot(y.cumsum(),color='green',marker='o',ls=':')
+
+y=np.random.randint(0,10,15)
+display(y)
+display(y.cumsum())
+# 两行一列子视图
+fig,ax=plt.subplots(2,1)
+fig.set_figwidth=12
+fig.set_figheight=9
+# 没有x坐标时默认是0,1...n的自然数
+ax[0].plot(y,color='red',marker='*',ls='-.')
+_=ax[1].plot(y.cumsum(),color='green',marker='o',ls=':')
+
+条形图
+
+# x轴标签
+labels=list('ABCDEF')
+# 数据只表示柱高
+man=np.random.randint(25,35,size=6)
+woman=np.random.randint(20,30,size=6)
+# 误差
+wc_m=np.random.randint(1,8,size=6)
+wc_wm=np.random.randint(1,8,size=6)
+plt.figure(figsize=(9,6))
+plt.rcParams['font.family']='STKaiti'
+plt.rcParams['font.size']=18
+width=0.35
+# yerr误差
+plt.bar(x=labels,height=man,width=width,yerr=wc_m,label='man')
+# bottom叠上去man指堆上去
+plt.bar(x=labels,height=man,bottom=man,width=width,yerr=wc_wm,label='woman')
+plt.title('柱状图',pad=60)
+_=plt.legend(labels=['man','woman'],loc ='center',ncols=2,bbox_to_anchor=(0,0.98,1,0.2))
+
+# 准备数据,y轴数据,有两种不同数据,每种6个
+boys=np.random.randint(25,35,size=6)
+girls=np.random.randint(20,30,size=6)
+# x轴[0-5]整数,这个是用来临时摆位置的,会被标签替换
+x=np.arange(0,6)
+labels=['G1','G2','G3','G4','G5','G6']
+# 设置视图大小
+plt.figure(figsize=(9,6))
+width=0.36
+# 根据男生数据画柱状图,柱状中心距离x width/2
+plt.bar(x-width/2,boys,width)
+plt.bar(x+width/2,girls,width)
+plt.title('班级成绩统计图',pad=60)
+plt.legend(labels=['boys','girls'],loc ='center',ncols=2,bbox_to_anchor=(0,0.98,1,0.2))
+plt.ylim(0,40)
+# 设置x轴标签
+_=plt.xticks(ticks=x,labels=labels,fontsize='20')
+# 设置柱状图文本信息
+for i in range(6):
+    # 男生数据
+    s1=boys[i]
+    # 女生数据
+    s2=girls[i]
+    # 设置的文本的位置,和设置数据一样.width/2,ha是水平居中
+    plt.text(x=i-width/2,y=s1+1,s=s1,ha='center')
+    plt.text(x=i+width/2,y=s2+1,s=s2,ha='center')
+极坐标
+
+x=np.linspace(0,4*np.pi,200)
+y=np.linspace(0,2,200)
+plt.figure(figsize=(8,8))
+ax=plt.subplot(111,projection='polar',fc='lightgreen')
+# plot意思就是连线图,在极坐标里4pi是两个圈,平常用就是一条直线
+plt.plot(x,y)
+# 因为y0-2,设为3让半径盈余,多一点
+ax.set_rmax(3)
+ax.set_rticks([0.5,1,1.5,2])
+ax.grid(True,ls='--')
+柱形极坐标
+
+# 准备数据
+# 分8份
+n=8
+# 在极坐标里,圈就相当于x坐标,咱们分8份,每份pi/4
+x=np.linspace(0,2*np.pi,n,endpoint=False)
+# 纵坐标相当于极坐标中半径,数据有大有小对应现实需要放的数据
+# 随机生成3-15的8个随机数
+y=np.random.randint(3,15,size=n)
+display(y)
+# 随机生成8种颜色
+colors=np.random.rand(8,3)
+plt.figure(figsize=(8,8))
+# 创建极坐标
+ax=plt.subplot(111,projection='polar')
+# 宽度相当于每一个柱子,总共2pi,8份每一份就是pi/4
+width=np.pi/4
+ax.set_rmax(18)
+ax.set_rticks([3,6,9,12,15])
+# 显示网格线
+ax.grid(True)
+_=plt.bar(x,y,width,color=colors)
+饼图
+
+label1=['鱼肉','猪肉','牛肉','西瓜','葡萄','香蕉','菠菜','白菜','土豆']
+data1=[50,40,30,20,40,30,10,20,30]
+label2=['肉类','水果','蔬菜']
+data2=[120,90,60]
+plt.rcParams['font.family']='STKaiti'
+plt.rcParams['font.size']=18
+# 设置视图大小
+plt.figure(figsize=(8,8))
+# labeldistance标签位置
+plt.pie(x=data2,labels=label2,radius=0.6,labeldistance=0.4,
+        # wedgeprops是个神奇的属性,一下子把饼图变漂亮了
+       wedgeprops={'linewidth':3,'width':0.6,'edgecolor':'w'
+                  })#饼图格式,间隔线宽,饼图宽度,边界颜色白色
+_=plt.pie(x=data1,labels=label1,radius=1,labeldistance=1.2,
+        wedgeprops={'linewidth':3,'width':0.3,'edgecolor':'k'
+                  })#饼图格式,间隔线宽,饼图宽度,边界颜色 黑色
+plt.legend(['肉类','水果','蔬菜'],title='食物占比',bbox_to_anchor=(0.9,0.7,0.1,0.4))
+plt.tight_layout()
+plt.savefig('./数据图片/嵌套饼图.png',dpi=150)
+蜘蛛图
+
+label1=['个人能力','IQ','服务意识','团队精神','解决问题能力','持续学习能力']
+y=[85,90,60,65,90,95]
+x=np.linspace(0,2*np.pi,num=6,endpoint=False)
+c=np.random.rand(6,3)
+plt.rcParams['font.family']='STKaiti'
+#  设置视图大小必须放在设置子视图前才有用,不然你在子视图里设置大小没用
+plt.figure(figsize=(8,8))
+ax=plt.subplot(111,projection ='polar')
+width=np.pi/3
+ax.bar(x,y,width,color=c)
+ax.set_rmax(110)
+ax.set_rticks([25,50,75,100])
+ax.grid(True)
+_=ax.set_thetagrids(x*180/np.pi,labels=label1,fontsize=18)
+
+label1=['个人能力','IQ','服务意识','团队精神','解决问题能力','持续学习']
+y=[83,61,95,67,76,88]
+x=np.linspace(0,2*np.pi,num=6,endpoint=False)
+plt.rcParams['font.family']='STKaiti'
+plt.figure(figsize=(8,8))
+ax=plt.subplot(111,polar=True)
+y.append(y[0])
+# 其实就是把x[0]先变成数组,因为折线图不会连线最后一个点,所有要添加一个最开始点
+x=np.concatenate([x,[x[0]]])
+# x=list(x)
+# x.append(x[0])
+# display(x)
+# o就是marker形式,-是连接点的线
+ax.plot(x,y,'o-',lw=2)
+ax.fill(x,y,alpha=0.2)
+#设置角度,前面为了让折线图plot帮我们连线,增加了一个元素,切片去掉一个
+_=ax.set_thetagrids(x[:-1]*180/np.pi,labels=label1,fontsize=18)
+3D线形图,散点图
+
+import numpy as np
+import matplotlib.pyplot as plt
+# 导入3D包
+from mpl_toolkits.mplot3d.axes3d import Axes3D
+x=np.linspace(0,60,300)
+y=np.sin(x)
+z=np.cos(x)
+# fig=plt.figure(figsize=(9,6))
+# a3=Axes3D(fig)
+# a3.plot(x,y,z)
+# 设置视图大小,放plt.subplot(111,projection='3d')上边才有用
+plt.figure(figsize=(9,6))
+# projection='3d'设置为3d视图
+ax=plt.subplot(111,projection='3d')
+ax.plot(x,y,z)
+ax.set_xlabel('x轴',labelpad=-25,color='red')
+ax.set_ylabel('y轴',labelpad=-25,color='red')
+ax.set_zlabel('z轴',labelpad=-25,color='red')
+x=np.random.randint(0,60,size=20)
+y=np.random.randn(20)
+z=np.random.randn(20)
+# 散点图
+ax.scatter(x,y,z,color='green')
+# 调整视角
+ax.view_init(elev=30,azim=-80)
+
+import numpy as np
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings('ignore')
+
+3D条形图
+# 导入3D包
+from mpl_toolkits.mplot3d.axes3d import Axes3D
+fontdic={
+    'family':'STKaiti',
+    'size':18,
+    'color':'red'
+}
+# x坐标,对应每个月(1-4)
+month=np.arange(1,5)
+plt.figure(figsize=(6,6))
+ax=plt.subplot(111,projection='3d')
+for m in month:
+    # 在3D中画每个月的柱状图,left相当于二维的x轴(横坐标)
+    ax.bar(left=np.arange(1,5),
+           # height相当于二维的y轴(纵坐标)
+           height=np.random.randint(10,20,4),
+           # 把要画什么下的数据那个总的当z轴(这个是设置x轴)
+           zdir='x',
+           # 这是总轴具体数据(在哪个方向上排就设置哪个)
+           zs=m,
+           alpha=0.7,
+           width=0.6
+    )
+#这图显示的是每个月里面每周的销量
+# label显示的文本,ticks刻度的意思(1,2,3,4)
+ax.set_xlabel('月份',fontdict=fontdic,labelpad=-10)
+ax.set_xticks(month)
+ax.set_ylabel('周',fontdict=fontdic,labelpad=-10)
+ax.set_yticks([1,2,3,4])
+ax.set_zlabel('销量',fontdict=fontdic,labelpad=-10,color='green')
+热力图
+
+import seaborn as sbn
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+sbn.set(style='dark',context='poster',font='STKaiti')
+plt.figure(figsize=(12,9))
+np.set_printoptions(suppress=True)
+label1=['一月','二月','三月','四月','五月','六月','七月','八月','九月','十月','十一月','十二月']
+label2=['2010年','2011年','2012年','2013年','2014年','2015年','2016年','2017年']
+data=np.random.randint(100,500,size=(8,12))
+df=pd.DataFrame(data,index=label2,columns=label1)
+# 数据重塑,把dataframe中的month对应(1,2,3月),year--(2010,2011),data--data
+# df.pivot('month','year','data')
+# display(df)
+df=df.T
+display(df)
+# annot数字,文本fmt d整数0.1f小数点后1位,linewidths线宽
+sbn.heatmap(df,annot=True,fmt='d',linewidths=0.5,cmap='RdBu_r')

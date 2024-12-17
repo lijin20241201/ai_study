@@ -1,0 +1,269 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import PIL
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from tensorflow.keras.models import Sequential
+
+gpus = tf.config.list_physical_devices('GPU')  
+if gpus:  
+    # 如果有GPU，设置GPU资源使用率  
+    try:  
+        # 允许GPU内存按需增长  
+        for gpu in gpus:  
+            tf.config.experimental.set_memory_growth(gpu, True)  
+        # 设置可见的GPU设备（这里实际上不需要，因为已经通过内存增长设置了每个GPU）  
+        # tf.config.set_visible_devices(gpus, 'GPU')  
+        print("GPU可用并已设置内存增长模式。")  
+    except RuntimeError as e:  
+        # 虚拟设备未就绪时可能无法设置GPU  
+        print(f"设置GPU时发生错误: {e}")  
+else:  
+    # 如果没有GPU  
+    print("没有检测到GPU设备。")
+
+import pathlib
+
+data_dir='./datasets/flower_photos'
+
+data_dir = pathlib.Path(data_dir).with_suffix('')
+
+image_count = len(list(data_dir.glob('*/*.jpg')))
+print(image_count)
+
+len(list(data_dir.glob('roses/*')))
+
+batch_size = 32
+img_height = 180
+img_width = 180
+
+#开发模型时，使用验证拆分是一种很好的做法。将 80% 的图像用于训练，将 20% 的图像用于验证。
+
+SEED=123
+train_ds = tf.keras.utils.image_dataset_from_directory(
+  data_dir,
+  validation_split=0.2,
+  subset="training",
+  seed=SEED,
+  image_size=(img_height, img_width),
+  batch_size=batch_size)
+
+val_ds = tf.keras.utils.image_dataset_from_directory(
+  data_dir,
+  validation_split=0.2,
+  subset="validation",
+  seed=SEED,
+  image_size=(img_height, img_width),
+  batch_size=batch_size)
+
+dict_={'daisy':'雏菊','tulips':'郁金香','sunflowers':'向日葵','roses':'玫瑰','dandelion':'蒲公英'}
+
+#可以在这些数据集的 class_names 特性中找到类名称。这些名称按照字母顺序与目录名称相对应
+class_names = train_ds.class_names
+class_names=[dict_[i] for i in class_names]
+print(class_names)
+
+plt.figure(figsize=(10, 10))
+plt.rcParams['font.family'] = 'WenQuanYi Micro Hei'  # 设置字体为STKaiti  
+# plt.rcParams['font.sans-serif'] = ['STKaiti']  # 如果没有sans-serif字体则回退到STKaiti  
+# plt.rcParams['axes.unicode_minus'] = False  # 正确显示负号
+for images, labels in train_ds.take(1):#从训练集取出一个批次
+  for i in range(25):#显示前25张图片
+    plt.subplot(5,5, i + 1)#5行5列子视图
+    plt.xticks([])#不带刻度
+    plt.yticks([])
+    plt.grid(False) #不带网格
+    plt.imshow(images[i].numpy().astype('uint8'))
+    plt.xlabel(class_names[labels[i]])
+plt.show()
+
+for image_batch, labels_batch in train_ds.take(1):
+  print(image_batch.shape)
+  print(labels_batch.shape)
+
+print(type(train_ds))
+
+# 目的不同：shuffle 的 buffer_size 用于打乱数据集，而 prefetch 的 buffer_size 用于异步加载数据。
+# 影响不同：shuffle 的 buffer_size 太小可能导致打乱效果不佳，而 prefetch 的 buffer_size 太小可能导致数据加载成为训练瓶颈。
+# 自动调整：shuffle 的 buffer_size 通常需要手动设置，而 prefetch 的 buffer_size 可以使用 AUTOTUNE 来自动调整
+
+AUTOTUNE = tf.data.AUTOTUNE
+train_ds = train_ds.cache().shuffle(1000).prefetch(buffer_size=AUTOTUNE)
+val_ds = val_ds.cache().prefetch(buffer_size=AUTOTUNE)
+
+#在这里，我们通过使用 tf.keras.layers.Rescaling 将值标准化为在 [0, 1] 范围内
+normalization_layer = layers.Rescaling(1./255)
+
+# map 方法是惰性的，这意味着它不会立即执行映射操作，而是返回一个新的数据集对象，该对象在迭代时才会执行实际的映射。
+# 此外，由于 TensorFlow 的 map 方法支持自动微分，所以归一化层（如果它包含可训练的参数和定义了梯度）
+# 也可以与模型的其他部分一起参与训练。
+
+normalized_ds = train_ds.map(lambda x, y: (normalization_layer(x), y))
+image_batch, labels_batch = next(iter(normalized_ds))
+first_image = image_batch[0]
+print(np.min(first_image), np.max(first_image))
+
+num_classes = len(class_names)
+num_classes
+
+model = Sequential([
+  layers.Rescaling(1./255, input_shape=(img_height, img_width, 3)),
+  layers.Conv2D(16, 3, padding='same', activation='relu'),
+  layers.MaxPooling2D(),
+  layers.Conv2D(32, 3, padding='same', activation='relu'),
+  layers.MaxPooling2D(),
+  layers.Conv2D(64, 3, padding='same', activation='relu'),
+  layers.MaxPooling2D(),
+  layers.Flatten(),
+  layers.Dense(128, activation='relu'),
+  layers.Dense(num_classes)
+])
+
+model.compile(optimizer='adam',
+              loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+              metrics=['accuracy'])
+
+epochs=10
+history = model.fit(
+  train_ds,
+  validation_data=val_ds,
+  epochs=epochs
+)
+
+acc = history.history['accuracy']
+val_acc = history.history['val_accuracy']
+loss = history.history['loss']
+val_loss = history.history['val_loss']
+epochs_range = range(epochs)
+plt.figure(figsize=(8, 8))
+plt.subplot(1, 2, 1)
+plt.plot(epochs_range, acc, label='Training Accuracy')
+plt.plot(epochs_range, val_acc, label='Validation Accuracy')
+plt.legend(loc='lower right')
+plt.title('Training and Validation Accuracy')
+
+plt.subplot(1, 2, 2)
+plt.plot(epochs_range, loss, label='Training Loss')
+plt.plot(epochs_range, val_loss, label='Validation Loss')
+plt.legend(loc='upper right')
+plt.title('Training and Validation Loss')
+plt.show()
+
+# 在上面的图表中，训练准确率随时间呈线性提升，而验证准确率在训练过程中停滞在 60% 左右。同时，
+# 训练准确率和验证准确率之间的差异也很明显，这是过拟合的标志。
+# 当训练样本数量较少时，模型有时会从训练样本中的噪声或不需要的细节中学习，以至于对模型在新样本上的性能产生负面影响。
+# 这种现象被称为过拟合。这意味着模型将很难在新数据集上泛化。
+
+# 过拟合通常会在训练样本数量较少的情况下发生。数据增强采用的方法是：
+# 通过增强然后使用随机转换，从现有样本中生成其他训练数据，产生看起来可信的图像。
+# 这有助于向模型公开数据的更多方面，且有助于更好地进行泛化
+
+# 这里的 0.1 是一个角度值，表示图像将随机旋转的角度范围。由于它是用弧度表示的，0.1 弧度大约等于 5.73 度。
+# 这意味着图像将在 -5.73 度到 +5.73 度之间随机旋转。
+# 0.1 可能表示缩放因子的范围。如果它是这样定义的，那么图像的大小将在原始尺寸的
+# 90%（即 1 - 0.1）到 110%（即 1 + 0.1）之间随机变化。
+
+data_augmentation = keras.Sequential(
+  [ #随机的水平镜像
+    layers.RandomFlip("horizontal",
+                      input_shape=(img_height,
+                                  img_width,
+                                  3)),
+    layers.RandomRotation(0.1),#随机旋转一定角度
+    layers.RandomZoom(0.1),#随机缩放
+  ]
+)
+
+plt.figure(figsize=(10, 10))
+plt.rcParams['font.family'] = 'WenQuanYi Micro Hei'  # 设置字体为STKaiti  
+# plt.rcParams['font.sans-serif'] = ['STKaiti']  # 如果没有sans-serif字体则回退到STKaiti  
+# plt.rcParams['axes.unicode_minus'] = False  # 正确显示负号
+for images, labels in train_ds.take(1):#从训练集取出一个批次
+  for i in range(25):#显示前25张图片
+    augmented_images = data_augmentation(images)
+    plt.subplot(5,5, i + 1)#5行5列子视图
+    plt.xticks([])#不带刻度
+    plt.yticks([])
+    plt.grid(False) #不带网格
+    plt.imshow(augmented_images[i].numpy().astype('uint8'))
+    plt.xlabel(class_names[labels[i]])
+plt.show()
+
+model = Sequential([
+  data_augmentation,#数据增强层
+  layers.Rescaling(1./255),#归一化层
+  layers.Conv2D(16, 3, padding='same', activation='relu'),
+  layers.MaxPooling2D(),
+  layers.Conv2D(32, 3, padding='same', activation='relu'),
+  layers.MaxPooling2D(),
+  layers.Conv2D(64, 3, padding='same', activation='relu'),
+  layers.MaxPooling2D(),
+  # Dropout 层是对其之前层的输出进行操作，而不是对之后的层。在你给出的结构中，Dropout
+  # 层是对 MaxPooling2D 层的输出进行操作的，而 Flatten 层则接收 Dropout 层处理后的输出。
+  layers.Dropout(0.2),#dropout层,意味着有20%的神经元随机失活
+  layers.Flatten(),
+  layers.Dense(128, activation='relu'),
+  layers.Dense(num_classes, name="outputs")
+])
+
+model.compile(optimizer='adam',
+              loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+              metrics=['accuracy'])
+
+epochs = 15
+history = model.fit(
+  train_ds,
+  validation_data=val_ds,
+  epochs=epochs
+)
+
+# 应用数据增强和 tf.keras.layers.Dropout 后，过拟合的情况比以前少了，训练准确率和验证准确率也变得更为接近
+
+acc = history.history['accuracy']
+val_acc = history.history['val_accuracy']
+
+loss = history.history['loss']
+val_loss = history.history['val_loss']
+
+epochs_range = range(epochs)
+
+plt.figure(figsize=(8, 8))
+plt.subplot(1, 2, 1)
+plt.plot(epochs_range, acc, label='Training Accuracy')
+plt.plot(epochs_range, val_acc, label='Validation Accuracy')
+plt.legend(loc='lower right')
+plt.title('Training and Validation Accuracy')
+
+plt.subplot(1, 2, 2)
+plt.plot(epochs_range, loss, label='Training Loss')
+plt.plot(epochs_range, val_loss, label='Validation Loss')
+plt.legend(loc='upper right')
+plt.title('Training and Validation Loss')
+plt.show()
+
+sunflower_url = "https://storage.googleapis.com/download.tensorflow.org/example_images/592px-Red_sunflower.jpg"
+sunflower_path = tf.keras.utils.get_file('Red_sunflower', origin=sunflower_url)
+
+# 使用您的模型对一个未包含在训练集或验证集中的图像进行分类。
+# 注：数据增强层和随机失活层在推断时处于非活动状态。
+
+img = tf.keras.utils.load_img(
+    sunflower_path, target_size=(img_height, img_width)
+)
+
+img_array = tf.keras.utils.img_to_array(img)
+
+img_array = tf.expand_dims(img_array, 0)#在0轴增加一维,因为tensorflow只接收4维张量
+
+predictions = model.predict(img_array)#得到logits
+
+score = tf.nn.softmax(predictions[0])#处理成概率
+
+print(score.numpy(),score.numpy().sum())
+
+print(
+    "这张图片以{:.2f}%的概率归属于{} "
+    .format(100 * np.max(score),class_names[np.argmax(score)])
+)
+

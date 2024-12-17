@@ -1,0 +1,326 @@
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ["KERAS_BACKEND"] = "tensorflow"
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
+# !curl -O http://saliencydetection.net/duts/download/DUTS-TE.zip
+
+原始的还有个512的特征层,太大了,目前训练不了,本来有7个输出,只有第一个是真正的模型预测
+
+我目前没真正搞懂它为啥要7个,所以我精简成1个,这个是彩色图片预测掩码,所以比牙齿切割要难,
+
+而且有些掩码像素并不是二值化,是有边缘过度的,这个模型训练好,是能提前他认为的前景特征的
+
+但是要训练好,得需要大的数据集,这个不像牙齿切割只需要提取牙齿特征,这个给模型的是真实的rgb彩色图片,模型需要预测掩码,这是很难的,模型会根据训练预测,这个难在不是只预测一个特别的掩码,而是很多物体
+
+import numpy as np
+from glob import glob
+import matplotlib.pyplot as plt
+import keras_cv
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers, backend
+
+# ! pip install --upgrade ipywidgets
+
+gpus = tf.config.list_physical_devices('GPU')  
+if gpus:  
+    # 如果有GPU，设置GPU资源使用率  
+    try:  
+        # 允许GPU内存按需增长  
+        for gpu in gpus:  
+            tf.config.experimental.set_memory_growth(gpu, True)  
+        # 设置可见的GPU设备（这里实际上不需要，因为已经通过内存增长设置了每个GPU）  
+        # tf.config.set_visible_devices(gpus, 'GPU')  
+        print("GPU可用并已设置内存增长模式。")  
+    except RuntimeError as e:  
+        # 虚拟设备未就绪时可能无法设置GPU  
+        print(f"设置GPU时发生错误: {e}")  
+else:  
+    # 如果没有GPU  
+    print("没有检测到GPU设备。")
+
+IMAGE_SIZE = 160
+BATCH_SIZE = 4
+OUT_CLASSES = 1
+TRAIN_SPLIT_RATIO = 0.90
+DATA_DIR = "./datasets/DUTS-TE/"
+
+def load_paths(path, split_ratio):#加载图片掩码路径,切分路径
+    images = sorted(glob(os.path.join(path, "DUTS-TE-Image/*")))[:3200]#排序后的
+    masks = sorted(glob(os.path.join(path, "DUTS-TE-Mask/*")))[:3200]
+    len_ = int(len(images) * split_ratio)
+    return (images[:len_], masks[:len_]), (images[len_:], masks[len_:])#返回训练集,验证集
+
+def read_image(path, size, mode):
+    x = keras.utils.load_img(path, target_size=size, color_mode=mode)
+    x = keras.utils.img_to_array(x)
+    x = (x / 255.0).astype(np.float32)
+    return x
+
+def preprocess(x_batch, y_batch, img_size, out_classes):
+    def f(_x, _y):
+        _x, _y = _x.decode(), _y.decode()
+        _x = read_image(_x,(img_size, img_size), mode="rgb")  # image
+        _y = read_image(_y,(img_size, img_size), mode="grayscale")  # mask
+        return _x, _y
+    images, masks = tf.numpy_function(f, [x_batch, y_batch], [tf.float32, tf.float32])
+    images.set_shape([img_size, img_size, 3])
+    masks.set_shape([img_size, img_size, out_classes])
+    return images, masks
+
+def load_dataset(image_paths, mask_paths, img_size, out_classes, batch, shuffle=True):
+    dataset = tf.data.Dataset.from_tensor_slices((image_paths, mask_paths))
+    if shuffle:
+        dataset = dataset.cache().shuffle(buffer_size=1000)
+    dataset = dataset.map(
+        lambda x, y: preprocess(x, y, img_size, out_classes),
+        num_parallel_calls=tf.data.AUTOTUNE,
+    )
+    dataset = dataset.batch(batch)
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+    return dataset
+
+train_paths, val_paths = load_paths(DATA_DIR, TRAIN_SPLIT_RATIO)
+
+train_dataset = load_dataset(
+    train_paths[0], train_paths[1], IMAGE_SIZE, OUT_CLASSES, BATCH_SIZE, shuffle=True
+)
+
+val_dataset = load_dataset(
+    val_paths[0], val_paths[1], IMAGE_SIZE, OUT_CLASSES, BATCH_SIZE, shuffle=False
+)
+
+print(f"Train Dataset: {len(train_dataset)}")
+print(f"Validation Dataset: {len(val_dataset)}")
+
+def display(display_list):
+    # plt.figure(figsize=(8,8))
+    title = ["Input Image", "True Mask", "Pre Mask"]
+    for i in range(len(display_list)):
+        plt.subplot(1, len(display_list), i + 1)
+        plt.title(title[i])
+        plt.imshow(keras.utils.array_to_img(display_list[i]), cmap="gray")
+        plt.axis("off")
+    plt.tight_layout()
+    plt.show()
+for image, mask in train_dataset.take(1):
+    display([image[1], mask[1]])
+
+print(f"Unique values count: {len(np.unique((mask[0] * 255)))}")
+print("Unique values:")
+print(np.unique((mask[0] * 255)).astype(int))
+
+def basic_block(x_input, filters, stride=1, down_sample=None, activation=None):#残差连接块
+    residual = x_input#下面步长都1,形状不会变
+    x = layers.Conv2D(filters, (3, 3), strides=stride, padding="same", use_bias=False)(
+        x_input
+    )
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    x = layers.Conv2D(filters, (3, 3), strides=(1, 1), padding="same", use_bias=False)(
+        x
+    )
+    x = layers.BatchNormalization()(x)
+    if down_sample is not None:
+        residual = down_sample
+    x = layers.Add()([x, residual])#残差连接,需要形状相同
+    if activation is not None:
+        x = layers.Activation(activation)(x)
+    return x
+def convolution_block(x_input, filters, dilation=1):#卷积block(卷积,批次标准化,relu)
+    x = layers.Conv2D(filters, (3, 3), padding="same", dilation_rate=dilation)(x_input)
+    x = layers.BatchNormalization()(x)
+    #先批次标准化再relu是合理的,因为批次标准化后会有负值,如果先relu,再批次标准,那么relu就好像没用一样
+    #因为批次标准后会有负值
+    return layers.Activation("relu")(x)
+def segmentation_head(x_input, out_classes, final_size=None):#模型预测的输出部分
+    x = layers.Conv2D(out_classes, kernel_size=(3, 3), padding="same")(x_input)
+    if final_size is not None:
+        x = layers.Resizing(final_size[0], final_size[1])(x)
+    return x
+def get_resnet_block(_resnet, block_num):#block_num=0#64,128,256
+    resnet_layers = [3, 4, 6]  # v2_stack_0_block3_add,v2_stack_1_block4_add,v2_stack_2_block6_add
+    return keras.models.Model(
+        inputs=_resnet.get_layer(f"v2_stack_{block_num}_block1_1_conv").input, # v2_stack_0_block1_1_conv (None,None,64)
+        outputs=_resnet.get_layer(
+            f"v2_stack_{block_num}_block{resnet_layers[block_num]}_add"# v2_stack_0_block3_add(None,None,64)
+        ).output,
+        name=f"resnet34_block{block_num + 1}",
+    )
+
+# for i in reversed(range(6)):
+#     print(i)
+
+resnet = keras_cv.models.ResNet34Backbone(
+        include_rescaling=False,
+    )
+
+resnet.summary()
+
+def basnet_predict(input_shape, out_classes):#(160,160,3)
+    filters = 64
+    num_stages = 5
+    x_input = layers.Input(input_shape)#(4,160,160,3)
+    # -------------Encoder--------------
+    x = layers.Conv2D(filters, kernel_size=(3, 3), padding="same")(x_input)#(4,160,160,64)
+    resnet = keras_cv.models.ResNet34Backbone(
+        include_rescaling=False,
+    )
+    encoder_blocks = []#编码块,下采样,用于提取图片特征
+    for i in range(num_stages):#(160,160,64),(80,80,128),(40,40,256)
+        if i < 3:  #一共迭代5次,前3次用resnet输出的特征图,后两次用basic_block
+            x = get_resnet_block(resnet, i)(x)#()
+            # print(f'{x.shape=}')
+            encoder_blocks.append(x)#添加3个输出的特征图(64,128,256)
+            x = layers.Activation("relu")(x)
+        else:  # 3,4,最后两次迭代(20,20,256),(10,10,256)
+            x = layers.MaxPool2D()(x)#最大池化
+            x = basic_block(x, filters=filters * 4, activation="relu")#残差连接块
+            x = basic_block(x, filters=filters * 4, activation="relu")
+            # x = basic_block(x, filters=filters * 4, activation="relu")
+            encoder_blocks.append(x)#循环结束encoder_blocks有5个特征图输出
+    # -------------Bridge-------------
+    x = convolution_block(x, filters=filters * 4, dilation=2)#膨胀卷积,会加大视野,#(10,10,256)
+    x = convolution_block(x, filters=filters * 4, dilation=2)
+    # x = convolution_block(x, filters=filters * 4, dilation=2)
+    encoder_blocks.append(x)#结束时,encoder_blocks有6个特征图
+    #(160,160,64),(80,80,128),(40,40,256),(20,20,256),(10,10,256),(10,10,256)
+    # -------------Decoder-------------
+    decoder_blocks = []
+    for i in reversed(range(num_stages)):#索引会从4,3,...逆着来
+        if i != (num_stages - 1):  #第一次循环i=4=num_stages - 1,所以第一次不会执行
+            shape = keras.backend.int_shape(x)
+            x = layers.Resizing(shape[1] * 2, shape[2] * 2)(x)#这样特征图会变大为原来的两倍,(20,20,256)
+        # print(f'{x.shape=},{encoder_blocks[i].shape=}')   
+        x = layers.concatenate([encoder_blocks[i], x], axis=-1)#合并特征轴,除了特征轴,其他轴形状必须一致(10,10,512)
+        # print(f'{x.shape=}')
+        x = convolution_block(x, filters=filters * 4)#(...,256),形状不会变
+        x = convolution_block(x, filters=filters * 4)
+        # x = convolution_block(x, filters=filters * 4)
+        decoder_blocks.append(x)#会有5个特征图,(10,10,256),(20,20,256),(40,40,256),(80,80,256),(160,160,256)
+    # decoder_blocks.reverse()#(160,160,256),(80,80,256),(40,40,256),(20,20,256),(10,10,256)
+    #现在会有6个特征图(160,160,256),(80,80,256),(40,40,256),(20,20,256),(10,10,256),(10,10,256)
+    # decoder_blocks.append(encoder_blocks[-1])  #最后一个是桥
+    # # -------------Side Outputs--------------
+    # decoder_blocks = [
+    #     #(160,160,1),一共6个,但是应该说,除了第一个,其他都抽象,而且最后一个是桥
+    #     segmentation_head(decoder_block, out_classes, input_shape[:2])
+    #     for decoder_block in decoder_blocks
+    # ]
+    # # print(f'{len(encoder_blocks)=},{len(decoder_blocks)=}')
+    # #单输入,多输出,是多个特征图的输出,但是最后一个其实是编码的输出,是抽象出的特征(6个)
+    # return keras.models.Model(inputs=x_input, outputs=decoder_blocks)
+    out_put=segmentation_head(x,out_classes)
+    return keras.models.Model(inputs=x_input, outputs=out_put)
+
+basnet_predict((160,160,3),1).output
+
+def basnet_rrm(base_model, out_classes):
+    num_stages = 4
+    filters = 64
+    x_input=base_model.output
+    # x_input = base_model.output[0]#它的第0个输出就是经历了编解码的输出,模型最具体的预测(160,160,1)
+    # -------------Encoder--------------
+    x = layers.Conv2D(filters, kernel_size=(3, 3), padding="same")(x_input)#(160,160,64)
+    encoder_blocks = []#(160,160,64),(80,80,64),(40,40,64),(20,20,64)
+    for _ in range(num_stages):#0,1,2,3
+        x = convolution_block(x, filters=filters)#形状不变,特征提取,(160,160,64)
+        encoder_blocks.append(x)
+        x = layers.MaxPool2D()(x)
+    # -------------Bridge--------------
+    x = convolution_block(x, filters=filters)#(10,10,64)
+    # -------------Decoder--------------
+    for i in reversed(range(num_stages)):#3,2,1,0
+        shape = keras.backend.int_shape(x)#(None,10,10,64),(20,20,64)
+        x = layers.Resizing(shape[1] * 2, shape[2] * 2)(x)#(20,20,64),(40,40,64)
+        # print(f'{x.shape=},{encoder_blocks[i].shape=}')   
+        x = layers.concatenate([encoder_blocks[i], x], axis=-1)#(20,20,128),特征轴合并,(40,40,128)
+        x = convolution_block(x, filters=filters)#(20,20,64),(40,40,64)
+    # print(x.shape)
+    #x(160,160,64),经过了下采样和上采样(中间会有上下采样的特征合并)
+    x = segmentation_head(x, out_classes, None) # (160,160,1)
+    # ------------- refined = coarse + residual
+    x = layers.Add()([x_input, x])  #残差连接(160,160,1)
+    #input (None, 160, 160, 3),output(None,160,160,1),一个细化了的输出
+    return keras.models.Model(inputs=base_model.input, outputs=x)
+
+basnet_rrm(basnet_predict((160,160,3),1),1).output
+
+def basnet(input_shape, out_classes):#(160,160,3),1
+    # predict_model = basnet_predict(input_shape, out_classes)#6个输出,形状(160,160,1)
+    predict_model=basnet_predict(input_shape,out_classes)
+    refine_model = basnet_rrm(predict_model, out_classes)#1个输出,残差连接(160,160,1)
+    # output = [refine_model.output]  #细化的输出(经历了全过程的下采样和上采样)
+    # output.extend(predict_model.output)#6个输出,用于计算损失啥的
+    # #概率化的输出,输出的是像素属于掩码的分数,一共7个,分数0-1,越大,说明模型越相信它是掩码[(160,160,1)]
+    # output = [layers.Activation("sigmoid")(_) for _ in output]
+    # #单输入多输出,第一个输出才是模型预测,其他都是为了计算loss
+    # return keras.models.Model(inputs=predict_model.input, outputs=output)
+    x=refine_model.output
+    output=layers.Activation('sigmoid')(x)
+    return keras.models.Model(inputs=predict_model.input, outputs=output)
+
+class BasnetLoss(keras.losses.Loss):
+    def __init__(self, **kwargs):
+        super().__init__(name="basnet_loss", **kwargs)
+        self.smooth = 1.0e-9#很小的正数
+        self.cross_entropy_loss = keras.losses.BinaryCrossentropy()#二元交叉熵
+        self.ssim_value = tf.image.ssim#函数
+        self.iou_value = self.calculate_iou#函数
+    def calculate_iou(self,y_true,y_pred):
+        intersection = backend.sum(backend.abs(y_true * y_pred), axis=[1, 2, 3])
+        union = backend.sum(y_true, [1, 2, 3]) + backend.sum(y_pred, [1, 2, 3])
+        union = union - intersection
+        return backend.mean(
+            (intersection + self.smooth) / (union + self.smooth), axis=0
+        )
+    def call(self, y_true, y_pred):
+        cross_entropy_loss = self.cross_entropy_loss(y_true, y_pred)#像素级损失
+        ssim_value = self.ssim_value(y_true, y_pred, max_val=1)#使用 SSIM 函数计算真实值和预测值之间的结构相似性。
+        #计算结构相似性损失。这里使用了 1 - ssim_value 来反转相似度得分（因为 SSIM 越高，损失应该越低）
+        ssim_loss = backend.mean(1 - ssim_value + self.smooth, axis=0)
+        iou_value = self.iou_value(y_true, y_pred)#调用之前定义的 calculate_iou 方法来计算交并比。
+        iou_loss = 1 - iou_value# 计算交并比损失，也是使用 1 - iou_value 来反转得分。
+        return cross_entropy_loss + ssim_loss + iou_loss #最后，将这三种损失相加，得到最终的损失值。
+
+basnet_model = basnet(
+    input_shape=(IMAGE_SIZE, IMAGE_SIZE, 3), out_classes=OUT_CLASSES
+)
+basnet_model.summary()
+
+learning_rate=2e-3
+weight_decay=1e-4
+
+basnet_model.compile(
+    optimizer=keras.optimizers.AdamW(learning_rate,weight_decay,epsilon=1e-8),
+    loss=BasnetLoss(),
+    metrics=[keras.metrics.MeanAbsoluteError(name="mae")],
+)
+from tensorflow.keras.callbacks import ReduceLROnPlateau
+
+checkpoint_filepath='./checkpoint/basenet_model_2.weights.h5'
+callbacks = [ keras.callbacks.ModelCheckpoint(
+    filepath=checkpoint_filepath,monitor='val_loss',save_best_only=True,save_weights_only=True),
+    tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5,  
+                               patience=2, min_lr=5e-6)]
+
+basnet_model.fit(train_dataset, validation_data=val_dataset, epochs=20,callbacks=callbacks)
+
+basnet_model.load_weights('./checkpoint/basenet_model_2.weights.h5')
+
+def normalize_output(prediction):
+    max_value = np.max(prediction)
+    min_value = np.min(prediction)
+    return (prediction - min_value) / (max_value - min_value)
+
+# lst=[]
+for image, mask in train_dataset.take(16):
+    pred_mask = basnet_model.predict(image)
+    # print(pred_mask[0].shape)#第一个0是预测的输出,第二个0是预测的这个批次的第几个样本
+    # lst.append(image[3])
+    # lst.append(mask[3])
+    # for i in range(len(pred_mask)):
+    #     lst.append(normalize_output(pred_mask[i]))#显示当前批次的第一张图片
+    # lst.append(pred_mask[3])
+    display([image[0],mask[0],pred_mask[0]])

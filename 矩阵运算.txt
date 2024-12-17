@@ -1,0 +1,282 @@
+分块矩阵
+
+A=np.random.randint(0,10,size=(6,6))
+A1=A[:3,:3]
+A2=A[:3,3:]
+A3=A[3:,:3]
+A4=A[3:,3:]
+B=np.random.randint(0,10,size=(6,6))
+B1=B[:3,:3]
+B2=B[:3,3:]
+B3=B[3:,:3]
+B4=B[3:,3:]
+# display(A,A1,A2,A3,A4,B,B1,B2,B3,B4)
+# A1B1=A1+B1
+# A2B2=A2+B2
+# A3B3=A3+B3
+# A4B4=A4+B4
+# D=np.block([[A1B1,A2B2],[A3B3,A4B4]])
+# display(A+B,D)
+E=np.block([[5*A1,5*A2],[5*A3,5*A4]])
+# display(5*A,E)
+# 分块矩阵乘法
+A1_B1=A1@B1+A2@B3
+A2_B2=A1@B2+A2@B4
+A3_B3=A3@B1+A4@B3
+A4_B4=A3@B2+A4@B4
+D=np.block([[A1_B1,A2_B2],[A3_B3,A4_B4]])
+# 验证分块矩阵的乘和矩阵整体乘是否一样
+display(A@B,D)
+
+A=np.random.randint(0,8,size=(3,3))
+B=np.random.randint(0,8,size=(3,9))
+B1=B[:,:2]
+B2=B[:,2:6]
+B3=B[:,6:]
+display(A,B,B1,B2,B3)
+A_B1=A@B1
+A_B2=A@B2
+A_B3=A@B3
+# 分块乘法，把A当成只有一个块，分别乘B的每一块
+D=np.block([A_B1,A_B2,A_B3])
+# display(A@B,D)
+B.T
+矩阵初等变换
+
+A=np.random.randint(0,10,size=(3,4))
+display(A)
+# 交换两行2,3
+A[[1,2]]=A[[2,1]]
+display(A)
+# 将第二行乘以2倍
+A[[1]]*=2
+display(A)
+# 将第二行的两倍加到第一行上去
+A[[0]]+=A[[1]]*2
+display(A)
+#现在开始逆操作,让A变回最初的A
+# 第一行减去第二行的两倍(也即加第二行的-2倍，都一样的)
+A[[0]]-=A[[1]]*2
+display(A)
+# 将第二行整除2
+A[[1]]//=2
+display(A)
+# 交换两行3,2
+A[[2,1]]=A[[1,2]]
+display(A)
+
+E=np.eye(4)
+# 交换两行1,3 交换两行
+E[[0,2]]=E[[2,0]]
+display(E)
+# 将第三行乘以5倍
+E[[2]]*=5
+display(E)
+# 将第四行的3倍加到第一行上去
+E[[0]]+=E[[3]]*3
+display(E)
+#现在开始逆操作,让E变回最初的E
+# 第一行减去第四行的3倍(也即加第四行的-3倍，都一样的)
+E[[0]]-=E[[3]]*3
+display(E)
+# 将第三行整除5
+E[[2]]//=5
+display(E)
+# 交换两行31
+E[[2,0]]=E[[0,2]]
+display(E)
+
+# 我们把单位阵E经过一次初等变换得到的方阵叫做初等方阵
+E=np.eye(4)
+# 交换两行1,3 记作E(i,j)，交换i,j两行
+E[[0,2]]=E[[2,0]]
+display(E)
+E=np.eye(4)
+# 将第三行乘以5倍，记作E（i(k）k≠0表示用k乘以第i行
+E[[2]]*=5
+display(E)
+E=np.eye(4)
+#将第四行的3倍加到第一行上去,记作E(i,j(k))，表示将第j行的k倍加到第i行
+E[[0]]+=E[[3]]*3
+display(E)
+
+A=np.arange(1,10)
+A=A.reshape(3,3)
+A
+E=np.eye(3)
+E[[1]]*=2
+#初等方阵E左乘A会把A第二行乘以2，右乘A会把A第二列乘以2.
+# 因为这个初等方阵是单位阵经过第二行乘以k倍得到的
+#这说明初等方阵具有传递性
+# display(A,E@A,A@E)
+E=np.eye(3)
+# 交换单位阵的一三行得到的初等方阵
+E[[0,2]]=E[[2,0]]
+# 初等方阵左乘会交换A的一三行，右乘会交换A的1,3列
+#因为初等方阵从列角度看，也可以看成交换了1,3列
+# display(A,E@A,A@E)
+E=np.eye(3)
+# 初等方阵是将第三行乘以3加到第一行上去
+E[[0]]+=E[[2]]*3
+# 初等方阵在左乘A时把第三行乘以3加到A的第一行
+#初等方阵右乘A时是把A的第一列乘以3加到了第三列
+#这是因为从初等方阵的列角度看的话，它确实是第一列乘以3
+# 加到了第三列
+display(E,A,E@A,A@E)
+初等变换法求逆矩阵
+
+import numpy as np
+A=[1,0,1,2,1,0,-3,2,-5]
+A=np.array(A)
+A=A.reshape(3,3)
+E=np.eye(3)
+D=np.block([A,E])
+
+# 第一行乘以-2加到第二行
+D[[1]]+=D[[0]]*(-2)
+# 第一行乘以3加到第三行
+D[[2]]+=D[[0]]*3
+# 第二行乘以-2加到第三行
+D[[2]]-=D[[1]]*2
+D[[2]]/=2
+D[[0]]+=D[[2]]*(-1)
+D[[1]]+=D[[2]]*2
+A_n=D[:,3:]
+A_lin_n=np.linalg.inv(A)
+# 用初等变换法和numpy方法得到的逆矩阵一致
+display(A_n,A_lin_n)
+import numpy as np
+
+# A是对角阵
+A=np.zeros(shape=(4,4))
+for i in range(0,4):
+    A[i,i]=np.random.randint(0,8)
+B=np.random.randint(1,6,size=(4,4))
+# A为对角矩阵，B为随机4x4阵，对角阵左乘相当于乘每一行，右乘相当于乘每一列
+display(A,B,A@B,B@A)
+
+# 弄一个对称矩阵
+A=np.zeros(shape=(4,4))
+for i in range(0,4):
+    for j in range(0,4):
+        A[i,j]=A[j,i]=np.random.randint(0,7)
+B=np.zeros(shape=(4,4))
+for i in range(0,4):
+    for j in range(0,4):
+        B[i,j]=B[j,i]=np.random.randint(0,7)
+# display(A,B,A.T,B.T)
+# 检测矩阵是否对称
+np.allclose(A,A.T)
+# display((A+B).T,A+B,(A-B).T,A-B)
+display((3*A).T,(3*A))
+
+# 反对称矩阵
+A=np.zeros(shape=(4,4))
+for i in range(0,4):
+    for j in range(0,4):
+        # i,j不是主对角线元素才赋值，主对角线不动
+        if j!=i:
+            # 判断一下，A[i,j]为0才赋值.
+            if not A[i,j]:
+                A[i,j]=np.random.randint(1,10) 
+            # 判断一下，A[j,i]为0才赋值。    
+            if not A[j,i]:
+                A[j,i]=-A[i,j]
+#             display(A)
+display(A,-A,A.T)
+# display(A,np.allclose(-A,A.T))
+
+
+def get_dy_hls(A,i,j):
+    if len(A)!=len(A[0]):
+        print('形状必须是方的')
+    sub_A=np.delete(A,i,axis=0)
+    sub_A=np.delete(sub_A,j,axis=1)
+    sub_A_hs=np.linalg.det(sub_A)
+    return (-1)**(i+j)*sub_A_hs
+# 获取伴随矩阵
+def get_bs_jz(A):
+#     display(len(A),A)
+    #创建（3,3）空矩阵
+    B=np.empty(shape=(len(A),len(A)))
+    # 每次遍历都获得该行的代数余子式
+    for i in range(0,len(A)):
+        # 内层循环获得的是第一行每个元素的代数余子式
+        for j in range(0,len(A)):
+            B[i,j]=get_dsyzs(A,i,j)
+    return B.T
+#     display(B)
+# A的伴随矩阵    
+B=get_bs_jz(A)
+E=np.eye(3)
+A_hls=np.linalg.det(A)
+#A的伴随矩阵的行列式
+B_hls=np.linalg.det(B)
+# AA*=A*A=|A|E
+# display(A@B,B@A,A_hls*E)
+# |A*||A|=|A|ⁿ
+# display(B_hls,np.power(A_hls,3-1))
+# A的逆矩阵就是A的行列式分之一*A的伴随矩阵
+A_njz=(1/A_hls)*B
+# display(A_hls,1/A_hls,B,A_njz)
+#A和A逆相乘==单位阵E
+# display(A@A_njz,A_njz@A,E)
+#利用线性方法得到的逆矩阵
+A_n=np.linalg.inv(A)
+#A的伴随矩阵，公式A伴随=A逆*A行列式
+A_bs=A_hls*A_n
+# 两种方法得到的是一样的
+# display(A_njz,A_n,A_bs,B)
+#A的伴随矩阵的逆矩阵=1/|A|*A
+B_n=1/A_hls*A
+display(B_n,np.linalg.inv(B))
+import numpy as np
+A=np.random.randint(0,10,size=(3,3))
+B=np.random.randint(0,10,size=(3,3))
+C=np.random.randint(0,10,size=(3,3))
+# display(A,B,C)
+Z=np.zeros(shape=(3,3))
+# A-B
+# 矩阵加法交换律
+# display(A+B,B+A)
+#矩阵加法结合律
+# display(A+(B+C),(A+B)+C,(A+C)+B)
+# display(A,-A,A+(-A))
+# display((A+Z)==A)
+# 矩阵数乘
+# display(B,6*B)
+# display(3*(A+B),3*A+3*B)
+# display(A,(3+5)*A,3*A+5*A)
+# display(A,5*(3*A),(5*3)*A)
+
+A=np.array([[-1,1,5],[4,3,-2]])
+B=np.array([[1,-1],[0,2],[-3,6]])
+# 矩阵乘法不满足交换律,AB≠BA,AB有意义,BA未必有意义
+# display(A,B,A.dot(B),B.dot(A))
+# 零矩阵
+Z=np.zeros(shape=(3,3))
+display(A.dot(Z))
+
+A=np.array([[2,0],[-1,0]])
+B=np.array([[0,0],[1,3]])
+C=np.array([[0,0],[2,4]])
+# AB=AC,A≠0推不出来B=C,AB=0推不出来A=0或B=0
+# 矩阵乘法不满足这些
+display(A.dot(B),A.dot(C))
+import numpy as np
+A=np.random.randint(0,10,size=(3,3))
+B=np.random.randint(0,10,size=(3,3))
+C=np.random.randint(0,10,size=(3,3))
+#单位阵
+E=np.eye(3)
+# AE=EA=A
+# display(A.dot(E),E.dot(A),A)
+# A(BC)=(AB)C矩阵乘法结合律
+# display(A.dot(B.dot(C)),(A.dot(B)).dot(C))
+#(A+B)C=AC+BC
+# display((A+B).dot(C),A.dot(C)+B.dot(C))
+# 矩阵乘法分配律C(A+B)=CA+CB
+# display(C.dot(A+B),C.dot(A)+C.dot(B))
+# k(AB)=(kA)B=A(kB)
+display(3*(A.dot(B)),(3*A).dot(B),A.dot(3*B))
+

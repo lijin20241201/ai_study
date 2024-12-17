@@ -1,0 +1,212 @@
+先打开源文件
+sudo vi /etc/apt/sources.list
+# 加阿里源
+deb http://mirrors.aliyun.com/kali kali-rolling main non-free contrib
+先按esc退出,之后输入:wq
+sudo apt install fcitx
+sudo apt install fcitx-googlepinyin
+
+之后可以在fcitx里设置添加google拼音
+
+先安装minicond
+
+create -n ai python==3.10.13创建虚拟环境
+
+之后更改pip源
+
+之后安装jupyter 6.2.12.不要安装7以上的,那个不支持插件
+pip install --upgrade notebook==6.2.12
+
+#安装nb插件
+pip install jupyter_contrib_nbextensions
+jupyter contrib nbextension install --user
+pip install jupyter_nbextensions_configurator
+jupyter nbextensions_configurator enable --user  # can be skipped for notebook >=5.3
+
+配置jupyter 启动项可以网上查,基本就是 gen-jupyter_configure.py
+
+之后找那个notebookApp_dir='/home/kali/jupyter_ai'
+# 中科大,报错,不好用
+deb http://mirrors.ustc.edu.cn/kali kali-rolling main non-free contrib
+deb-src http://mirrors.ustc.edu.cn/kali kali-rolling main non-free contrib 
+# 阿里云
+deb http://mirrors.aliyun.com/kali kali-rolling main non-free contrib
+deb-src http://mirrors.aliyun.com/kali kali-rolling main non-free contrib
+# 清华大学
+deb http://mirrors.tuna.tsinghua.edu.cn/kali kali-rolling main contrib non-free
+deb-src https://mirrors.tuna.tsinghua.edu.cn/kali kali-rolling main contrib non-free
+#官方源
+deb http://http.kali.org/kali kali-rolling main non-free contrib
+deb-src http://http.kali.org/kali kali-rolling main non-free contrib
+sudo vim /etc/apt/sources.list
+sudo apt update 会从远程的软件包存储库中获取最新的软件包列表。
+apt dist-upgrade 命令，这是一个更强大的升级命令，它会尝试解决依赖关系问题并升级更多的软件包
+sudo apt upgrade #升级所有可升级的软件包,最好不好升级,因为版本和版本之间可能不兼容
+#在使用apt install命令安装软件包时，相关的.deb文件会被下载到/var/cache/apt/archives/目#录下，
+并在安装完成后保留在那里。如果不定期清理，这个目录可能会占用大量的硬盘空间。
+sudo apt clean #清除遗留在/var/cache中的已取回的包文件的本地仓库
+apt autoclean#它也会清除已检索包文件的本地仓库，但只会删除那些不会再被下载且几乎无用的文件。
+sudo dpkg-reconfigure locales #设置汉化语言
+sudo apt-get install ttf-wqy-microhei ttf-wqy-zenhei xfonts-wqy #安装中文字体
+sudo reboot 重启
+shift+insert 粘贴
+alt+insert 粘贴选中文字
+tab 补全目录或文件
+->补全历史命令
+man 命令,查看命令详情
+ps -ef 查看进程
+.当前目录
+/根目录
+~或不输入,会跳到用户的主目录
+../上一级目录
+../../上上一级目录
+/etc和/etc/的区别,对于文件夹来说,没区别
+ls -F 普通文件不添加后斜杠,文件夹有后斜杠
+ls -F|grep '/',|管道符,grep过滤,只要带斜杠的
+ls *.conf 列出.conf结尾的文件
+ls mot? ,匹配单个字符
+ls mke[0-9][a-z]s.conf括号里面可选一个
+ls *.conf *.cfg匹配多个,{}
+ls 查看文件列表
+ll 会列出权限
+pwd 打印当前路径
+cd 切换工作路径
+cp 复制 copy简写
+find 指定目录查找文件
+find /usr/local -name 'man'
+mkdir创建文件夹
+mkdir -p a/b/c/d 创建多级目录
+mv 改名或者移动
+rm 移除文件 rm -rf 强制移除目录及目录内文件,rmdir 删除空目录
+touch 创建或更新时间戳
+# 打开源
+sudo vim /etc/apt/sources.list
+# kali原有源
+#deb http://http.kali.org/kali kali-rolling main non-free contrib
+# 清华源
+deb https://mirrors.tuna.tsinghua.edu.cn/kali kali-rolling main contrib non-free
+sudo apt update# 更新源
+sudo apt clean 清理缓存
+
+vim 编辑器
+命令模式 i--切换到编辑模式
+shift+G跳到结尾
+:行号,来到某一行
+dd 删除一行
+/查找内容(n下一处)
+:q!放弃修改
+esc退出编辑模式
+:wq保存退出,w--write,q--quit
+cat 拼接,输出内容 cat--concatenate
+more 逐页显示内容# 用处没less多
+less 逐页显示内容
+enter 下一行
+space翻页--空格键
+ctrl+F 向下滚动一屏
+b往回翻
+pageup
+pagedown
+tail 查看文件末尾内容
+grep 过滤文本内容
+>文件,输出重定向,清空
+>>文件,追加,写入
+一个>是写入,会覆盖,两个是追加
+|管道符
+tail -f 文件,实时显示动态变动文件
+find /etc/ -name '*.conf'>2.txt# 输出重定向
+ps -ef|grep mysql # ps -ef显示进程,grep过滤只显示mysql
+grep -i bind redis.conf# 根据文件里面包含的内容过滤
+grep过滤输出
+wget下载后面跟url
+tar -xzvf redis-*.tar解压包
+tar -cvf 文件夹打包
+groupadd 添加用户组
+groupdel删除用户组
+useradd 添加用户
+userdel删除用户
+passwd用户 修改密码
+su 切换用户
+sudo 以系统管理者的身份执行指令
+chmod 修改权限
+chown 修改所有者和所属组
+#d,-分别指文件夹,文件,第一个rwx所有者,
+#第二个rwx用户组,rw-其他人
+r-read读,w-write写,x-execute执行
+分值约定,r=4,w=2,x=1,-=0
+drwxrwxrw-
+444 r--r--r--读是4
+777 rwxrwxrwx--可读可写可执行
+755 rwxr-xr-x# 第一个是7,第二个是5,第三个是5
+ping url 测试网络
+ifconfig 查看网络
+telnet远程连接
+wget下载
+netstat查看网络
+netstat -an|grep 22# 过滤出带22的
+df 查看磁盘使用
+top 查看系统资源
+ps 查看进程状态
+kill 杀死进程# kill -9 7680
+free查看系统内存
+date 查看系统时间
+cat /proc/version# 查看操作系统版本
+uname -a 查看操作系统版本
+lsb_release -a 可以查看是否滚动版本
+
+sudo passwd root # 更改root密码
+192.168.73.133 # kali虚拟机ip
+# 设置ssh远程登录
+#配置静态ip
+vim /etc/network/interfaces #打开网络配置文件
+auto eth0 #是0不是o
+inface eth0 inet static #设置为静态
+address 192.168.253.128 #ip
+gateway 192.168.253.2 #网关
+netmask 255.255.255.0 #子网掩码
+ifconfig eth0 down
+ifconfig eth0 up
+ifconfig #查看网卡状况
+netstat -an|grep 22 #查看22端口监听情况,ssh服务
+sudo vim /etc/ssh/sshd_config#打开ssh设置
+PermitRootLogin yes #允许root登录  
+PasswordAuthentication yes #需要密码
+sudo systemctl restart ssh #重启SSH服务
+service ssh start #启动ssh
+systemctl enable --now ssh #开机自启动ssh
+
+kali-undercover # 让kali伪装成win10
+cd /root/.config # 恢复kali界面
+rm -rf xfce4
+reboot 
+# apt-get是比较老的命令了,现在都是apt
+apt search fcitx-googlepinyin
+apt install fcitx # 依赖项
+apt install fcitx-googlepinyin
+reboot
+要虚拟机和主机共享剪切板,需要设置虚拟机
+-设置,选项,共享文件夹和虚拟机隔离--启用剪切拖放
+service mysql start
+service mysql stop
+service mysql restart #重启
+service mysql status
+vim /etc/mysql/my.cnf #配置文件
+ps -ef|grep mysql# 只看mysql,主要关注进程和资源使用情况
+kali默认有mysql,root,密码,空
+netstat -an|grep 3306 --主要看网络状态和活动
+netstat -an|grep 80
+service apache2 start# 启动apache
+/var/www/html # 默认根路径
+vim /etc/apache2/apache2.conf #apache配置文件
+Nginx
+/etc/nginx/nginx.conf #配置文件
+/etc/nginx/sites-available/default # 端口配置
+/etc/init.d/nginx#直接打这个会有各种子命令
+/etc/init.d/nginx start #脚本启动
+netstat -an|grep 8088 #默认80,改成了8088
+# 文件上传与下载
+vm-tools
+vsftp
+# 在xshell里操作,可以把主机的文件传到linux系统
+rz,输入rz,按enter键,打开文件选项
+#可以把虚拟机文件传到windows系统
+sz,一个或多个文件,按enter,打开保存位置选项

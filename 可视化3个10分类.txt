@@ -1,0 +1,175 @@
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ["KERAS_BACKEND"] = "tensorflow"
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
+import keras
+from keras import layers
+import matplotlib.pyplot as plt
+import tensorflow as tf
+import numpy as np
+
+def get_data(dataset_name=None,channel=1):
+    if channel==1 and dataset_name=='mnist':
+        (x_train, y_train), (x_test, y_test) =tf.keras.datasets.mnist.load_data()
+        x_train=np.expand_dims(x_train,-1)
+        x_test=np.expand_dims(x_test,-1)
+        return (x_train,y_train),(x_test,y_test)
+    elif channel==1 and dataset_name=='fashion_mnist':
+        (x_train, y_train), (x_test, y_test) =tf.keras.datasets.fashion_mnist.load_data()
+        x_train=np.expand_dims(x_train,-1)
+        x_test=np.expand_dims(x_test,-1)
+        return (x_train,y_train),(x_test,y_test)
+    elif channel==3 and dataset_name=='cifar10':
+        (x_train, y_train), (x_test, y_test) =tf.keras.datasets.cifar10.load_data()
+        return (x_train, y_train), (x_test, y_test)
+
+(x_train_mnist, y_train_mnist), (x_test_mnist, y_test_mnist) =get_data('mnist')
+
+def show_imgs(x_train,y_train,col,row):
+    plt.figure(figsize=(col,row))
+    for i in range(col*row):
+        plt.subplot(row,col,i+1)
+        plt.xticks([])
+        plt.yticks([])
+        plt.xlabel(y_train[i])
+        plt.imshow(x_train[i])
+    plt.tight_layout()
+    plt.show()
+
+batch_size=256
+
+augment_images=keras.Sequential(
+    [keras.layers.RandomCrop(32,32),
+    keras.layers.RandomFlip('horizontal')]
+)
+
+def make_datasets(images, labels,is_train=False):
+    dataset = tf.data.Dataset.from_tensor_slices((images, labels))
+    if is_train:
+        dataset = dataset.shuffle(batch_size * 100)
+    dataset = dataset.batch(batch_size)
+    if is_train:
+        dataset = dataset.map(lambda x,y:(augment_images(x), y),
+                              num_parallel_calls=tf.data.AUTOTUNE)
+    return dataset.prefetch(tf.data.AUTOTUNE)
+
+def get_conv_pool_model(shape=(28,28,1), num_classes=10):
+    inputs = keras.Input(shape)
+    x = layers.Rescaling(scale=1.0 / 255)(inputs)#0-1归一化
+    for size in (64,128):
+        x=layers.Conv2D(size,3)(x)
+        x=layers.BatchNormalization()(x)
+        x=layers.LeakyReLU()(x)
+        x=layers.Conv2D(size,3)(x)
+        x=layers.BatchNormalization()(x)
+        x=layers.LeakyReLU()(x)
+        x=layers.MaxPool2D()(x)
+    x=layers.Flatten()(x)
+    x=layers.Dropout(0.5)(x)
+    x=layers.Dense(256,activation='relu')(x)
+    logits = layers.Dense(num_classes)(x)
+    return keras.Model(inputs,logits)
+
+mnist_model=get_conv_pool_model()
+
+learning_rate=1e-3
+weight_decay=1e-4
+
+mnist_optimizer = keras.optimizers.AdamW(
+    learning_rate=learning_rate, weight_decay=weight_decay
+)
+
+mnist_model.compile(
+        optimizer=mnist_optimizer,
+        loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        metrics=[
+        keras.metrics.SparseCategoricalAccuracy(name="acc"),
+    ]
+    )
+
+from tensorflow.keras.callbacks import ReduceLROnPlateau
+
+checkpoint_filepath = "./checkpoint/mnist_best_1.keras"
+callbacks = [ keras.callbacks.ModelCheckpoint(filepath=checkpoint_filepath,monitor='val_loss',\
+    verbose=1,save_best_only=True,mode='min'),
+keras.callbacks.EarlyStopping(monitor="val_loss", patience=5),#超过四次验证损失不减少就停止
+ReduceLROnPlateau(monitor='val_loss', factor=0.5,  
+                           patience=2, min_lr=5e-6)
+]
+mnist_his = mnist_model.fit(
+    x_train_mnist,y_train_mnist,batch_size=256,
+    validation_split=0.1,epochs=20,callbacks=[callbacks]
+)
+
+mnist_model.load_weights('./checkpoint/mnist_best_1.keras')
+_, acc= mnist_model.evaluate(x_test_mnist,y_test_mnist)
+print("Test accuracy: %.2f %%" %(acc))
+import utils
+
+imgs=utils.get_convs_filter_imgs((28,28,1),mnist_model,['conv2d_2','conv2d_3'])
+
+utils.show_imglst(imgs,8,16)
+(x_train_fashion,y_train_fashion),(x_test_fashion,y_test_fashion)=get_data('fashion_mnist')
+
+def prepare_model(checkpoint_filepath,lr=1e-3,wc=1e-4,model=None):
+    optimizer = keras.optimizers.AdamW(learning_rate=lr, weight_decay=wc)
+    model.compile(
+        optimizer=optimizer,
+        loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        metrics=[
+        keras.metrics.SparseCategoricalAccuracy(name="acc"),
+    ])
+    callbacks = [ keras.callbacks.ModelCheckpoint(filepath=checkpoint_filepath,\
+                            monitor='val_loss',save_best_only=True,mode='min'),
+    ReduceLROnPlateau(monitor='val_loss', factor=0.5,  
+                               patience=2, min_lr=5e-6)
+    ]
+    return callbacks
+
+fashion_model=get_conv_pool_model()
+
+callbacks=prepare_model('./checkpoint/fashion_best_1.keras',model=fashion_model)
+
+fashion_his = fashion_model.fit(
+    x_train_fashion,y_train_fashion,batch_size=256,
+    validation_split=0.1,epochs=25,callbacks=[callbacks]
+)
+
+fashion_model.load_weights('./checkpoint/fashion_best_1.keras')
+_,fashion_acc=fashion_model.evaluate(x_test_fashion,y_test_fashion)
+print("Test accuracy: %.2f %%" %(fashion_acc))
+fashion_imgs=utils.get_convs_filter_imgs((28,28,1),fashion_model,['conv2d_6','conv2d_7'])
+(x_train_cifar, y_train_cifar),(x_test_cifar, y_test_cifar)=get_data('cifar10',3)
+
+show_imgs(x_train_cifar,y_train_cifar,3,3)
+
+cifar_model=get_conv_pool_model(shape=(32,32,3))
+
+cond=tf.random.uniform(shape=(len(x_train_cifar),))<0.9
+
+new_x_train_cifar=x_train_cifar[cond]
+new_y_train_cifar=y_train_cifar[cond]
+
+cond_not=tf.logical_not(cond)
+
+x_val=x_train_cifar[cond_not]
+y_val=y_train_cifar[cond_not]
+
+cifar_train_dataset=make_datasets(new_x_train_cifar,new_y_train_cifar,is_train=True)
+
+cifar_val_dataset=make_datasets(x_val,y_val)
+
+cifar_test_dataset=make_datasets(x_test_cifar,y_test_cifar)
+
+callbacks=prepare_model('./checkpoint/cifar_best_1.keras',model=cifar_model)
+
+cifar_his = cifar_model.fit(
+    cifar_train_dataset,validation_data=cifar_val_dataset,
+    epochs=30,callbacks=[callbacks]
+)
+cifar_model.load_weights('./checkpoint/cifar_best_1.keras')
+_, cifar_acc= cifar_model.evaluate(cifar_test_dataset)
+print("Test accuracy: %.2f %%" %(cifar_acc))
+cifar_imgs=utils.get_convs_filter_imgs((32,32,3),cifar_model,['conv2d_10','conv2d_11'])
+

@@ -1,0 +1,326 @@
+import os
+os.environ["KERAS_BACKEND"] = "tensorflow"  # @param ["tensorflow", "jax", "torch"]
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
+import keras_nlp
+import keras
+import tensorflow as tf
+import time
+
+import sj_utils
+sj_utils.use_gpu()
+
+data_path='datasets/tangsi/poems_zh.txt'
+
+poem_lst=[]
+with open(data_path,encoding='utf-8') as f:
+    for line in f:
+        line=line.strip()
+        if len(line)>8 and len(line)<80:
+            poem_lst.append(line)
+
+max([len(i) for i in poem_lst])
+
+# poem_lst=[list(jieba.cut(i)) for i in poem_lst]
+
+# char_lst=[]
+# for i in poem_lst:
+#     for j in i:
+#        if j not in char_lst:
+#             char_lst.append(j)
+
+# char_lst=['[PAD]','[UNK]','[START]','[END]']+char_lst
+
+# with open('poem_char_vocab.txt',encoding='utf-8',mode='w') as f:
+#     for i in char_lst:
+#         f.write(i+'\n')
+
+char_lst=[]
+with open('poem_char_vocab.txt',encoding='utf-8') as f:
+    for line in f:
+        line=line.strip()
+        if line:
+            char_lst.append(line)
+
+word2idx=dict(zip(char_lst,range(len(char_lst))))
+
+idx2word=dict(zip(range(len(char_lst)),char_lst))
+
+vocab_size=len(word2idx)
+
+seq_len=80
+
+def convert_example(text):
+    text_split=[]
+    for i in text:
+        text_split.append(i)
+    idxs=[word2idx.get(i,1)for i in text_split]
+    idxs=[2]+idxs+[3]
+    x=idxs[:-1]
+    y=idxs[1:]
+    if len(x)<seq_len:
+       x=x+[0]*(seq_len-len(x))
+    if len(y)<seq_len:
+       y=y+[0]*(seq_len-len(y))   
+    return x,y
+
+import random
+
+random.shuffle(poem_lst)
+
+train_nums=int(len(poem_lst)*0.8)
+
+x_train=poem_lst[:train_nums]
+
+x_val=poem_lst[train_nums:]
+
+train_pairs=[convert_example(i) for i in x_train]
+
+val_pairs=[convert_example(i) for i in x_val]
+
+train_target=[i[0] for i in train_pairs]
+train_labels=[i[1] for i in train_pairs]
+
+val_target=[i[0] for i in val_pairs]
+val_labels=[i[1] for i in val_pairs]
+
+train_ds=tf.data.Dataset.from_tensor_slices((train_target,train_labels))
+
+val_ds=tf.data.Dataset.from_tensor_slices((val_target,val_labels))
+
+for i in val_ds.take(1):
+    print(i)
+    break
+
+batch_size=64
+
+train_ds=train_ds.shuffle(buffer_size=512).batch(batch_size)
+
+train_ds=train_ds.prefetch(tf.data.AUTOTUNE)
+
+val_ds=val_ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+for i in val_ds.take(1):
+    print(i)
+    break
+
+class TextGenerator(keras.callbacks.Callback): # keras 回调
+    """从训练的模型生成文本.
+    1. 给模型一些输入提示符
+    2. 预测下一个token的概率
+    3. 读取token，并将其添加到下一个输入中。
+    """
+    def __init__(
+        self, max_tokens, start_tokens, index_to_word, top_k=10, print_every=1
+    ):
+        self.max_tokens = max_tokens
+        self.start_tokens = start_tokens
+        self.index_to_word = idx2word
+        self.print_every = print_every
+        self.k = top_k
+    def sample_from(self, logits):
+        # 获取当前token中置信度最高的k个
+        logits, indices = ops.top_k(logits, k=self.k, sorted=True)
+        indices = np.asarray(indices).astype("int32")
+        preds = keras.activations.softmax(ops.expand_dims(logits, 0))[0] # 预测概率
+        preds = np.asarray(preds).astype("float32")
+        # 当 p 被指定时，它应该是一个与 a 中元素数量相同的一维数组或类似数组（如列表），并且数组
+        # 中的每个元素都应该是一个非负的概率值，这些概率值的总和应该等于 1（或非常接近 1，以处理
+        #浮点数的精度问题）。这样，numpy.random.choice（或类似的函数）就可以根据这些概率来随机选
+        # 择 a 中的元素。
+        return np.random.choice(indices, p=preds)
+    def detokenize(self, number):
+        return self.index_to_word[number]
+    def on_epoch_end(self, epoch, logs=None):
+        start_tokens = [_ for _ in self.start_tokens] # 获取提示
+        if (epoch + 1) % self.print_every != 0:
+            return
+        num_tokens_generated = 0
+        tokens_generated = []
+        while num_tokens_generated <= self.max_tokens:
+            pad_len = seq_len- len(start_tokens) # 填充长度
+            sample_index = len(start_tokens) - 1
+            if pad_len < 0: # 截断
+                x = start_tokens[:seq_len]
+                sample_index = seq_len - 1
+            elif pad_len > 0: # 填充
+                x = start_tokens + [0] * pad_len
+            else: # 这个等于的情况
+                x = start_tokens
+            x = np.array([x])
+            y = self.model.predict(x, verbose=0) # 获取模型预测
+            # 采样模型预测的第i+1个token
+            sample_token = self.sample_from(y[0][sample_index])
+            tokens_generated.append(sample_token) # 把当前预测token加入模型生成token列表
+            start_tokens.append(sample_token) # 把token索引加入提示
+            num_tokens_generated = len(tokens_generated) # 统计生成token数
+            if sample_token==3:
+                break
+        txt = " ".join(
+            [self.detokenize(_) for _ in self.start_tokens + tokens_generated]
+        )
+        print(f"generated text:\n{txt}\n")
+
+def causal_attention_mask(batch_size, n_dest, n_src, dtype):
+    """
+    在自注意力（self-attention）机制中，通过将点积矩阵（dot product matrix）的上半部分进行掩码
+    处理，可以阻止未来标记（tokens）的信息流向当前标记。这意味着，在点积矩阵中，从右下角开始计数的下
+    三角部分填充为1（或保持不掩码，具体取决于实现方式），而上三角部分则通过掩码处理（通常设置为负无穷
+    大或非常大的负数，以确保在softmax操作后这部分的权重接近于0），从而有效地阻断了信息的逆向流动。
+    简单来说，这种掩码操作确保了模型在处理序列中的某个标记时，只能利用到该标记及其之前的所有信息，而不
+    能“看到”或利用到序列中后续标记的信息。这对于处理序列数据（如文本或时间序列）中的因果关系至关重要，
+    尤其是在自然语言处理（NLP）任务中，因为语言的生成和理解通常是顺序进行的，当前词或句子的理解依赖于
+    之前的内容。
+    """
+    i = ops.arange(n_dest)[:, None] #(5,1)
+    j = ops.arange(n_src) #(5)
+    m = i >= j - n_src + n_dest
+    mask = ops.cast(m, dtype)
+    mask = ops.reshape(mask, [1, n_dest, n_src]) # 类似下三角的掩码(1,5,5)
+    mult = ops.concatenate( #(8,1,1)
+        [ops.expand_dims(batch_size, -1), ops.convert_to_tensor([1, 1])], 0
+    )
+    return ops.tile(mask, mult) # 为批次内所有样本复制因果掩码(8,5,5)
+
+from keras import layers
+
+import numpy as np
+
+class TransformerBlock(layers.Layer):
+    # transformer解码器块,文本生成没有编码器输出部分,所以没有交叉注意力
+    def __init__(self, embed_dim, num_heads, ff_dim, rate=0.1):
+        super().__init__()
+        # 多头注意力
+        self.att = layers.MultiHeadAttention(num_heads, embed_dim)
+        self.ffn = keras.Sequential( # 前馈全连接层
+            [
+                layers.Dense(ff_dim, activation="relu"),
+                layers.Dense(embed_dim),
+            ]
+        )
+        # 层标准化
+        self.layernorm1 = layers.LayerNormalization(epsilon=1e-6)
+        self.layernorm2 = layers.LayerNormalization(epsilon=1e-6)
+        self.dropout1 = layers.Dropout(rate) # dropout
+        self.dropout2 = layers.Dropout(rate)
+    def call(self, inputs):
+        input_shape = ops.shape(inputs)
+        batch_size = input_shape[0] # 批次大小
+        seq_len = input_shape[1] # 序列长度
+        #(8,5,5),下三角型掩码,因果掩码
+        causal_mask = causal_attention_mask(batch_size, seq_len, seq_len, "bool")
+        # query=key=value,自注意力,因果掩码，注意力输出,token加权和
+        attention_output = self.att(inputs, inputs, attention_mask=causal_mask)
+        attention_output = self.dropout1(attention_output)
+        out1 = self.layernorm1(inputs + attention_output) # 自注意力前后残差
+        ffn_output = self.ffn(out1)
+        ffn_output = self.dropout2(ffn_output)
+        return self.layernorm2(out1 + ffn_output) # 前馈全连接前后残差
+
+from keras import ops
+
+causal_attention_mask(1,5,5, "bool")
+
+# 创建两个独立的嵌入层:一个用于token嵌入，另一个用于token在序列中的位置嵌入
+class TokenAndPositionEmbedding(layers.Layer):
+    def __init__(self, maxlen, vocab_size, embed_dim):
+        super().__init__()
+        #词嵌入,为词汇表中vocab_size的词元嵌入，每个token对应一个embed_dim维的嵌入向量
+        self.token_emb = layers.Embedding(input_dim=vocab_size, output_dim=embed_dim)
+        #词在序列中的位置嵌入
+        self.pos_emb = layers.Embedding(input_dim=maxlen, output_dim=embed_dim)
+    def call(self, x):
+        maxlen = ops.shape(x)[-1] # 序列长度
+        # 序列中每个token的位置索引
+        positions = ops.arange(0, maxlen, 1)
+        # 位置嵌入,每个索引位置都会对应一个embed_dim大小的向量
+        positions = self.pos_emb(positions)
+        x = self.token_emb(x)
+        return x + positions # 返回带位置信息的token嵌入
+
+def bulid_model(embed_dim = 256,num_heads = 4,feed_forward_dim = 512,layer_num=3):
+    inputs = layers.Input(shape=(seq_len,), dtype="int32")
+    embedding_layer = TokenAndPositionEmbedding(seq_len, vocab_size, embed_dim) # 嵌入层
+    x = embedding_layer(inputs)
+     # transformer解码器块,没有交叉注意力
+    for _ in range(layer_num):
+        transformer_block = TransformerBlock(embed_dim, num_heads, feed_forward_dim)
+        x = transformer_block(x)
+    outputs = layers.Dense(vocab_size)(x) # 输出词汇表大小的置信度分布
+    model = keras.Model(inputs=inputs, outputs=outputs)
+    return model
+
+model=bulid_model()
+
+model.summary()
+
+save_dir='./checkpoints/shigeshengcheng/'
+
+# model.save_weights(save_dir+'woshishiren_model_1.weights.h5')
+
+model.load_weights(save_dir+'woshishiren_model_1.weights.h5')
+
+start_prompt ='[START]'
+start_tokens = [word2idx.get(_, 1) for _ in start_prompt.split()]
+num_tokens_generated = 80
+text_gen_callback = TextGenerator(num_tokens_generated, start_tokens, idx2word)
+
+loss_fn = keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+
+perplexity = keras_nlp.metrics.Perplexity(from_logits=True, mask_token_id=0)
+
+num_epochs=5
+
+learning_rate = keras.optimizers.schedules.PolynomialDecay(
+    8e-4,
+    decay_steps=train_ds.cardinality() * num_epochs,
+    end_learning_rate=5e-7,
+)
+
+optimizer=keras.optimizers.Adam(learning_rate)
+
+model.compile(
+    optimizer=optimizer,
+    loss=loss_fn,
+    metrics=[perplexity]
+)
+
+model.fit(train_ds, validation_data=val_ds, epochs=num_epochs,callbacks=[text_gen_callback])
+
+sampler_dict={
+    'GreedySampler':keras_nlp.samplers.GreedySampler(),
+    'BeamSampler':keras_nlp.samplers.BeamSampler(num_beams=10),
+    'RandomSampler':keras_nlp.samplers.RandomSampler(),
+    'TopKSampler':keras_nlp.samplers.TopKSampler(k=10),
+    'TopPSampler':keras_nlp.samplers.TopPSampler(p=0.5)
+}
+
+def get_generate_text(prompt,index,sampler='GreedySampler'):
+    def next(prompt, cache, index):
+        logits = model(prompt)[:, index - 1, :]
+        # Ignore hidden states for now; only needed for contrastive search.
+        hidden_states = None
+        return logits, hidden_states, cache
+    output_tokens = sampler_dict[sampler](
+    next=next,
+    prompt=prompt,
+    index=index,
+    stop_token_ids=[3] #在模型预测到[END]时停止生成
+    )
+    txt =[idx2word.get(i,'[UNK]') for i in output_tokens.numpy()[0]]
+    txt=''.join(txt).replace('[START]','').replace('[END]','').replace('[PAD]','')
+    print(f"{sampler}生成的文本:{txt}")
+
+start_prompt ='[START] 白 日 依 山 尽 ，'
+prompt_tokens = [word2idx.get(_, 1) for _ in start_prompt.split()]
+if len(prompt_tokens)<seq_len:
+    prompt_tokens=prompt_tokens+[0]*(seq_len-len(prompt_tokens))
+prompt_tokens=tf.convert_to_tensor([prompt_tokens],dtype='int32')
+index=len(start_prompt.split())
+
+get_generate_text(prompt_tokens,index)
+get_generate_text(prompt_tokens,index,'BeamSampler')
+get_generate_text(prompt_tokens,index,'RandomSampler')
+get_generate_text(prompt_tokens,index,'TopKSampler')
+get_generate_text(prompt_tokens,index,'TopPSampler')

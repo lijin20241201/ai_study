@@ -1,0 +1,174 @@
+import os
+import sys
+import json
+
+def read_by_lines(path):
+    result = list()
+    with open(path, "r", encoding="utf8") as infile:
+        for line in infile:
+            result.append(line.strip())
+    return result
+
+def write_by_lines(path, data):
+    with open(path, "w", encoding="utf8") as outfile:
+        [outfile.write(d + "\n") for d in data]
+
+def extract_result(text, labels):
+    ret, is_start, cur_type = [], False, None
+    if len(text) != len(labels):
+        labels = labels[:len(text)]#截断
+    for i, label in enumerate(labels):
+        if label != u"O":#实体
+            _type = label[2:]#事件类型或角色类型
+            if label.startswith(u"B-"):#以B-开头
+                is_start = True
+                cur_type = _type
+                #这是一个实体的开始
+                ret.append({"start": i, "text": [text[i]], "type": _type})
+            elif _type != cur_type:#
+                cur_type = _type
+                is_start = True
+                ret.append({"start": i, "text": [text[i]], "type": _type})#新实体
+            elif is_start: #如果还在当前实体内,追加文本
+                ret[-1]["text"].append(text[i])
+            else:
+                cur_type = None
+                is_start = False
+        else:#非实体
+            cur_type = None
+            is_start = False
+    return ret
+
+trigger_file='./ckpt/DuEE-Fin/trigger/test_pred.json'
+role_file='./ckpt/DuEE-Fin/role/test_pred.json'
+enum_file='./ckpt/DuEE-Fin/enum/test_pred.json'
+schema_file='./datasets/DuEE-fin/duee_fin_event_schema.json'
+save_path='./submit/test_duee_fin.json'
+
+trigger_data = read_by_lines(trigger_file)#pred存放模型预测的token标签类别和模型对这一类别的置信度
+role_data = read_by_lines(role_file)
+enum_data = read_by_lines(enum_file)
+schema_data = read_by_lines(schema_file)#用来提取事件,论元的规则文件
+
+schema, sent_role_mapping, sent_enum_mapping = {}, {}, {}
+for s in schema_data:
+    d_json = json.loads(s)#遍历每一行规则
+    #事件类型到论元角色列表的映射，绑定关系
+    schema[d_json["event_type"]] = [r["role"] for r in d_json["role_list"]]
+
+s=json.loads(role_data[3])#json加载字符串形式json数据
+
+for d in role_data:
+    d_json = json.loads(d)
+    r_ret = extract_result(d_json["text"], d_json["pred"]["labels"])#提取的论元实体
+    role_ret = {}
+    for r in r_ret:
+        role_type = r["type"]#获取角色类型
+        if role_type not in role_ret:
+            role_ret[role_type] = []
+        role_ret[role_type].append("".join(r["text"]))
+    _id = "{}\t{}".format(d_json["id"], d_json["sent_id"])#id是原文本和当前批次文本id连接串
+    sent_role_mapping[_id] = role_ret
+
+# process the enum_role data
+for d in enum_data:
+    d_json = json.loads(d)
+    _id = "{}\t{}".format(d_json["id"], d_json["sent_id"])#_id是原始id和批次id的结合
+    label = d_json["pred"]["label"]#当前文本段的标签
+    sent_enum_mapping[_id] = label
+
+pred_ret = []
+enum_event_type = "公司上市"
+enum_role = "环节"
+# process trigger data
+for d in trigger_data:
+    d_json = json.loads(d)
+    t_ret = extract_result(d_json["text"], d_json["pred"]["labels"])#提取的当前文本段的触发词
+    pred_event_types = list(set([t["type"] for t in t_ret]))#当前文本段去重的事件类型
+    event_list = []
+    _id = "{}\t{}".format(d_json["id"], d_json["sent_id"])#_id
+    for event_type in pred_event_types:
+        role_list = schema[event_type]#当前事件类型对应的角色列表
+        arguments = []#保存当前事件类型对应的角色论元实体
+        for role_type, ags in sent_role_mapping[_id].items():#角色论元实体的映射
+            if role_type not in role_list:#如果角色在当前事件对应的角色列表里不存在，就过滤掉
+                continue
+            for arg in ags:#遍历论元实体
+                arguments.append({"role": role_type, "argument": arg})
+        # 特殊处理环节
+        if event_type == enum_event_type:#如果事件类型是特殊类型
+            arguments.append({#角色是环节，论元是sent_enum_mapping枚举映射里面的值
+                "role": enum_role,
+                "argument": sent_enum_mapping[_id]
+            })
+        event = {#当前事件
+            "event_type": event_type,
+            "arguments": arguments,
+            "text": d_json["text"]
+        }
+        event_list.append(event)#添加当前文本段的每一个事件
+    pred_ret.append({
+        "id": d_json["id"],#原文本id
+        "sent_id": d_json["sent_id"],#文本段id，也是现在的d_json对应文本段id
+        "text": d_json["text"],
+        "event_list": event_list
+    })
+
+os.makedirs('./submit',exist_ok=True)
+
+# 遍历pred_ret中的每个元素
+doc_pred = {}
+for d in pred_ret:
+    if d["id"] not in doc_pred:#id是原始训练集的样本id,确保只有一个id
+        doc_pred[d["id"]] = {"id": d["id"], "event_list": []}#没有就创建id到样本对象的映射字典
+    #有的话就会获取id对应的event_list，把当前文本段对应的事件列表追加进去
+    doc_pred[d["id"]]["event_list"].extend(d["event_list"])
+
+[{k:v} for k,v in doc_pred.items()][0]
+
+def event_normalization(doc):
+    for event in doc.get("event_list", []):
+        argument_list = []#去重事件参数列表
+        argument_set = set()
+        for arg in event["arguments"]:
+            arg_str = "{}-{}".format(arg["role"], arg["argument"])
+            if arg_str not in argument_set:#看角色论元组决定添加不添加
+                argument_list.append(arg)
+            argument_set.add(arg_str)
+        event["arguments"] = argument_list
+    event_list = sorted(doc.get("event_list", []),#排序事件列表
+                        key=lambda x: len(x["arguments"]),
+                        reverse=True)
+    new_event_list = []
+    for event in event_list:
+        event_type = event["event_type"]
+        event_argument_set = set()
+        for arg in event["arguments"]:
+            event_argument_set.add("{}-{}".format(arg["role"], arg["argument"]))
+        flag = True
+
+        #事件类型相同并且里面的论元参数们也相同的话，认为是同一事件，只添加一次
+        for new_event in new_event_list:
+            if event_type != new_event["event_type"]:
+                continue
+            new_event_argument_set = set()
+            for arg in new_event["arguments"]:
+                new_event_argument_set.add("{}-{}".format(
+                    arg["role"], arg["argument"]))
+            # print(len(event_argument_set
+            #        & new_event_argument_set),len(new_event_argument_set))
+            #下面这种情况，说明事件重复，不能添加这个事件
+            if len(event_argument_set
+                   & new_event_argument_set) == len(new_event_argument_set):
+                flag = False
+        if flag:
+            new_event_list.append(event)
+    doc["event_list"] = new_event_list
+    return doc
+
+doc_pred = [
+    json.dumps(event_normalization(r), ensure_ascii=False)
+    for r in doc_pred.values()
+]
+print("submit data {} save to {}".format(len(doc_pred), save_path))
+write_by_lines(save_path, doc_pred)

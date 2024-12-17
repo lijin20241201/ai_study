@@ -1,0 +1,259 @@
+import torch# pytorch
+import torch.nn as nn# 模型工具包
+import torch.nn.functional as F# 函数运算工具包
+from torch.autograd import Variable# 变量处理包
+import math
+import matplotlib.pyplot as pyp
+import numpy as np
+import copy
+# 在深度学习自然语言的学习过程中,有些概念是必须要明确的,我们人类的自然语言,比如一句话,一篇文章或评论,都是有序的,
+#就是改变了顺序,改变了上下文,表示的含义有很大变化,还有深度学习中矩阵很重要,(batch_size,seq_len,w_dim)
+# 之前人们用one-hot模式表示一段文本中出现的词汇(这里说的词汇可以指单词,或者词组),1表示有,0表示没有,这样电脑
+# 知道的就是这段文本都出现了哪些字,这种表示一般要开很大的矩阵,而且大部分都是0,是稀疏矩阵
+#现在文本处理中的embedding层,是形成了词汇--索引--词向量的映射,以后我们大脑中看到索引,看到向量,
+#条件反射就应该知道它代表一个词汇,而向量的维度,就表示这个词汇的特征,维度越大,这种表示就越细.
+# 所谓时间轴其实大白话就是一段文本从开始到结束,当然也有双向的时候,从结束到开始,这就是看它的上下文
+embedding=nn.Embedding(10,3)#10,要给多少词汇创建特征,每个词汇的特征向量维度
+input1=torch.LongTensor([[1,2,4,5],[4,3,2,9]])# 模拟(2,4)形状的输入,2两个样本,4每个样本是长度为4的词汇序列
+print(embedding(input1),embedding(input1).size())
+# 经过embedding层处理后,形状变为(2,4,3),2样本数,4,序列长度,3每个词汇在电脑中表示的维度
+np.set_printoptions(suppress=True)
+embedding=nn.Embedding(10,3,padding_idx=0)# padding_idx,序列中不够长度的会被填充0,这些0会被赋予全0的向量
+input1=torch.LongTensor([[1,0,4,5],[4,3,0,9]])#torch词向量是随机生成的
+print(embedding(input1),embedding(input1).size())
+class MyModel(nn.Module):
+    def __init__(self,d_model,max_words):# 词向量维度,多少个单词或词语要做词向量
+        super(MyModel,self).__init__()#调用父类初始化方法
+        self.lut=nn.Embedding(max_words,d_model)#embedding层
+        self.d_model=d_model
+    def forward(self,x):#正向传播,(batch_size,max_len),单词别写错
+        print('x形状:{},系数:{}'.format(x.size(),math.sqrt(self.d_model)))
+        return self.lut(x)*math.sqrt(self.d_model)
+cxl=512# 词维度
+max_words=1000# 要做embedding的词汇数
+x=Variable(torch.LongTensor([[500,60,400,300],[200,120,68,80]]))# (2,4)样本数,序列长度
+emb=MyModel(cxl,max_words) # 创建模型
+output= emb(x)# 得到输出,因为模型只有一个embedding层,所以输出形状变为(2,4,512)
+print('output形状:{},x形状:{}'.format(output.shape,x.size()))
+import math
+class PositionEncoding(nn.Module):#位置编码
+    # cxl_len,一个序列中某个单元(可以是单词,词组)对应的向量维度,seq_len:序列的长度
+    def __init__(self,cxl_len,dropout,seq_len=200):#假设词向量100维
+        super(PositionEncoding,self).__init__()
+        self.dropout=nn.Dropout(dropout)#定义dropout层,dropout,里面参数置0的比例
+        # 定义的句子(序列)到向量的映射,是序列的向量表示
+        seq_cxl_=torch.zeros(seq_len,cxl_len)# 初始化容器(200,100)
+        seq_inx=torch.arange(seq_len).unsqueeze(1)# 序列的索引化表示(200,1)
+        # ,unsqueeze(1)指在1轴增加维度
+        temp_fz=torch.exp(torch.arange(0,cxl_len,2)\
+                          *-(math.log(10000.0)/cxl_len))# 步长2,偶数列(1*50)
+        # 第一个:指锁定所有行,第二个::2指锁定所有列,不过步长是2,其实选定的是偶数列
+        # 因为选定偶数列,所以seq_cxl_[:,::2]形状是(200,50)==(200,1)*(1*50)
+        # 偶数列向量值被赋正弦值,奇数列向量值被赋余弦值
+        seq_cxl_[:,::2]=torch.sin(seq_inx*temp_fz)
+        seq_cxl_[:,1::2]=torch.cos(seq_inx*temp_fz)
+        seq_cxl_=seq_cxl_.unsqueeze(0)# 在0轴增加维度
+        # 将词向量矩阵注册成模型的buffer,不随优化器同步更新参数,注册后,在模型保存后,和模型一起加载
+        self.register_buffer('seq_cxl',seq_cxl_)
+    def forward(self,x):# x形状(batch_size,seq_len),截取列到和x形状一样
+        x=x+Variable(self.seq_cxl[:,:x.size(1)],requires_grad=False)
+        return self.dropout(x)
+# x=torch.randint(5,size=(4,20,cxl_len))
+x=output
+pe=PositionEncoding(cxl_len,dropout,max_len)
+pe_res=pe(x)
+display(pe_res,pe_res.shape)#
+import matplotlib.pyplot as plt
+plt.figure(figsize=(8,4))
+plt.rcParams['font.size']=16
+plt.rcParams['font.family']='STKaiti'
+pe=PositionEncoding(20,0,100)# 20维的词向量,0不用dropout,100序列长度,这个可以随传入的max_len改变
+# 传入一个样本数1,100长度的序列,20维的词向量,都是0,相当于展示向量矩阵
+y=pe(Variable(torch.zeros(1,50,20))) 
+#x=x+Variable(self.seq_cxl[:,:x.size(1)],requires_grad=False)
+# 相当于这里x没作用,dropout也禁用,所以y值只与seq_cxl有关
+# x表示序列(也就是100长度的句子),y表示词向量的值(1,100,20)
+print(y.shape)# 偶数维度乘的是正弦,奇数维度乘的是余弦,一个序列中的
+#同一词汇在每个维度向量值不同(有遵循正弦的,有遵循余弦的),
+#一个序列中的不同词汇在同一个向量维度遵循正弦或余弦变化
+plt.plot(range(1,36),y[0,:35,4:8].data.numpy())# 展示前35个词汇
+plt.legend(['dim %d'%p for p in range(4,8)],fontsize=16)
+plt.xlabel('词汇')
+plt.ylabel('向量值')
+plt.show()# 4,6表示正弦,是因为在被赋值时,乘的是正弦,5,7余弦,乘的时候乘的余弦
+def get_mask_tensor(size):# 构建掩码张量
+    mask_shape=(1,size,size)#size指的是序列长度
+    subseq_mask=np.triu(np.ones(mask_shape),k=1).astype('uint8')
+    return torch.from_numpy(1-subseq_mask)# 得到下三角矩阵
+size=5
+B=get_mask_tensor(size)# 得到下三角矩阵
+np.triu(np.ones(mask_shape),k=0)# k=0,得到上三角矩阵
+# 因为三维张量只有一个样本,所以可以用索引0取,取的是里面的方阵
+#因为是下三角,黄色是1的部分代表被遮掩,紫色代表没被遮掩,
+#横坐标代表当前词汇的位置,纵坐标代表可查看的位置
+#一个序列0的位置是看不到此序列后面的词的,被遮掩了
+# 1的位置可以看到索引0的词汇,但看不到其他的词汇,
+# 其他以此类推,只有序列最后的那个词汇能看到这个序列上所有的词汇
+# 保证了电脑是按顺序读的,信息没被提前泄露
+_=plt.imshow(get_mask_tensor(20)[0])
+# key,query,value代表注意力的三个输入张量,mask:掩码,dropout:Dropout对象
+def attention(key,query,value,mask=None,dropout=None):# 比如key=query=value形状(2,4,512)
+    cxl_dim=query.size(-1)# cxl_dim=512
+    # 对query和key的转置做矩阵乘法,key最后两个轴做转置,除以一个缩放因子
+    # (2,4,512)@(2,512,4)==(2,4,4),除了一个512的开方,相当于把数据变小处理
+    # 这行代码的深层次意义就是构造了一个(seq_len,seq_len)的方阵,是为了遮掩,
+    # 这样序列后边的信息才不会提前泄露,第一个词汇的向量会依次和整个序列的每一个词汇
+    # 的向量做点乘,之后放到第一个词汇的一行(一共4(保存的是相关性)个信息),之后依次类推
+    # 第二个词汇和整个序列的每个词汇做点乘,也有4个信息(保存的是第二个词汇和序列中每个词汇的相关性)
+    # 最后就形成了一个方阵.最后除的那个是常数,只是为了把数据变小(2,8,4,64)@(2,8,64,4)=(2,8,4,4)
+    scores=torch.matmul(query,key.transpose(-2,-1))/math.sqrt(cxl_dim)
+    print('scores形状:',scores.shape)
+    if mask is not None:# 如果有掩码
+        #将scores中mask值为0的部分替换成一个很小的值,1的部分不变
+        #mask形状和scores一致,mask中1的部分起了遮掩的作用
+        print('mask',mask.shape)
+        scores=scores.masked_fill(mask==0,1e-9)
+    #对scores的最后一个维度做softmax操作,求概率,scores形状(2,4,4),在其上最后一维做softmax
+    # 操作,返回形状也应该是(2,4,4),返回的是概率对应的标签
+    p_attn=nn.functional.softmax(scores,dim=-1)#(2,4,4),2表示两个样本,4*4是上面计算的结果形状
+    if dropout is not None:# 有dropout层就添加,dropout随机把p_attn中的一些值置0
+        p_attn=dropout(p_attn)
+    # 最后完成p_attn和value的乘法,和p_attn一起返回,p_attn是概率
+    return torch.matmul(p_attn,value),p_attn#(2,4,4)@(2,4,512)=(2,4,512),p_attn:(2,4,4)
+query=key=value=pe_res
+display(query.shape)
+attn,p_attn=attention(key,query,value)
+display(attn.shape,p_attn.shape,attn,p_attn)
+mask=Variable(torch.zeros(2,4,4))
+attn,p_attn=attention(key,query,value,mask=mask)
+display(attn.shape,p_attn.shape,attn,p_attn)
+Q是原始的一段文本,K是给出的提示,V是大脑中对Key的延伸,当K=Q=V时是自注意力机制
+# 实现多头注意力机制的类
+class MultiHeadAttent(nn.Module):
+    # 把单个词汇向量分成几组,词维度,dropout层,进行dropout时,置0的比例
+    def __init__(self,head,cxl_dim,dropout=0.1):
+        super(MultiHeadAttent,self).__init__()# 断言词维度能被head整除
+        assert cxl_dim % head==0
+        self.d_k=cxl_dim//head# 每个头获得的深度(词向量维度//4)# 64
+        print(self.d_k)
+        self.head=head# 8
+        self.cxl_dim=cxl_dim# 512
+        # 获得线性层,一共四个,Q,K,V,和输出线性层
+        # 拷贝线性层,拷贝4个
+        self.linears=nn.ModuleList(
+            [copy.deepcopy(nn.Linear(cxl_dim,cxl_dim)) for _ in range(4)])
+        self.attn=None# 初始化注意力张量
+        self.dropout=nn.Dropout(dropout)# 初始化dropout
+        # Q,K,v是注意力机制的三个输入张量,mask掩码张量
+    def forward(self,query,key,value,mask=None):# (2,4,512)--样本数,序列长度,词维度
+        # 过滤条件:mask不是None,会被设置掩码,mask(8,4,4)
+        if mask is not None:#这样掩码是4维,(8,1,4,4)
+            mask=mask.unsqueeze(0)# 将掩码在索引0的轴进行扩充,掩码做的是掩盖序列,与样本数无关
+            # 所以取1就行
+        print('mask:',mask.shape)
+        batch_size=query.size(0)# 得到样本数
+        # 把Q,K,V和他们各自要被输入的层,像拉链一样绑定在一起        
+        zip_group=zip(self.linears,(query,key,value))
+        # 首先变形成(batch_size,seq_len,head,d_k)这样的形状(2,4,8, 64)
+        query,key,value=[model(x).view(batch_size,-1,self.head,self.d_k) \
+                         .transpose(1,2)# 之后让序列和代表几个头的轴交换,
+                         #因为在attention里做的是后两个轴交换
+                         for model,x in zip_group]
+        #(2, 8, 4, 64)
+        print('query,key,value,mask:',query.size(),key.shape,value.size(),mask.size())
+        # 把query,key,value传入注意力方法,p_attn和value的乘法,和p_attn一起返回,p_attn是概率
+        # 传入时形状是 (2, 8, 4, 64),之后q与k转置相乘,(2,8,4,64)@(2,8,64,4)=(2,8,4,4)
+        #输出时(2,8,4,4)@(2,8,4,64)=(2,8,4,64)
+        # 要明白传入的key,query,value形状是(2, 8, 4, 64),后面两个轴是(序列长度,分成组的词向量维度)
+        x,self.attn=attention(key,query,value,mask=mask,dropout=self.dropout)
+        print('xattention之后得形状',x.shape,self.attn.shape)#2, 8, 4, 64
+        # 得到每个头的结果是4维的张量,前面已经进行过1,2两个维度的转置,现在要转置回来
+        # 经过transpose方法后,必须使用contiguous方法,不然无法使用view方法   
+        # (2,4,8,64)--view(2,4,512),做了一个连接变形操作
+        x=x.transpose(1,2).contiguous().view(batch_size,-1,self.head*self.d_k)
+        print('xconcanate后的形状:',x.shape,self.attn.shape)
+        #最后将x输入线性层列表的最后一个线性层进行处理,得到最终的输出
+        return self.linears[-1](x)# linear传入和传出都是512
+# 实例化若干参数
+head=8
+cxl_dim=512
+dropout=0.2
+query=value=key=pe_res# Q,V,K初始化,赋值一样的话是自注意力机制
+# 经过embdding词嵌入,之后经过编码器编码,再之后做多头注意力机制
+# 总结:收集词汇集,为词汇做embedding层,之后编码,把词汇映射成向量矩阵,和索引矩阵
+# 之后把单个词汇的向量分成多个头,做多个头的注意力机制,掩码在0轴加,就是在样本数的轴加
+mask=Variable(torch.zeros(8,4,4))# 有几个头就应该有几个掩码,掩码形状(seq_len,seq_len)
+mha=MultiHeadAttent(head,cxl_dim,dropout)
+res=mha(query,value,key,mask)
+print(res.shape,res)
+class qk_qlj_layers(nn.Module):
+    # cxl_dim词嵌入维度,qlj_dim全连接层之间传递的维度
+    def __init__(self,cxl_dim,qlj_dim,dropout=0.1):
+        super(qk_qlj_layers,self).__init__()
+        self.cxl_dim=cxl_dim
+        self.qlj_dim=qlj_dim
+        self.w1=nn.Linear(cxl_dim,qlj_dim)
+        self.w2=nn.Linear(qlj_dim,cxl_dim)
+        self.dropout=nn.Dropout(dropout)
+        print(cxl_dim,qlj_dim,dropout)
+    def forward(self,x):
+        # x代表上一层的输出,这里用的是经过多头机制处理后的输出,
+        # 之后经过全连接1层,之后relu激活处理
+        # 之后dropout随机置0处理,最后交由全连接二层处理输出
+        # 输出形状(2,4,512),没有变化
+        return self.w2(self.dropout(F.relu(self.w1(x))))
+cxl_dim=512
+qlj_dim=64
+dropout=0.2
+x=res
+qkqlj=qk_qlj_layers(cxl_dim,qlj_dim,dropout)
+qlj_sc=qkqlj(x)
+display(qlj_sc.shape,qlj_sc)
+# 构造规范化层的类,做标准化处理的层
+class layer_normer(nn.Module):
+    # cxl_dim,词嵌入维度,eps:用在规范化计算的分母中,防止除0操作
+    def __init__(self,cxl_dim,eps=1e-6):
+        super(layer_normer,self).__init__()
+        self.cxl_dim=cxl_dim
+        self.eps=eps
+        # 初始化两个张量,用来对结果做规范化操作
+        self.a1=nn.Parameter(torch.ones(cxl_dim))
+        self.a2=nn.Parameter(torch.zeros(cxl_dim))
+    def forward(self,x):# (2,4,512)
+        # x:代表上一层网络的输出,首先对x进行最后一个维度上的求均值
+        # 操作,同时保持输入维度和输出维度一致
+        mean=x.mean(-1,keepdim=True)
+        # 接着对x进行最后一个维度上的求标准差的操作,保持输入维度和输出维度一致
+        std=x.std(-1,keepdim=True)
+        # 按照规范化公式计算并返回
+        return self.a1*(x-mean)/(std+self.eps)+self.a2
+cxl_dim=512
+eps=1e-9
+x=qlj_sc
+layer_norm=layer_normer(cxl_dim,eps)
+norm_output=layer_norm(x)
+print(norm_output.shape,norm_output)
+# 构建子层连接结构的类
+class SubLayerConnection(nn.Module):
+    def __init__(self,cxl_dim,dropout=0.1):
+        super(SubLayerConnection,self).__init__()
+        # 实例化一个规范化层的类
+        self.norm=layer_normer(cxl_dim)
+        self.dropout=nn.Dropout(dropout)
+        self.cxl_dim=cxl_dim
+    def forward(self,x,sublayer):
+        # x:代表上一层传入的张量
+        # sublayer,该子层连接中的子层函数
+        # 首先将x标准化处理,之后送入子层函数处理,之后经过dropout处理
+        # 最后进行残差连接
+        return x+self.dropout(sublayer(self.norm(x)))
+cxl_dim=512
+head=8
+dropout=0.2
+x=pe_res# 形状(2,4,512)位置编码的x
+mask=Variable(torch.zeros(8,4,4))# 掩码
+mha_=MultiHeadAttent(head,cxl_dim)# 多头注意力
+sublayer=lambda x:mha_(x,x,x,mask)# 子层函数,经由多头注意力机制处理(自注意力)
+sc=SubLayerConnection(cxl_dim,dropout)
+sc_res=sc(x,sublayer)
+print(sc_res.size(),sc_res)

@@ -1,0 +1,157 @@
+from keras.datasets import reuters
+import numpy as np
+训练数据,训练标签,测试数据,测试标签,8982个训练样本,2246个测试样本
+# 这个是新闻单标签多分类问题,就是每个样本会被贴上一个标签,如果是贴多个,就是多标签多分类
+# start_char=1,进入新的一篇新闻的标志, oov_char=2,只映射最常用的1万字,超出范围的映射2,
+#index_from=3,真正有意义的单词是从索引3开始的,46个类别
+(train_data,train_label),(test_data,test_lable)=reuters.load_data(num_words=10000)
+#单词对应数字的字典
+w_inx=reuters.get_word_index()
+#新字典,数字对应单词
+# rsw_inx={val:key for (key,val) in w_inx.items()}
+rsw_inx=dict([(val,key) for (key,val) in w_inx.items()])
+#为啥索引-3,因为它的0,1,2索引是'padding,start of sequence,unknown',
+# 翻译成白话就是如果电脑读到1,她就知道这是一篇新的新闻,读到2,就知道这个单词不在1万个常用字之内
+#单词和单词之间有空格,应该就是padding,根据数字映射单词,前两个单词应该是人名,不在1万常用字里面
+decoded_newswire=''.join([rsw_inx.get(i-3,'?') for i in train_data[0][:20]])
+def vect_sequences(seqs,dimension=10000):
+    #初始化行为新闻样本数,列为常用的1万个单词
+    # 如果是训练数据,形状是(8982,10000),默认元素是0
+    res=np.zeros(shape=(len(seqs),dimension))
+#     print(enumerate(seqs))
+    #遍历所有新闻样本
+    #seq是遍历的每一个新闻样本,现在脑子中一定要把新闻
+    #这个东西当成一个数字列表,程序员就是翻译家,我们
+    #在处理实际问题时要抽象化为数字,这样电脑看起来是很爽的
+    # 在给人看的时候是把抽象的数字具体化了,这个方法得作用
+    # 就是让电脑知道,一篇新闻里都出现了哪些字
+    # 不同的新闻出现的字是不一样的,而我们给的答案(标签)
+    # 不一样,这样电脑就会根据输入x,输出y来拟合f,拟合的好坏
+    # 是比较真实答案和预测答案的误差,越大越糟糕
+    for i,seq in enumerate(seqs):
+#         print(len(seq),[rwindex.get(i) for i in seq])
+#         print(i,seq)
+        # 当前新闻里有某个单词,那这个单词对应的数字列会被赋值1
+        #当前新闻没出现的字符是0,1代表Ture
+        res[i,seq]=1
+    return res
+#训练集8982个样本,10000代表10000个常用单词
+#一行代表一条新闻
+x_train=vect_sequences(train_data)
+x_test=vect_sequences(test_data)
+display(x_train.shape)
+a=rsw_inx.get(1)
+b=''.join([rsw_inx.get(i-3,'?') for i in train_data[0]])
+display(a,b)
+from keras.utils import to_categorical
+one_hot_train_labels=to_categorical(train_label)
+one_hot_test_labels=to_categorical(test_lable)
+
+from keras import models
+from keras import layers
+model=models.Sequential()
+#128个神经元,隐层一,激活函数relu,10000,单个新闻样本的特征列
+# 如果这一列是1,代表出现了某个单词,0,代表没出现这个单词
+model.add(layers.Dense(128,activation='relu',input_shape=(10000,)))
+#128个神经元,隐层二,激活函数relu
+model.add(layers.Dense(128,activation='relu'))
+#46分类,所以是46个神经元,softmax处理多分类,经过softmax函数作用后
+# 使得某个新闻属于这46类中每个的概率总和等于1
+model.add(layers.Dense(46,activation='softmax'))
+model.summary()# (10000+1)*128,(128+1)*128,(128+1)*46
+# 参数:优化器,rmsprop一阶导,之后做个调和平均放在分母位置,loss多元分类交叉,accuracy看它预估的正确率
+#分类问题,不要用mse平方差公式,因为梯度太平坦,要用logi回归的交叉乘
+model.compile(optimizer='RMSProp',loss='categorical_crossentropy',metrics=['acc'])
+#如果对train(test)_label没做one_hot_encode,可以这样写sparse_categorical_crossentropy
+model.compile(optimizer='RMSProp',loss='sparse_categorical_crossentropy',metrics=['acc'])
+#验证集,索引0-999,对y先做one_hot_encode编码
+#之后再切片,不然会很麻烦
+yzj_x=x_train[:1000]
+yzj_y=one_hot_train_labels[:1000]
+#测试集
+csj_x=x_train[1000:]
+csj_y=one_hot_train_labels[1000:]
+#validation_data验证和测试一起
+history=model.fit(csj_x,csj_y,epochs=20,batch_size=512,validation_data=(yzj_x,yzj_y))
+import matplotlib.pyplot as plt
+#过拟合,太想拟合训练资料,所以在拟合新资料时就有很大偏差
+xl_loss=history.history['loss']
+xl_zql=history.history['acc']
+yz_loss=history.history['val_loss']
+yz_zql=history.history['val_acc']
+epochs=range(1,1+len(xl_loss))
+plt.figure(figsize=(20,9))
+plt.rcParams['font.size']=18
+ax1=plt.subplot(121)
+ax1.plot(epochs,xl_loss,'b',label='xl_loss')
+ax1.plot(epochs,yz_loss,'bo',label='yz_loss')
+ax1.set_xlabel('epochs')
+ax1.set_ylabel('loss')
+plt.legend()
+plt.title('xl_loss, yz_loss')
+ax2=plt.subplot(122)
+ax2.plot(epochs,xl_zql,'r',label='xl_zql')
+ax2.plot(epochs,yz_zql,'ro',label='yz_zql')
+plt.title('xl_zql,yz_zql')
+plt.legend()
+plt.show()
+np.argmin(yz_loss)# 索引5,就是第6次val_loss最小
+# 根据上面的训练验证,可以看到第6次迭代,val_loss最小,这次拿
+#所有训练数据来跑
+model=models.Sequential()
+#128个神经元,隐层一,激活函数relu,10000,单个新闻样本的特征列
+# 如果这一列是1,代表出现了某个单词,0,代表没出现这个单词
+model.add(layers.Dense(128,activation='relu',input_shape=(10000,)))
+#128个神经元,隐层二,激活函数relu
+model.add(layers.Dense(128,activation='relu'))
+#46分类,所以是46个神经元,softmax处理多分类,经过softmax函数作用后
+# 使得某个新闻属于这46类中每个的概率总和等于1
+model.add(layers.Dense(46,activation='softmax'))
+model.compile(optimizer='RMSProp',loss='categorical_crossentropy',metrics=['acc'])
+model.fit(x_train,one_hot_train_labels,epochs=6,batch_size=512)
+#评估,results返回损失和准确率
+results=model.evaluate(x_test,one_hot_test_labels)
+#会获得模型对某条新闻属于那一类的概率
+#最后一层46个神经元每个预估的概率,总和肯定是1
+np.set_printoptions(suppress=True)
+pre=model.predict(x_test)
+print(np.sum(pre[0]),np.argmax(pre[0]))
+np.set_printoptions(suppress=True)
+#模型预测的类别
+pre_class=np.array([np.argmax(i) for i in pre])
+pre_class
+#真实类别
+test_lable
+import pandas as pd
+#交叉表
+pd.crosstab(index=test_lable,columns=pre_class,rownames=['True_Label'],colnames=['predict_label'])
+from sklearn.metrics import classification_report
+# 准确率,召回率 support提供的样本,样本资料少,电脑也不知道怎么分
+#准确率是电脑预估是几,真的是几的概率
+#召回率是真的是几,电脑预估是几的概率
+print(classification_report(test_lable,pre_class))
+test_copy=test_lable.copy()
+display(test_copy[:5])
+#随机瞎蒙
+np.random.shuffle(test_copy)
+display(test_copy[:5])
+np.sum(test_copy==test_lable)/len(test_lable)
+arr=np.arange(18)
+display(arr)
+np.random.shuffle(arr)
+display(arr)
+# 如果不是特别原因,不要某一层神经元突然大幅度减少,会降低验证准确率,降到0.7680
+# 之前0.8多
+model2=models.Sequential()
+#128个神经元,隐层一,激活函数relu,10000,单个新闻样本的特征列
+# 如果这一列是1,代表出现了某个单词,0,代表没出现这个单词
+model2.add(layers.Dense(128,activation='relu',input_shape=(10000,)))
+#10个神经元,隐层二,激活函数relu
+model2.add(layers.Dense(10,activation='relu'))
+#46分类,所以是46个神经元,softmax处理多分类,经过softmax函数作用后
+# 使得某个新闻属于这46类中每个的概率总和等于1
+model2.add(layers.Dense(46,activation='softmax'))
+model2.compile(optimizer='RMSProp',loss='categorical_crossentropy',metrics=['acc'])
+model2.fit(csj_x,csj_y,epochs=20,batch_size=256,validation_data=(yzj_x,yzj_y))
+#评估,results返回损失和准确率
+results=model2.evaluate(x_test,one_hot_test_labels)

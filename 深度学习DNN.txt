@@ -1,0 +1,59 @@
+https://keras.io/api/datasets/
+https://archive.ics.uci.edu/
+
+DNN--全连接神经网络
+fashion_mnist玩具集
+import tensorflow as tf
+import numpy as np
+import matplotlib.pyplot as plt
+import tensorflow.keras as ks
+fm=ks.datasets.fashion_mnist# 德国时装多分类
+#6万个训练数据,1万个测试数据,每个样本形状28*28
+(train_imgs,train_lbs),(test_imgs,test_lbs)=fm.load_data()
+# plt.figure()
+# plt.imshow(train_imgs[0])
+# plt.colorbar()
+# plt.show()
+# plt.figure(figsize=(10,10))
+# for i in range(25):
+#     #分成5行5列的子视图
+#     plt.subplot(5,5,i+1)
+#     #不显示轴
+# #     plt.axis('off')
+#     #不显示刻度
+#     plt.xticks([])
+#     plt.yticks([])
+#     plt.imshow(train_imgs[i],cmap=plt.cm.binary)
+#     plt.xlabel(names[train_lbs[i]])
+train_imgs=train_imgs/255.0
+test_imgs=test_imgs/255.0
+#神经网络堆层
+model=ks.Sequential([
+    #输入图片形状是(28x28),也可以写成(28*28,)因为图片是
+    #被摊平的
+    ks.layers.Flatten(input_shape=(28,28)),
+    #128个神经元,激活函数relu,隐藏层
+    ks.layers.Dense(128,activation='relu'),
+    #因为目标分类是10种,所以目标层神经元10个
+    ks.layers.Dense(10)
+])
+model.summary()#28*28,(784+1)*128,(128+1)*10
+#one-hot编码
+# from keras.utils import to_categorical
+# #能把标签处理成机器容易识别的行式,one-hot编码
+# train_lbs=to_categorical(train_lbs)
+# test_lbs=to_categorical(test_lbs)
+#编译模型,SparseCategoricalCrossentropy能做onehot编码处理
+model.compile(optimizer='adam',loss=ks.losses.SparseCategoricalCrossentropy(
+   from_logits=True),metrics=['accuracy'])
+#batch_size=128小批量的丢进去
+model.fit(train_imgs,train_lbs,epochs=10,batch_size=128)
+#sigm=lambda x:1/(1+np.exp(-x))
+#sigm(5.757487 )
+#误差,准确率,评估
+test_loss,test_acc=model.evaluate(test_imgs,test_lbs,verbose=2)
+display(type(test_loss),type(test_acc),test_loss,test_acc)
+#这个是线性值Z
+np.set_printoptions(suppress=True)
+a=model.predict(test_imgs)
+display(a[0],test_lbs[0])

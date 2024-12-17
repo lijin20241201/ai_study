@@ -1,0 +1,334 @@
+用到的技术cnn,残差连接，通道注意力机制,点卷积切换通道,深度卷积提取空间特征,模型架构参数是没问题的,我之前和keras摘要里的参数比对过,有些细节没弄，比如dropout,还有激活函数，用silu的多,还有se模块中两个切换通道的逐点卷积,缩小通道那个要加silu函数,扩张通道的要加sigmoid激活函数,sigmoid是给通道打分,能够区分对分类重要的通道和对分类不重要的通道,之后就是把通道的打分加权到空间里,等于重新设定了特征图的通道
+
+import os
+os.environ["KERAS_BACKEND"] = "tensorflow"  # @param ["tensorflow", "jax", "torch"]
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+import matplotlib.pyplot as plt
+import numpy as np
+import keras
+import tensorflow as tf
+from keras import layers
+
+# MobileNetV2 的一个关键特性是使用了“扩张-压缩”模式，即首先通过 1x1 卷积（点卷积）增加通道数（扩张），
+# 然后通过深度可分离卷积处理特征，最后再通过 1x1 卷积减少通道数（压缩）,越往下,扩张和压缩通道越大
+# 并且在特征图到60x60以下逐渐加大提取特征力度,用残差网络
+# MobileNetV2 中的瓶颈块会根据网络的深度重复不同的次数。您的代码中为不同的瓶颈块设置了不同的重复次数（
+# 如 2 次、3 次），这通常是正确的
+def activation_block(x): # 大多预训练模型都是先批次标准化,再激活函数
+    # 如果把激活函数放前面,在模型摘要里会先显示激活函数,但是这不是大多数模型的摘要信息
+    # 说明是先批次标准化,之后激活函数
+    x = layers.BatchNormalization()(x)
+    return layers.Activation(keras.activations.hard_swish)(x)
+
+def relu_activation_block(x): # 大多预训练模型都是先批次标准化,再激活函数
+    # 如果把激活函数放前面,在模型摘要里会先显示激活函数,但是这不是大多数模型的摘要信息
+    # 说明是先批次标准化,之后激活函数
+    # relu6:如果输入 x 是正数，则输出 x，但不超过6；如果 x 是负数，则输出0；如果 x 大于6，
+    # 则输出6.而relu无限制
+    x = layers.BatchNormalization()(x)
+    return layers.Activation('relu6')(x)
+
+def se(inputs,in_c,out_c):
+    multiply=inputs
+    # (n,c) 全局平均池化,获取样本的全局分类信息
+    x=layers.GlobalAveragePooling2D()(multiply)
+    # 变形
+    x=layers.Reshape([1,1,-1])(x)
+    # 这里用了截距,这里减少通道数是为了紧凑特征,同时可以减少模型过拟合
+    x=layers.Conv2D(in_c,1,padding='same')(x)
+    # 之后放大到原通道数,这里卷积核大小是1,是点卷积
+    x=layers.Conv2D(out_c,1,padding='same')(x)
+    x=layers.Multiply()([x,multiply])
+    return x
+
+def depthwiseConv_block(inputs,filters,kernel_size=3,strides=1):
+    x=inputs
+    x=layers.Conv2D(filters,1,padding='same',use_bias=False)(x)
+    x=relu_activation_block(x)
+    x=layers.DepthwiseConv2D(kernel_size,strides=strides,padding='same',use_bias=False)(x)
+    x=relu_activation_block(x)
+    return x
+
+def conv1_block(inputs,filters,dropout=None):
+    x=inputs
+    x=layers.Conv2D(filters,1,padding='same',use_bias=False)(x)
+    x = layers.BatchNormalization()(x)
+    if dropout:
+        x=layers.Dropout(dropout)(x)
+    return x
+
+# 收缩点卷积:16--24--40--80--112--192
+# 扩张点卷积:96--144--240--480--672--1152
+# 通道注意力模块:4--6--10--20--28--48
+def get_efficientnetb0_model(input_shape,num_classes):
+    inputs=keras.Input(shape=input_shape)
+    x=layers.Rescaling(1.0/255)(inputs)
+    x=layers.Normalization()(x)
+    x=layers.Rescaling(scale=[2.0896918976428642, 2.1128856368212916, 2.1081851067789197], offset=0.0)(x)
+    x=layers.Conv2D(32,3,strides=2,padding='same',use_bias=False)(x) # (112,112)
+    x=relu_activation_block(x)
+    x=layers.DepthwiseConv2D(3,padding='same',use_bias=False)(x)
+    x=relu_activation_block(x)
+    x=se(x,8,32) # 有利于通道信息的重修订,减少过拟合,只关注重要的特征
+    x=conv1_block(x,16)
+    # 深度卷积模块,用来提取空间信息
+    x=depthwiseConv_block(x,96,strides=2)  # (56,56)
+    x=se(x,4,96)
+    x=conv1_block(x,24)
+    x0=x
+    x=depthwiseConv_block(x0,144)
+    x=se(x,6,144)
+    x=conv1_block(x,24,0.025)
+    x=layers.add([x,x0])
+    # 注意:kernel_size=5,核大,视野就大
+    x=depthwiseConv_block(x,144,kernel_size=5,strides=2) # (28,28)
+    x=se(x,6,144)
+    x=conv1_block(x,40)
+    x0=x
+    x=depthwiseConv_block(x0,240,kernel_size=5)
+    x=se(x,10,240)
+    x=conv1_block(x,40,0.025)
+    x=layers.add([x,x0])
+    # 这个位置用的kernel_size=3
+    x=depthwiseConv_block(x,240,strides=2) # (14,14)
+    x=se(x,10,240)
+    x=conv1_block(x,80)
+    for i in range(2):
+        x0=x
+        x=depthwiseConv_block(x0,480)
+        x=se(x,20,480)
+        x=conv1_block(x,80,0.025)
+        x=layers.add([x,x0])
+    x=depthwiseConv_block(x,480,kernel_size=5)
+    x=se(x,20,480)
+    x=conv1_block(x,112)
+    for i in range(2):
+        x0=x
+        x=depthwiseConv_block(x0,672,kernel_size=5)
+        x=se(x,28,672)
+        x=conv1_block(x,112,0.025)
+        x=layers.add([x,x0])
+    x=depthwiseConv_block(x,672,kernel_size=5,strides=2) # (7,7)
+    x=se(x,28,672)
+    x=conv1_block(x,192)
+    for i in range(3):
+        x0=x
+        x=depthwiseConv_block(x0,1152,kernel_size=5)
+        x=se(x,48,1152)
+        x=conv1_block(x,192,0.025)
+        x=layers.add([x,x0])
+    x=depthwiseConv_block(x,1152,kernel_size=3)
+    x=se(x,48,1152)
+    x=conv1_block(x,320)
+    x=layers.Conv2D(1280,1,padding='same',use_bias=False)(x)
+    x=activation_block(x)
+    return keras.Model(inputs,x)
+
+# 64--128--256--512--1024
+# 没有残差,点卷积用来切换通道,便于深度卷积提取信息
+def get_mobilenet_model(input_shape,num_classes):
+    inputs=keras.Input(shape=input_shape)
+    x=layers.Rescaling(1.0/255)(inputs)
+    x=layers.Conv2D(32,3,strides=2,padding='same',use_bias=False)(x)  # (80,80,32)
+    x=relu_activation_block(x)
+    x=layers.DepthwiseConv2D(3,padding='same',use_bias=False)(x)
+    x=relu_activation_block(x)
+    x=layers.Conv2D(64,1,padding='same',use_bias=False)(x)
+    x=relu_activation_block(x)
+    x=layers.DepthwiseConv2D(3,strides=2,padding='same',use_bias=False)(x) # (40,40,64)
+    x=relu_activation_block(x)
+    for i in range(2): # 在40x40的特征图上深度卷积两次
+        x=layers.Conv2D(128,1,padding='same',use_bias=False)(x)
+        x=relu_activation_block(x)
+        if i==0:
+            x=layers.DepthwiseConv2D(3,padding='same',use_bias=False)(x)
+        else:
+           x=layers.DepthwiseConv2D(3,strides=2,padding='same',use_bias=False)(x) # (20,20,128)
+        x=relu_activation_block(x)
+    for i in range(2): # 在20x20的特征图上深度卷积两次
+        x=layers.Conv2D(256,1,padding='same',use_bias=False)(x)
+        x=relu_activation_block(x)
+        if i ==0:
+            x=layers.DepthwiseConv2D(3,padding='same',use_bias=False)(x)
+        else:
+            x=layers.DepthwiseConv2D(3,strides=2,padding='same',use_bias=False)(x) # (10,10,256)
+        x=relu_activation_block(x)
+    for i in range(6): # 在10x10的特征图上狠提特征
+        x=layers.Conv2D(512,1,padding='same',use_bias=False)(x)
+        x=relu_activation_block(x)
+        if i !=5:
+            x=layers.DepthwiseConv2D(3,padding='same',use_bias=False)(x)
+        else:
+            x=layers.DepthwiseConv2D(3,strides=2,padding='same',use_bias=False)(x)  # (5,5,512)
+        x=relu_activation_block(x)
+    x=layers.Conv2D(1024,1,padding='same',use_bias=False)(x)
+    x=relu_activation_block(x)
+    x=layers.DepthwiseConv2D(3,padding='same',use_bias=False)(x)
+    x=relu_activation_block(x)
+    x=layers.Conv2D(1024,1,padding='same',use_bias=False)(x)
+    x=relu_activation_block(x)
+    return keras.Model(inputs,x)
+
+def get_efficientnetb5_model(input_shape,num_classes):
+    inputs=keras.Input(shape=input_shape)
+    x=layers.Rescaling(1.0/255)(inputs)
+    x=layers.Normalization()(x)
+    x=layers.Rescaling(scale=[2.0896918976428642, 2.1128856368212916, 2.1081851067789197], offset=0.0)(x)
+    x=layers.Conv2D(48,3,strides=2,padding='same',use_bias=False)(x) # (112,112)
+    x=relu_activation_block(x)
+    x=layers.DepthwiseConv2D(3,padding='same',use_bias=False)(x)
+    x=relu_activation_block(x)
+    x=se(x,12,48)
+    x=conv1_block(x,24)
+    # 其实想想都知道它加深网络干啥事,之前200多层的网络主要提取14x14,7x7这些特征图的特征
+    # 现在它有足够的层数,就加大了112x112,56x56特征图的提取力度
+    for i in range(2): # 在112x112的特征图上用了两次残差
+        x0=x
+        x=layers.DepthwiseConv2D(3,padding='same',use_bias=False)(x0)
+        x=relu_activation_block(x)
+        x=se(x,6,24)
+        x=conv1_block(x,24,0.025)
+        x=layers.add([x,x0])
+    x=depthwiseConv_block(x,144,strides=2) # (56,56)
+    x=se(x,6,144)
+    x=conv1_block(x,40)
+    for i in range(4): # 在56x56的特征图上用了四次残差
+        x0=x
+        x=depthwiseConv_block(x0,240)
+        x=se(x,10,240)
+        x=conv1_block(x,40,0.025)
+        x=layers.add([x,x0])
+    # 用5x5的核,可以加强感受野
+    x=depthwiseConv_block(x,240,strides=2,kernel_size=5) # (28,28)
+    x=se(x,10,240)
+    x=conv1_block(x,64)
+    for i in range(4): # 在28x28的特征图上用了四次残差
+        x0=x
+        x=depthwiseConv_block(x0,384,kernel_size=5)
+        x=se(x,16,384)
+        x=conv1_block(x,64,0.025)
+        x=layers.add([x,x0])
+    # 用3x3的核
+    x=depthwiseConv_block(x,384,kernel_size=3,strides=2) # (14,14)
+    x=se(x,16,384)
+    x=conv1_block(x,128)
+    for i in range(6):
+        x0=x
+        x=depthwiseConv_block(x0,768)
+        x=se(x,32,768)
+        x=conv1_block(x,128,0.025)
+        x=layers.add([x,x0])
+    x=depthwiseConv_block(x,768,kernel_size=5)
+    x=se(x,32,768)
+    x=conv1_block(x,176)
+    for i in range(6): # 在14x14的特征图上一共用了12次残差
+        x0=x
+        x=depthwiseConv_block(x0,1056,kernel_size=5)
+        x=se(x,44,1056)
+        x=conv1_block(x,176,0.025)
+        x=layers.add([x,x0])
+    # 深度卷积核大小:5x5
+    x=depthwiseConv_block(x,1056,kernel_size=5,strides=2) # (7,7)
+    x=se(x,44,1056)
+    x=conv1_block(x,304)
+    for i in range(8):
+        x0=x
+        x=depthwiseConv_block(x0,1824,kernel_size=5)  # 核大小:5x5
+        x=se(x,76,1824)
+        x=conv1_block(x,304,0.025)
+        x=layers.add([x,x0])
+    x=depthwiseConv_block(x,1824,kernel_size=3)
+    x=se(x,76,1824)
+    x=conv1_block(x,512)
+    for i in range(2): # 在7x7的特征图上一共用了10次残差
+        x0=x
+        x=depthwiseConv_block(x0,3072)
+        x=se(x,128,3072)
+        x=conv1_block(x,512,0.025)
+        x=layers.add([x,x0])
+    x=layers.Conv2D(2048,1,padding='same',use_bias=False)(x)
+    x=activation_block(x)
+    return keras.Model(inputs,x)
+
+# 上面的要是没看懂,这个就不要看了,这个一共800多层，作为目标最优秀的一类卷积残差网络
+
+def get_efficientnetb7_model(input_shape,num_classes):
+    inputs=keras.Input(shape=input_shape)
+    x=layers.Rescaling(1.0/255)(inputs)
+    x=layers.Normalization()(x)
+    x=layers.Rescaling(scale=[2.0896918976428642, 2.1128856368212916, 2.1081851067789197], offset=0.0)(x)
+    x=layers.Conv2D(64,3,strides=2,padding='same',use_bias=False)(x) # (112,112)
+    x=relu_activation_block(x)
+    x=layers.DepthwiseConv2D(3,padding='same',use_bias=False)(x)
+    x=relu_activation_block(x)
+    x=se(x,16,64)
+    x=conv1_block(x,32)
+    # 其实想想都知道它加深网络干啥事,之前200多层的网络主要提取14x14,7x7这些特征图的特征
+    # 现在它有足够的层数,就加大了112x112,56x56特征图的提取力度
+    for i in range(3): # 在 112x112的特征图上用了3次残差
+        x0=x
+        x=layers.DepthwiseConv2D(3,padding='same',use_bias=False)(x0)
+        x=relu_activation_block(x)
+        x=se(x,8,32)
+        x=conv1_block(x,32,0.025)
+        x=layers.add([x,x0])
+    x=depthwiseConv_block(x,192,strides=2) # (56,56)
+    x=se(x,8,192)
+    x=conv1_block(x,48)
+    for i in range(6): # 在56x56的特征图上用了6次残差
+        x0=x
+        x=depthwiseConv_block(x0,288)
+        x=se(x,12,288)
+        x=conv1_block(x,48,0.025)
+        x=layers.add([x,x0])
+    # 用5x5的核,可以加强感受野
+    x=depthwiseConv_block(x,288,strides=2,kernel_size=5) # (28,28)
+    x=se(x,12,288)
+    x=conv1_block(x,80)
+    for i in range(6): # 在28x28的特征图上用了6次残差
+        x0=x
+        x=depthwiseConv_block(x0,480,kernel_size=5)
+        x=se(x,20,480)
+        x=conv1_block(x,80,0.025)
+        x=layers.add([x,x0])
+    # 用3x3的核
+    x=depthwiseConv_block(x,480,kernel_size=3,strides=2) # (14,14)
+    x=se(x,20,480)
+    x=conv1_block(x,160)
+    for i in range(9):
+        x0=x
+        x=depthwiseConv_block(x0,960)
+        x=se(x,40,960)
+        x=conv1_block(x,160,0.025)
+        x=layers.add([x,x0])
+    x=depthwiseConv_block(x,960,kernel_size=5)
+    x=se(x,40,960)
+    x=conv1_block(x,224)
+    for i in range(9): # 在14x14的特征图上一共用了18次残差
+        x0=x
+        x=depthwiseConv_block(x0,1344,kernel_size=5)
+        x=se(x,56,1344)
+        x=conv1_block(x,224,0.025)
+        x=layers.add([x,x0])
+    # 深度卷积核大小:5x5
+    x=depthwiseConv_block(x,1344,kernel_size=5,strides=2) # (7,7)
+    x=se(x,56,1344)
+    x=conv1_block(x,384)
+    for i in range(12):
+        x0=x
+        x=depthwiseConv_block(x0,2304,kernel_size=5)  # 核大小:5x5
+        x=se(x,96,2304)
+        x=conv1_block(x,384,0.025)
+        x=layers.add([x,x0])
+    x=depthwiseConv_block(x,2304,kernel_size=3)
+    x=se(x,96,2304)
+    x=conv1_block(x,640)
+    for i in range(3): # 在7x7的特征图上一共用了15次残差
+        x0=x
+        x=depthwiseConv_block(x0,3840)
+        x=se(x,160,3840)
+        x=conv1_block(x,640,0.025)
+        x=layers.add([x,x0])
+    x=layers.Conv2D(2560,1,padding='same',use_bias=False)(x)
+    x=activation_block(x)
+    return keras.Model(inputs,x)

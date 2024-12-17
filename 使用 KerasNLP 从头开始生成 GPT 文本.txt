@@ -1,0 +1,209 @@
+import os
+os.environ["KERAS_BACKEND"] = "tensorflow"  # @param ["tensorflow", "jax", "torch"]
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+import keras_nlp
+import keras
+import tensorflow as tf
+
+import sj_utils
+sj_utils.use_gpu()
+
+BATCH_SIZE = 64
+MIN_STRING_LEN = 512  # Strings shorter than this will be discarded
+SEQ_LEN = 128  # Length of training sequences, in tokens
+# Model
+EMBED_DIM = 256
+FEED_FORWARD_DIM = 128
+NUM_HEADS = 3
+NUM_LAYERS = 2
+VOCAB_SIZE = 5000  # 限制模型参数
+# Training
+EPOCHS = 5
+# Inference
+NUM_TOKENS_TO_GENERATE = 80
+
+keras.utils.get_file(
+    origin="https://dldata-public.s3.us-east-2.amazonaws.com/simplebooks.zip",
+    extract=True,
+)
+
+dir = os.path.expanduser("datasets/simplebooks")
+
+# Load simplebooks-92 train set and filter out short lines.
+raw_train_ds = (
+    tf.data.TextLineDataset(dir + "/simplebooks-92-raw/train.txt")
+    .filter(lambda x: tf.strings.length(x) > MIN_STRING_LEN)
+    .batch(BATCH_SIZE)
+    .shuffle(buffer_size=256)
+)
+
+# Load simplebooks-92 validation set and filter out short lines.
+raw_val_ds = (
+    tf.data.TextLineDataset(dir + "/simplebooks-92-raw/valid.txt")
+    .filter(lambda x: tf.strings.length(x) > MIN_STRING_LEN)
+    .batch(BATCH_SIZE)
+)
+
+# 我们从训练数据集中训练分词器，以得到一个词汇大小（VOCAB_SIZE），这是一个经过调整的超参数。我们希望尽可能限
+# 制词汇表的大小，因为稍后会看到，这对模型参数的数量有很大影响。同时，我们也不想包含太少的词汇项，否则会产生太
+# 多的未知词汇（Out-Of-Vocabulary, OOV）子词。此外，词汇表中还预留了三个标记："[PAD]"：用于将序列填充到固
+# 定长度（SEQ_LEN）。这个标记在vocab[0]和其他层中都以索引0出现，因为（以及其他层）将<pad>/[PAD]视为默认的填
+# 充标记。"[UNK]"：代表OOV子词，它应该与WordPieceTokenizer中的默认设置相匹配。这里oov_token="[UNK]"指定
+# 了未知词汇的标记。 "[BOS]"：代表句子的开始，但在这里，从技术上讲，它是一个标记，代表训练数据中每一行的开始。
+# 通过这些设计，我们可以有效地控制模型的大小和泛化能力，同时确保模型能够处理训练数据中可能遇到的各种情况，包括那
+# 些不在初始词汇表中的词汇。使用WordPieceTokenizer这样的分词器还可以帮助我们处理未知词汇，通过将它们分解为已
+# 知的子词组合，从而提高模型的覆盖率和准确性。
+
+# 训练标记器词汇
+vocab = keras_nlp.tokenizers.compute_word_piece_vocabulary(
+    raw_train_ds,
+    vocabulary_size=VOCAB_SIZE,
+    lowercase=True,
+    reserved_tokens=["[PAD]", "[UNK]", "[BOS]"], # 保留token:填充，未知，起始
+)
+
+# WordPieceTokenizer是BERT和其他模型使用的WordPiece算法的有效实现。
+tokenizer = keras_nlp.tokenizers.WordPieceTokenizer(
+    vocabulary=vocab,
+    sequence_length=SEQ_LEN,
+    lowercase=True,
+)
+
+# packer adds a start token
+start_packer = keras_nlp.layers.StartEndPacker(
+    sequence_length=SEQ_LEN,
+    start_value=tokenizer.token_to_id("[BOS]"),
+)
+
+def preprocess(inputs):
+    outputs = tokenizer(inputs)
+    # 加了开始符，但是长度还是128,这样原来的最后一个token会被截断
+    #相当于之前的[:-1]
+    features = start_packer(outputs)
+    # 原始分词，长度128,相当于之前的[1:]
+    labels = outputs
+    #labels是1--n+1,features是0--n，这样刚好是预测下一个token
+    return features, labels
+
+# Tokenize and split into train and label sequences.
+train_ds = raw_train_ds.map(preprocess, num_parallel_calls=tf.data.AUTOTUNE).prefetch(
+    tf.data.AUTOTUNE
+)
+
+for f,l in train_ds.take(1):
+    print(f[0])
+    print(l[0])
+    break
+
+val_ds = raw_val_ds.map(preprocess, num_parallel_calls=tf.data.AUTOTUNE).prefetch(
+    tf.data.AUTOTUNE
+)
+
+inputs = keras.layers.Input(shape=(None,), dtype="int32")
+# Embedding.
+embedding_layer = keras_nlp.layers.TokenAndPositionEmbedding(
+    vocabulary_size=VOCAB_SIZE,
+    sequence_length=SEQ_LEN,
+    embedding_dim=EMBED_DIM,
+    mask_zero=True,
+)
+x = embedding_layer(inputs)
+# transformer decode层,只有自注意力和前馈层，不包括跨注意力，因为不是翻译任务
+#没有源序列，只有目标序列，就是根据目标序列前i个token预测第i+1个token
+for _ in range(NUM_LAYERS): #有两层，所以x被解码两次
+    decoder_layer = keras_nlp.layers.TransformerDecoder(
+        num_heads=NUM_HEADS,
+        intermediate_dim=FEED_FORWARD_DIM,
+    )
+    # 只传一个目标序列输入，而不传编码器输出的输入，是因为任务的特殊性，文本生成，只需要
+    # 基于目标序列预测下个token，所以它只包括解码器部分，为了用因果掩码来让机器学会预测
+    # 下一个token
+    x = decoder_layer(x) 
+
+outputs = keras.layers.Dense(VOCAB_SIZE)(x)
+
+model = keras.Model(inputs=inputs, outputs=outputs)
+
+# Perplexity（或称为困惑度）是自然语言处理（NLP）中一个常见的评估指标，特别是在语言模型（Language
+# Model, LM）的评估中。它衡量了模型对测试数据的预测能力，即模型对测试集中每个词（或标记）预测的不确定
+# 性。困惑度越低，表示模型对测试数据的预测能力越好，不确定性越低。
+
+loss_fn = keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+perplexity = keras_nlp.metrics.Perplexity(from_logits=True, mask_token_id=0)
+model.compile(optimizer="adam", loss=loss_fn, metrics=[perplexity])
+
+# 让我们来看一下我们的模型概要——绝大多数参数都位于（嵌入层和）输出层！这意味着词汇表大小（VOCAB_SIZE）
+# 对模型参数的大小有很大影响，而Transformer解码器层的数量（NUM_LAYERS）对其影响则不那么显著。token_and
+# _position_embedding（词嵌入和位置嵌入）与dense（密集层）共同贡献了这些参数。
+
+model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS)
+
+model.save_weights('./checkpoints/gpt_text_generate_12.weights.h5')
+
+def next(prompt, cache, index):
+    logits = model(prompt)[:, index - 1, :]
+    # Ignore hidden states for now; only needed for contrastive search.
+    hidden_states = None
+    return logits, hidden_states, cache
+
+sampler = keras_nlp.samplers.GreedySampler()
+output_tokens = sampler(
+    next=next,
+    prompt=prompt_tokens,
+    index=1,  # Start sampling immediately after the [BOS] token.
+)
+txt = tokenizer.detokenize(output_tokens)
+print(f"Greedy search generated text: \n{txt}\n")
+
+sampler = keras_nlp.samplers.BeamSampler(num_beams=10)
+output_tokens = sampler(
+    next=next,
+    prompt=prompt_tokens,
+    index=1,
+)
+txt = tokenizer.detokenize(output_tokens)
+print(f"Beam search generated text: \n{txt}\n")
+
+sampler = keras_nlp.samplers.RandomSampler()
+output_tokens = sampler(
+    next=next,
+    prompt=prompt_tokens,
+    index=1,
+)
+txt = tokenizer.detokenize(output_tokens)
+print(f"Random search generated text: \n{txt}\n")
+
+sampler = keras_nlp.samplers.TopKSampler(k=10)
+output_tokens = sampler(
+    next=next,
+    prompt=prompt_tokens,
+    index=1,
+)
+txt = tokenizer.detokenize(output_tokens)
+print(f"Top-K search generated text: \n{txt}\n")
+
+sampler = keras_nlp.samplers.TopPSampler(p=0.5)
+output_tokens = sampler(
+    next=next,
+    prompt=prompt_tokens,
+    index=1,
+)
+txt = tokenizer.detokenize(output_tokens)
+print(f"Top-P search generated text: \n{txt}\n")
+
+class TopKTextGenerator(keras.callbacks.Callback):
+    """A callback to generate text from a trained model using top-k."""
+    def __init__(self, k):
+        self.sampler = keras_nlp.samplers.TopKSampler(k)
+    def on_epoch_end(self, epoch, logs=None):
+        output_tokens = self.sampler(
+            next=next,
+            prompt=prompt_tokens,
+            index=1,
+        )
+        txt = tokenizer.detokenize(output_tokens)
+        print(f"Top-K search generated text: \n{txt}\n")
+text_generation_callback = TopKTextGenerator(k=10)
+# Dummy training loop to demonstrate callback.
+model.fit(train_ds.take(1), verbose=2, epochs=2, callbacks=[text_generation_callback])

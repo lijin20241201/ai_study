@@ -1,0 +1,28 @@
+因为联想y7000在ubantu系统上连不到wifi,所以打算弄双系统
+
+第一步：下载win10镜像，之后在系统用gparted新建个分区，格式化成ntfs，用来装win10系统
+
+第二步，制作win10启动盘，这个需要先把u盘用disks格式化，之后用下面的命令刻录系统到u盘
+
+sudo bash woeusb-5.2.4.bash --device Win10_22H2_China_GGK_Chinese_Simplified_x64.iso /dev/sda
+
+第三步，设置bios u盘首启动，之后一路傻瓜式安装，刻录wins10和刻录普通的ubantu不一样，刻录ubantu只需要dd一个命令就行。双系统后如果报错，就进入分区，把挂载卸了。
+
+下载anaconda bash 安装它
+
+创建conda环境 安装nvidia驱动，cuda,cudnn
+
+安装显卡驱动，先下载，之后按网上的安装，成功后肯定黑屏，设置成下面的解决黑屏问题
+
+Section "Module"
+        Load "modesetting"
+EndSection
+
+Section "Device"
+    Identifier     "Device1"
+    Driver         "modesetting"
+    VendorName     "Intel Corporation"
+    BusID          "PCI:0:2:0"
+EndSection
+
+linux内核要固定住，不然，一更新又得重装驱动，当然，安装search到的应该没问题，之前安装系统推荐的就没问题，这个下载的就各种问题,cuda和cudnn只要别匹配错就行，这个傻瓜式安装

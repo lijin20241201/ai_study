@@ -1,0 +1,515 @@
+import os
+import paddle
+from paddlenlp.transformers import AutoModelForSequenceClassification
+
+params_path='checkpoint/text_classes/'
+output_path='output/text_class'
+
+model = AutoModelForSequenceClassification.from_pretrained(params_path)
+
+model.eval()
+# 转换为具有特定输入描述的静态图
+model = paddle.jit.to_static(
+    model,
+    input_spec=[
+        paddle.static.InputSpec(shape=[None, None],
+                                dtype="int64"),  # input_ids
+        paddle.static.InputSpec(shape=[None, None],
+                                dtype="int64")  # segment_ids
+    ])
+
+# Save in static graph model.
+save_path = os.path.join(output_path, "float32")
+paddle.jit.save(model, save_path)
+
+import functools
+import numpy as np
+from sklearn.metrics import top_k_accuracy_score, classification_report
+import paddle.nn.functional as F
+from paddlenlp.data import DataCollatorWithPadding
+from paddlenlp.datasets import load_dataset
+from paddlenlp.transformers import  AutoTokenizer
+from paddlenlp.utils.log import logger
+import re
+import json
+import random
+import time
+from paddle.io import DataLoader, BatchSampler, DistributedBatchSampler
+from paddlenlp.transformers import AutoModelForSequenceClassification, AutoTokenizer, LinearDecayWithWarmup
+from paddlenlp.dataaug import WordSubstitute, WordInsert, WordDelete, WordSwap
+from trustai.interpretation import FeatureSimilarityModel
+
+paddle.set_device('gpu')
+
+dataset_dir='datasets/KUAKE_QIC'
+
+label_list = {}
+label_path = os.path.join(dataset_dir, 'label.txt')
+
+train_path = os.path.join(dataset_dir, 'train.txt')
+dev_path = os.path.join(dataset_dir, 'dev.txt')
+
+with open(label_path, 'r', encoding='utf-8') as f:
+    for i, line in enumerate(f):
+        l = line.strip()
+        label_list[l] = i
+
+from q_a_utils import utils
+
+import importlib
+importlib.reload(utils)
+
+train_ds = load_dataset(utils.read_local_dataset,
+                            path=train_path,
+                            label_list=label_list,
+                            lazy=False)
+
+dev_ds = load_dataset(utils.read_local_dataset,
+                          path=dev_path,
+                          label_list=label_list,
+                          lazy=False)
+
+params_dir='checkpoint/text_classes'
+
+model = AutoModelForSequenceClassification.from_pretrained(
+        params_dir)
+
+tokenizer = AutoTokenizer.from_pretrained(params_dir)
+
+max_seq_length=128
+
+trans_func = functools.partial(utils.preprocess_function,
+                                   tokenizer=tokenizer,
+                                   max_seq_length=max_seq_length)
+
+train_dataset = train_ds.map(trans_func)
+dev_dataset = dev_ds.map(trans_func)
+
+batch_size=16
+bad_case_path=dataset_dir+'/bad_case.txt'
+
+# batchify dataset
+collate_fn = DataCollatorWithPadding(tokenizer)
+
+train_batch_sampler = BatchSampler(train_ds,
+                                       batch_size=batch_size,
+                                       shuffle=False)
+train_data_loader = DataLoader(dataset=train_ds,
+                               batch_sampler=train_batch_sampler,
+                               collate_fn=collate_fn)
+dev_batch_sampler = BatchSampler(dev_ds,
+                                 batch_size=batch_size,
+                                 shuffle=False)
+dev_data_loader = DataLoader(dataset=dev_ds,
+                             batch_sampler=dev_batch_sampler,
+                             collate_fn=collate_fn)
+
+len(train_data_loader.dataset)
+
+model.eval()
+probs = [] #保存模型预测的当前样本的概率分布
+labels = [] # 保存真实类别标签
+for batch in train_data_loader:
+    label = batch.pop("labels") # 弹出labels (16,1)
+    logits = model(**batch) # (16,11)
+    prob = F.softmax(logits, axis=1)
+    # print(label.shape)
+    labels.extend(label.numpy())
+    probs.extend(prob.numpy())
+# print(len(probs)) # 6931
+# print(probs[0].shape) # (11,)
+probs = np.array(probs)
+labels = np.array(labels)
+preds = probs.argmax(axis=-1)
+report_train = classification_report(labels,
+                                     preds,
+                                     digits=4,
+                                     output_dict=True)
+
+# digits=4参数指定了在输出报告中保留的小数位数。这意味着对于精确度（precision）、召回率（rec
+# all）、F1分数（F1-score）等性能指标，将展示到小数点后四位
+# output_dict=True参数则指定了函数的输出格式。当设置为True时，classification_report
+# 将返回一个字典（dict）而不是打印到控制台。这个字典包含了分类报告的所有信息，包括每个类别的精确度、
+# 召回率、F1分数以及支持度（即该类别的真实样本数）。
+
+report_train # 返回11个类别的报告
+
+probs = []
+labels = []
+for batch in dev_data_loader:
+    label = batch.pop("labels")
+    logits = model(**batch)
+    prob = F.softmax(logits, axis=1)
+    labels.extend(label.numpy())
+    probs.extend(prob.numpy())
+probs = np.array(probs)
+labels = np.array(labels)
+preds = probs.argmax(axis=-1) #获取最大概率对应的索引,也就是模型预测的类别
+report = classification_report(labels, preds, digits=4, output_dict=True)
+
+print(len(probs),len(labels))
+
+logger.info("-----Evaluate model-------")
+logger.info("Train dataset size: {}".format(len(train_ds)))
+logger.info("Dev dataset size: {}".format(len(dev_ds)))
+logger.info("Accuracy in dev dataset: {:.2f}%".format(report['accuracy'] *
+                                                      100))
+logger.info("Top-2 accuracy in dev dataset: {:.2f}%".format(
+    top_k_accuracy_score(labels, probs, k=2) * 100))
+logger.info("Top-3 accuracy in dev dataset: {:.2f}%".format(
+    top_k_accuracy_score(labels, probs, k=3) * 100))
+
+label_map=dict(zip(range(len(label_list)),label_list.keys()))
+
+for i in label_map: # 相当于遍历dict的keys()
+    logger.info("Class name: {}".format(label_map[i]))
+    # i对应当前类别,从0--10
+    logger.info(
+        "Evaluation examples in train dataset:\
+        {}({:.1f}%) | precision: {:.2f} | recall: {:.2f} | F1 score {:.2f}"
+        .format(report_train[str(i)]['support'], #当前类别的训练样本数
+                100 * report_train[str(i)]['support'] / len(train_ds),
+                report_train[str(i)]['precision'] * 100,
+                report_train[str(i)]['recall'] * 100,
+                report_train[str(i)]['f1-score'] * 100))
+    logger.info(
+        "Evaluation examples in dev dataset: {}({:.1f}%) | \
+        precision: {:.2f} | recall: {:.2f} | F1 score {:.2f}"
+        .format(report[str(i)]['support'],# 当前类别的评估样本数
+                100 * report[str(i)]['support'] / len(dev_ds),
+                report[str(i)]['precision'] * 100,
+                report[str(i)]['recall'] * 100,
+                report[str(i)]['f1-score'] * 100))
+    logger.info("----------------------------")
+
+with open(bad_case_path, 'w', encoding="utf-8") as f:
+    f.write("Confidence\tPrediction\tLabel\tText\n")
+    for i, (p, l) in enumerate(zip(preds, labels)):
+        p, l = int(p), int(l)
+        if p != l: # 把预测错的存入文件
+            # 模型预测类别对应的模型置信度,预测对应的类别，真实类别，预测文本
+            f.write("{:.2f}".format(probs[i][p]) + "\t" + label_map[p] +
+                    "\t" + label_map[l] + "\t" + dev_ds.data[i]["text"] +
+                    "\n")
+logger.info("Bad case in dev dataset saved in {}".format(
+    bad_case_path))
+
+# 现在我们进行稀疏数据识别--数据增强，得到新增训练数据
+
+# choices=["duplicate", "substitute", "insert", "delete", "swap"]
+aug_strategy='substitute'
+annotate=True
+
+seed=1000
+# 每个示例的基本原理数量。
+support_threshold=0.7
+
+unlabeled_file='data.txt'
+
+sparse_file='sparse.txt'
+support_file='support.txt'
+
+utils.set_seed(seed)
+
+def get_sparse_data(analysis_result, sparse_num): # 获取稀疏数据
+    # 参数:解析结果,稀疏数据
+    idx_scores = {} #保存样本索引序号和其对应的分析中的正样本相似度分数
+    preds = [] # 保存预测类别
+    for i in range(len(analysis_result)):
+        # 分析结果中的正例分数
+        scores = analysis_result[i].pos_scores  
+        # 计算出平均分数
+        idx_scores[i] = sum(scores) / len(scores)
+        # 把分析结果的预测类别加进去
+        preds.append(analysis_result[i].pred_label)
+    # 按分析结果分数的分数高低排序,后面是截取一定数目,按分数正序排列
+    #这样分数低的是稀疏样本数据
+    idx_socre_list = list(sorted(idx_scores.items(),
+                                 key=lambda x: x[1]))[:sparse_num]
+    ret_idxs, ret_scores = list(zip(*idx_socre_list))
+    return ret_idxs, ret_scores, preds
+
+#少样本分析中返回的标签是字符串文字形式，不是数字
+def read_local_dataset(path):
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            items = line.strip().split('\t')
+            if len(items) == 2:
+                yield {'text': items[0], 'label': items[1]}
+            elif len(items) == 1:
+                yield {'text': items[0]}
+            else:
+                logger.info(line.strip())
+                raise ValueError("{} should be in fixed format.".format(path))
+
+def preprocess_function(examples, tokenizer, max_seq_length):
+    result = tokenizer(text=examples["text"], max_seq_len=max_seq_length)
+    return result
+
+# Batchify dataset
+collate_fn = utils.LocalDataCollatorWithPadding(tokenizer)
+
+# 特别注意:进行稀疏样本分析时，这里的标签不是数字，而是真实类别
+
+# 所以这里加载读取的是字符串文本标签
+
+train_ds = load_dataset(read_local_dataset, path=train_path, lazy=False)
+dev_ds = load_dataset(read_local_dataset, path=dev_path, lazy=False)
+trans_func = functools.partial(preprocess_function,
+                               tokenizer=tokenizer,
+                               max_seq_length=max_seq_length)
+
+#这里转换成数字形式时,没有标签，只读取输入
+
+train_ds = train_ds.map(trans_func)
+dev_ds = dev_ds.map(trans_func)
+
+train_batch_sampler = BatchSampler(train_ds,
+                                   batch_size=batch_size,
+                                   shuffle=False)
+
+dev_batch_sampler = BatchSampler(dev_ds,
+                                     batch_size=batch_size,
+                                     shuffle=False)
+
+# collate_fn是返回列表形式的collate_fn
+
+rain_data_loader = DataLoader(dataset=train_ds,
+                               batch_sampler=train_batch_sampler,
+                               collate_fn=collate_fn)
+dev_data_loader = DataLoader(dataset=dev_ds,
+                             batch_sampler=dev_batch_sampler,
+                             collate_fn=collate_fn)
+
+for i in dev_data_loader:
+    print(i)
+    break
+
+# 用FeatureSimilarityModel的模型来分析特征的相似度，并基于这些分析从开发集（
+# dev_data_loader）中选择稀疏数据。这个过程大致可以分为几个步骤：特征相似度分
+# 析、稀疏数据选择和结果获取。
+
+# 这个步骤使用FeatureSimilarityModel类来处理模型model和训练数据加载器train_data_loader
+# ，并指定了分类器的最后一层名称（"classifier"）。这个模型可能通过某种方式（如梯度信息、激活
+# 值或注意力机制）来评估特征的重要性或它们之间的相似性。
+
+# Classifier_layer_name为最后一个输出层的层名
+feature_sim = FeatureSimilarityModel(model,
+                                     train_data_loader,
+                                     classifier_layer_name="classifier")
+
+# 通过遍历dev_data_loader中的每个批次（batch），使用feature_sim对象对每个批
+# 次进行分析，并可能根据某些条件（如rationale_num）选择或评估特定数量的样本。
+
+# 基于analysis_result，使用get_sparse_data函数选择稀疏数据。稀疏数据通常指的是在特
+# 征空间中具有独特或稀疏表示的数据点，它们可能对模型的学习特别重要或具有代表性。
+
+# get_sparse_data(analysis_result, sparse_num)函数根据某种标准（如特征相似度评分的分布
+# 、特征值的方差等）从analysis_result中选择sparse_num个最稀疏的数据点。
+
+# 返回三个主要元素：稀疏数据的索引（sparse_indexs）、稀疏度评分（sparse_scores）
+# 和这些数据的预测结果（preds）
+
+rationale_num=8
+
+# 特征相似度分析及稀疏数据选择
+analysis_result = []
+for batch in dev_data_loader:
+    analysis_result += feature_sim(batch, sample_num=rationale_num)
+
+analysis_result[8] #pos_scores大概率是相似度分数
+
+print((len(analysis_result)),len(dev_data_loader.dataset))
+
+# 设置返回评估集中稀疏数据的样本数
+sparse_num=300
+
+sparse_indexs, sparse_scores, preds = get_sparse_data(
+    analysis_result, sparse_num)
+
+sparse_indexs[:10]
+
+len([i for i in is_true if i==1])
+
+# 我是全评估集抽取，后边的预测都正确，说明他们不是稀疏样本
+#前面的预测很多不正确，是稀疏样本，说明这些类别缺乏训练数据
+is_true
+
+# 分数低的都是稀疏样本
+sparse_scores
+
+#稀疏数据是某个分类类别缺乏足够的训练数据,导致资料不足,所以模型在评估这些数据时会预测错误
+
+# Save the sparse data
+is_true = []
+with open(os.path.join(dataset_dir,sparse_file), 'w') as f:
+    for idx in sparse_indexs:
+        data = dev_ds.data[idx] # 获取稀疏样本和其真实类别
+        f.write(data['text'] + '\t' + str(data['label']) + '\n')
+        # 如果预测标签和真实标签相同,设置标记1,表示预测正确,否则设置0
+        is_true.append(1 if str(preds[idx]) ==
+                       str(label_list[data['label']]) else 0)
+
+logger.info("Sparse data saved in {}".format(
+    os.path.join(dataset_dir, sparse_file)))
+logger.info("Accuracy in sparse data: {:.2f}%".format(100 * sum(is_true) /
+                                                      len(is_true)))
+logger.info("Average score in sparse data: {:.4f}".format(
+    sum(sparse_scores) / len(sparse_scores)))
+
+# sparse_num`：筛选稀疏数据数量，建议为开发集的10%~20%，默认为100
+# support_num`：用于数据增强的支持数据数量，建议为训练集的10%~20%，默认为100
+# support_threshold`：支持数据的阈值，只选择支持证据分数大于阈值作为支持数据，默认为0.7。
+# `sparse_file`：保存在本地数据集路径中稀疏数据文件名；默认为"sparse.txt"。
+# `support_file`：保存在本地数据集路径中支持训练数据文件名；默认为"support.txt"。
+
+ 将得到增强支持数据`support.txt`与训练集数据`train.txt`合并得到新的训练集`
+# train_sparse_aug.txt`重新进行训练：
+# cat ../data/train.txt ../data/support.txt > ../data/train_sparse_aug.txt
+
+#获取支持数据:分析结果,支持数据条数,阈值
+def get_support_data(analysis_result, support_num, support_threshold=0.7):
+    ret_idxs = [] # 保存相似样本索引
+    ret_scores = [] # 保存相似样本索引对应的分数
+    rationale_idx = 0
+    try:
+        while len(ret_idxs) < support_num: #退出内循环时，这里会自动判断，退出循环
+            for i in range(len(analysis_result)):
+                # 选取相似度分数
+                score = analysis_result[i].pos_scores[rationale_idx]
+                # 大于支持阈值才行
+                if score > support_threshold:
+                    # 选取相似样本索引
+                    idx = analysis_result[i].pos_indexes[rationale_idx]
+                    # idx不在里面的话添加,不添加重复的
+                    if idx not in ret_idxs:
+                        ret_idxs.append(idx)
+                        ret_scores.append(score)
+                    # 如果选够了样本，就退出内循环
+                    if len(ret_idxs) >= support_num:
+                        break
+            # 这种情况是里面根据rationale_idx查到的idx已经在ret_idxs里面了
+            # 这里就会加1，再次进入内循环查找
+            rationale_idx += 1
+    except IndexError:
+        logger.error(
+            f"The index is out of range, please reduce support_num or increase support_threshold. Got {len(ret_idxs)} now."
+        )
+
+    return ret_idxs, ret_scores
+
+annotate=False
+
+train_file='train.txt'
+
+# Prepare & preprocess dataset
+if annotate:
+    candidate_path = os.path.join(dataset_dir, unlabeled_file)
+else:
+    candidate_path = os.path.join(dataset_dir,train_file)
+
+sparse_path = os.path.join(dataset_dir, sparse_file)
+
+support_path = os.path.join(dataset_dir,support_file)
+
+candidate_ds = load_dataset(read_local_dataset,
+                                path=candidate_path,
+                                lazy=False)
+
+# 加载稀疏数据
+sparse_ds = load_dataset(read_local_dataset, path=sparse_path, lazy=False)
+
+trans_func = functools.partial(preprocess_function,
+                               tokenizer=tokenizer,
+                               max_seq_length=max_seq_length)
+
+candidate_ds = candidate_ds.map(trans_func)
+
+sparse_ds = sparse_ds.map(trans_func)
+
+print(len(sparse_ds),sparse_ds[0])
+
+# Batchify dataset
+collate_fn = utils.LocalDataCollatorWithPadding(tokenizer)
+
+candidate_batch_sampler = BatchSampler(candidate_ds,
+                                           batch_size=batch_size,
+                                           shuffle=False)
+
+sparse_batch_sampler = BatchSampler(sparse_ds,
+                                        batch_size=batch_size,
+                                        shuffle=False)
+
+candidate_data_loader = DataLoader(dataset=candidate_ds,
+                                       batch_sampler=candidate_batch_sampler,
+                                       collate_fn=collate_fn)
+sparse_data_loader = DataLoader(dataset=sparse_ds,
+                                batch_sampler=sparse_batch_sampler,
+                                collate_fn=collate_fn)
+
+for i in sparse_data_loader:
+    print(i)
+    break
+
+# Classifier_layer_name为最后一个输出层的层名
+feature_sim = FeatureSimilarityModel(model,
+                                     candidate_data_loader,
+                                     classifier_layer_name="classifier")
+
+# 特征相似度分析
+analysis_result = [] # 分析结果
+for batch in sparse_data_loader:
+    analysis_result += feature_sim(batch, sample_num=-1)
+
+support_num=300
+
+support_indexs, support_scores = get_support_data(analysis_result,
+                                                      support_num,
+                                                      support_threshold)
+
+# Save the support data
+# 如果annotate=True,或者aug_strategy是重复
+if annotate or aug_strategy == "duplicate":
+    with open(support_path, 'w') as f:
+        for idx in list(support_indexs):
+            data = candidate_ds.data[idx]
+            if 'label' in data:
+                f.write(data['text'] + '\t' + data['label'] + '\n')
+            else:
+                f.write(data['text'] + '\n')
+    f.close()
+else:  
+    create_n = 1
+    aug_percent = 0.1 # 增强百分比
+    if aug_strategy == "substitute": # substitute:替代
+        aug = WordSubstitute('synonym',
+                             create_n=create_n,
+                             aug_percent=aug_percent)
+    elif aug_strategy == "insert": # 插入
+        aug = WordInsert('synonym',
+                         create_n=create_n,
+                         aug_percent=aug_percent)
+    elif aug_strategy == "delete": # 删除
+        aug = WordDelete(create_n=create_n, aug_percent=aug_percent)
+    elif  aug_strategy == "swap": # swap:交换
+        aug = WordSwap(create_n=create_n, aug_percent=aug_percent)
+
+    with open(support_path, 'w') as f:
+        for idx in list(support_indexs):
+            data = candidate_ds.data[idx]
+            augs = aug.augment(data['text'])
+            for a in augs:
+                f.write(a + '\t' + data['label'] + '\n')
+    f.close()
+
+data = candidate_ds.data[support_indexs[0]]
+
+logger.info("support data saved in {}".format(support_path))
+logger.info("support average scores: {:.4f}".format(
+    float(sum(support_scores)) / len(support_scores)))
+
+# 将得到增强支持数据`support.txt`与训练集数据`train.txt`合并得到新的训练集`train_sparse_aug.txt`重新进行训练：
+
+# ```shell
+# cat ../data/train.txt ../data/support.txt > ../data/train_sparse_aug.txt
+# ```

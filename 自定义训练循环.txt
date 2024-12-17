@@ -1,0 +1,200 @@
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+import tensorflow as tf
+
+# Helper libraries
+import numpy as np
+print(tf.__version__)
+
+path='./datasets/fashion_mnist.npz'
+
+with np.load(path) as data:
+  train_images = data['train_images']
+  train_labels = data['train_labels']
+  test_images = data['test_images']
+  test_labels = data['test_labels']
+
+train_images = train_images[..., None]#增加一个轴,通道轴
+test_images = test_images[..., None]
+
+train_images = train_images / np.float32(255)
+test_images = test_images / np.float32(255)
+
+strategy = tf.distribute.MirroredStrategy()
+
+BUFFER_SIZE = len(train_images)
+BATCH_SIZE_PER_REPLICA = 64
+GLOBAL_BATCH_SIZE = BATCH_SIZE_PER_REPLICA * strategy.num_replicas_in_sync
+EPOCHS = 10
+
+train_dataset = tf.data.Dataset.from_tensor_slices((train_images, train_labels))\
+.shuffle(BUFFER_SIZE).batch(GLOBAL_BATCH_SIZE)
+test_dataset = tf.data.Dataset.from_tensor_slices((test_images, test_labels)).batch(GLOBAL_BATCH_SIZE)
+train_dist_dataset = strategy.experimental_distribute_dataset(train_dataset)
+test_dist_dataset = strategy.experimental_distribute_dataset(test_dataset)
+
+def create_model():
+  model = tf.keras.Sequential([
+      tf.keras.layers.Conv2D(32, 3, activation='relu'),#卷积层
+      tf.keras.layers.MaxPooling2D(),#最大池化层
+      tf.keras.layers.Conv2D(64, 3, activation='relu'),#池化层
+      tf.keras.layers.MaxPooling2D(),#最大池化层
+      tf.keras.layers.Flatten(),
+      tf.keras.layers.Dense(64, activation='relu'),
+      tf.keras.layers.Dense(10)
+    ])
+  return model
+
+checkpoint_dir = './checkpoints/zdyxl'
+if not os.path.exists(checkpoint_dir): os.makedirs(checkpoint_dir)
+checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
+
+# reduction 参数决定了损失函数如何对单个样本的损失进行聚合。tf.keras.losses.Reduction 是一个枚举类，
+# 其中包含了几个不同的选项。在你提供的代码中，reduction=tf.keras.losses.Reduction.NONE 表示损失函数不会进行任何聚合操作，
+# 而是返回每个样本的损失值。这通常用于更细粒度的损失计算或需要自定义聚合逻辑的情况。
+# 具体来说，Reduction.NONE 的效果是：对于输入的每一个样本，损失函数都会计算出一个独立的损失值，而不会将这
+# 些损失值进行求和、平均或其他任何形式的聚合。因此，当你使用这个设置调用损失函数时，你通常会得到一个形状与输入
+# 样本数量相同的张量，其中每个元素对应于一个样本的损失。
+
+with strategy.scope():
+  loss_object = tf.keras.losses.SparseCategoricalCrossentropy(
+      from_logits=True,
+      reduction=tf.keras.losses.Reduction.NONE)
+  def compute_loss(labels, predictions):
+    per_example_loss = loss_object(labels, predictions)#返回的是(batch_size,)因为指定了每个样本返回一个损失
+    #计算得到批次平均损失
+    return tf.nn.compute_average_loss(per_example_loss, global_batch_size=GLOBAL_BATCH_SIZE)
+
+with strategy.scope():
+  test_loss = tf.keras.metrics.Mean(name='test_loss')
+  train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(
+      name='train_acc')
+  test_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(
+      name='test_acc')
+
+with strategy.scope():
+  model = create_model()#模型
+  optimizer = tf.keras.optimizers.Adam()#优化器
+  checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)#检查点
+
+def train_step(inputs):#训练步
+  images, labels = inputs
+  with tf.GradientTape() as tape:
+    predictions = model(images, training=True)#获取模型预测logits
+    loss = compute_loss(labels, predictions)#根据labels和logits计算损失,得到平均损失
+  gradients = tape.gradient(loss, model.trainable_variables)#计算梯度
+  optimizer.apply_gradients(zip(gradients, model.trainable_variables))#更新参数
+  #更新训练集准确率指标
+  train_accuracy.update_state(labels, predictions)
+  return loss #返回当前批次平均损失
+def test_step(inputs):#测试步
+  images, labels = inputs#获取输入数据和对应的真实标签类别
+  predictions = model(images, training=False)#模型接受输入得到logits
+  t_loss = loss_object(labels, predictions)#这里和训练时不一样,直接用的loss_object
+  print('t_loss:',t_loss.shape)
+  test_loss.update_state(t_loss)# t_loss(batch_size,)
+  test_accuracy.update_state(labels, predictions)
+
+# 使用 strategy.run 方法在策略管理的所有设备上并行执行 train_step 函数。train_step 函数应该是一个定义了模型前向传播、
+# 损失计算和反向传播（即优化器更新）的函数。
+
+@tf.function
+def distributed_train_step(dataset_inputs):
+  per_replica_losses = strategy.run(train_step, args=(dataset_inputs,))
+  return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses,
+                         axis=None)
+@tf.function
+def distributed_test_step(dataset_inputs):
+  return strategy.run(test_step, args=(dataset_inputs,))
+
+for epoch in range(EPOCHS):
+  # TRAIN LOOP
+  total_loss = 0.0
+  num_batches = 0
+  for x in train_dist_dataset:
+    total_loss += distributed_train_step(x)#把每个批次的平均训练损失做累加
+    num_batches += 1
+  train_loss = total_loss / num_batches#得到的是当前轮次的训练平均损失
+
+  # TEST LOOP
+  for x in test_dist_dataset:
+    distributed_test_step(x)
+
+  if epoch % 2 == 0:
+    checkpoint.save(checkpoint_prefix)
+
+  template = ("Epoch {}, Loss: {}, Accuracy: {}, Test Loss: {}, "
+              "Test Accuracy: {}")
+  #这里打印的都是当前轮次的平均值
+  print(template.format(epoch + 1, train_loss,
+                         train_accuracy.result() * 100, test_loss.result(),
+                         test_accuracy.result() * 100))
+
+  test_loss.reset_state()
+  train_accuracy.reset_state()
+  test_accuracy.reset_state()
+
+eval_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(
+      name='eval_accuracy')
+new_model = create_model()
+new_optimizer = tf.keras.optimizers.Adam()
+test_dataset = tf.data.Dataset.from_tensor_slices((test_images, test_labels)).batch(GLOBAL_BATCH_SIZE)
+
+@tf.function
+def eval_step(images, labels):
+  predictions = new_model(images, training=False)
+  eval_accuracy(labels, predictions)
+
+os.listdir(checkpoint_dir)
+
+checkpoint = tf.train.Checkpoint(optimizer=new_optimizer, model=new_model)
+
+# 会加载ckpoint_dir目录中最新（也就是最晚生成）的检查点。
+# 一旦这个调用成功，nnew_optimizer 和 new_model 就会被
+# 更新为检查点中保存的权重和状态。因此，new_model
+# 将包含检查点中保存的权重，这些权重通常是在之前的训练步骤中得到的。
+checkpoint.restore(tf.train.latest_checkpoint(checkpoint_dir))
+
+for images, labels in test_dataset:
+  eval_step(images, labels)
+
+print('Accuracy after restoring the saved model without strategy: {}'.format(
+    eval_accuracy.result() * 100))
+
+
+for epoch in range(EPOCHS):
+  total_loss = 0.0
+  num_batches = 0
+# 如果要迭代给定的步数而不是遍历整个数据集，可以使用 iter 调用创建一个迭代器，并在该迭代器上显式地调用 next。您可以选择在 tf.function
+# 内部和外部迭代数据集。下面是一个小代码段，演示了使用迭代器在 tf.function 外部迭代数据集。
+  train_iter = iter(train_dist_dataset)
+  # 注意：这里只迭代了10次，而不是整个数据集。这通常用于调试或快速测试。在实际应用中，你可能会想要遍历整个数据集或更多次数。
+  for _ in range(10):
+    total_loss += distributed_train_step(next(train_iter))
+    num_batches += 1
+  average_train_loss = total_loss / num_batches
+  template = ("Epoch {}, Loss: {}, Accuracy: {}")
+  print(template.format(epoch + 1, average_train_loss, train_accuracy.result() * 100))
+  train_accuracy.reset_state()
+
+@tf.function
+def distributed_train_epoch(dataset):
+  total_loss = 0.0
+  num_batches = 0
+  for x in dataset:
+    per_replica_losses = strategy.run(train_step, args=(x,))
+    total_loss += strategy.reduce(
+      tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
+    num_batches += 1
+  return total_loss / tf.cast(num_batches, dtype=tf.float32)
+for epoch in range(EPOCHS):
+  train_loss = distributed_train_epoch(train_dist_dataset)
+  template = ("Epoch {}, Loss: {}, Accuracy: {}")
+  print(template.format(epoch + 1, train_loss, train_accuracy.result() * 100))
+  train_accuracy.reset_state()
+
+for images, labels in test_dataset:
+  eval_step(images, labels)
+print('Accuracy after restoring the saved model without strategy: {}'.format(
+    eval_accuracy.result() * 100))

@@ -1,0 +1,407 @@
+数据预处理才是最重要的，至于训练评估部署，是个人都会，别小看预处理
+
+train_data='./datasets/duuie'
+
+output_folder='./datasets/duuie_pre'
+ignore_datasets=["DUEE", "DUEE_FIN_LITE"]
+schema_folder='./datasets/seen_schema'
+
+import shutil
+import os
+
+# shutil.rmtree(output_folder) if os.path.exists(
+#         output_folder) else None
+# shutil.copytree(train_data,output_folder)
+
+life_folder = os.path.join(output_folder, "DUIE_LIFE_SPO") #人生
+org_folder = os.path.join(output_folder, "DUIE_ORG_SPO") # 组织
+
+print(life_folder,org_folder)
+
+import json
+
+def load_jsonlines_file(filename):
+    return [json.loads(line) for line in open(filename, encoding="utf8")]
+
+life_train_instances = load_jsonlines_file(f"{life_folder}/train.json")
+org_train_instances = load_jsonlines_file(f"{org_folder}/train.json")
+
+print(type(life_train_instances),len(life_train_instances),len(org_train_instances))
+
+for i in range(27695,27696):
+    print(life_train_instances[i],'|',org_train_instances[i])
+
+class RecordSchema: # 格式
+    def __init__(self, type_list, role_list, type_role_dict):
+        self.type_list = type_list # 类型
+        self.role_list = role_list # 论元角色
+        self.type_role_dict = type_role_dict #类型角色字典
+    def __repr__(self) -> str:
+        repr_list = [f"Type: {self.type_list}\n", f"Role: {self.role_list}\n", f"Map: {self.type_role_dict}"]
+        return "\n".join(repr_list)
+    @staticmethod
+    def get_empty_schema(): # 初始化
+        return RecordSchema(type_list=list(), role_list=list(), type_role_dict=dict())
+    @staticmethod
+    def read_from_file(filename):
+        lines = open(filename, encoding="utf8").readlines()
+        type_list = json.loads(lines[0])# 类型
+        role_list = json.loads(lines[1]) # 角色
+        type_role_dict = json.loads(lines[2])#类型－角色
+        return RecordSchema(type_list, role_list, type_role_dict)
+    def write_to_file(self, filename):
+        with open(filename, "w", encoding="utf8") as output:
+            # 用于将Python对象编码（序列化）为JSON格式的字符串。设置ensure_ascii=False参数
+            # 会告诉json.dumps()函数不要转义非ASCII字符，用dumps把json对象转换成json字符串
+            output.write(json.dumps(self.type_list, ensure_ascii=False) + "\n")
+            output.write(json.dumps(self.role_list, ensure_ascii=False) + "\n")
+            output.write(json.dumps(self.type_role_dict, ensure_ascii=False) + "\n")
+
+RecordSchema.read_from_file(f"{life_folder}/record.schema")
+
+life_relation = RecordSchema.read_from_file(f"{life_folder}/record.schema").role_list #人生关系
+
+org_relation = RecordSchema.read_from_file(f"{org_folder}/record.schema").role_list
+
+from collections import defaultdict
+instance_dict = defaultdict(list) # 543个重复的,会被替换
+
+for instance in life_train_instances + org_train_instances:
+    instance_dict[instance["text"]] += [instance]
+
+a=[i for i in life_train_instances for j in org_train_instances if i['text']==j['text']]
+b=[i for i in org_train_instances for j in a if i['text']==j['text']]
+for i in range(3):
+    print(a[i]['relation'],'|',b[i]['relation'])
+
+dict_1={1:2,3:4}
+for i in dict_1:#相当于字典的keys()
+    print(i)
+
+from typing import Tuple, List, Dict
+
+def merge_instance(instance_list):
+    def all_equal(_x):#判断是否全相同
+        for __x in _x:
+            if __x != _x[0]:
+                return False
+        return True
+    def entity_key(_x): # 实体键
+        return (tuple(_x["offset"]), _x["type"])
+    def relation_key(_x): #关系键
+        return (
+            tuple(_x["type"]),
+            tuple(_x["args"][0]["offset"]),
+            _x["args"][0]["type"],
+            tuple(_x["args"][1]["offset"]),
+            _x["args"][1]["type"],
+        )
+
+    def event_key(_x): # 事件键
+        return (tuple(_x["offset"]), _x["type"])
+    assert all_equal([x["text"] for x in instance_list]) #只有实体文本text都相同才合并
+    element_dict = {
+        "entity": dict(),
+        "relation": dict(),
+        "event": dict(),
+    }
+    instance_id_list = list()
+    for x in instance_list:
+        instance_id_list += [x["id"]] #同样的文本，实体id的集合
+        for entity in x.get("entity", list()):
+            element_dict["entity"][entity_key(entity)] = entity #建立键到实体的映射
+        for relation in x.get("relation", list()):
+            element_dict["relation"][relation_key(relation)] = relation
+        for event in x.get("event", list()):
+            element_dict["event"][event_key(event)] = event
+
+    return {#合并后的实体是从原始数据集的不同id的样本组合起来的
+        "id": "-".join(instance_id_list),
+        "text": instance_list[0]["text"],
+        "tokens": instance_list[0]["tokens"],
+        "entity": list(element_dict["entity"].values()),
+        "relation": list(element_dict["relation"].values()),
+        "event": list(element_dict["event"].values()),
+    }
+
+
+for text in instance_dict:
+    instance_dict[text] = merge_instance(instance_dict[text])
+
+for i in range(800,802):
+    print(list(instance_dict.values())[i])
+
+import copy
+
+with open(f"{life_folder}/train.json", "w") as output: #写人生训练集到文件
+    for instance in instance_dict.values():
+        new_instance = copy.deepcopy(instance) # 深拷贝
+        # 过滤当前样本的["relation"]在life_relation列表内的
+        new_instance["relation"] = list(filter(lambda x: x["type"] in life_relation, instance["relation"]))
+        output.write(json.dumps(new_instance) + "\n")
+
+f"{org_folder}/train.json"
+
+with open(f"{org_folder}/train.json", "w") as output:
+    for instance in instance_dict.values():
+        new_instance = copy.deepcopy(instance)
+        #过滤当前样本的["relation"]在组织关系列表内的
+        new_instance["relation"] = list(filter(lambda x: x["type"] in org_relation, instance["relation"]))
+        output.write(json.dumps(new_instance) + "\n")
+
+a_instances = load_jsonlines_file(f"{life_folder}/train.json")
+b_instances = load_jsonlines_file(f"{org_folder}/train.json")
+print(len(a_instances),len(b_instances))
+
+import yaml
+def load_definition_schema_file(filename):#加载yaml文件
+    return yaml.load(open(filename, encoding="utf8"), Loader=yaml.FullLoader)
+
+aa = load_definition_schema_file(os.path.join(schema_folder,'体育竞赛.yaml'))
+
+aa['事件'].values()
+
+mm=[]
+for i in aa['事件'].values():
+    mm+=i["参数"] # 有重复
+print(mm)
+mm=list(set(mm)) #用set是为了去重复
+
+[x for x in aa['事件']]
+
+aa['事件']['退役']["参数"].keys()
+
+aaa={1:2,3:4}
+for k,v in aaa.items():
+    print(k,v)
+
+def dump_schema(output_folder, schema_dict):
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+    for schema_name, schema in schema_dict.items(): #写"entity"，"relation",...到文件entity.schema
+        schema_file = f"{output_folder}/{schema_name}.schema"
+        with open(schema_file, "w", encoding="utf8") as output:
+            for element in schema:
+                output.write(json.dumps(element, ensure_ascii=False) + "\n")
+
+def dump_event_schema(event_map, output_folder):
+    role_list = list()
+    for roles in event_map.values():
+        role_list += roles["参数"]
+    rols_list = list(set(role_list)) #论元角色列表
+    type_list = list(event_map.keys()) #事件类型
+    #事件类型到论元角色列表的映射
+    type_role_map = {event_type: list(event_map[event_type]["参数"].keys()) for event_type in event_map}
+    dump_schema(
+        output_folder=output_folder,
+        schema_dict={
+            "entity": [[], [], {}],
+            "relation": [[], [], {}],
+            "event": [type_list, rols_list, type_role_map],
+            "record": [type_list, rols_list, type_role_map],
+        },
+    )
+
+def filter_event_in_instance(instances,required_event_types):
+    # 过滤实例中的事件，只保留需要的事件类别的事件标注
+    new_instances = list()
+    for instance in instances:
+        new_instance = copy.deepcopy(instance)
+        # 重新设定样本["event"]，只保留当前需要的事件
+        new_instance["event"] = list(filter(lambda x: x["type"] in required_event_types, new_instance["event"]))
+        new_instances += [new_instance]
+    return new_instances
+
+def dump_instances(instances, output_filename): #写新的样本到目标文件夹
+    with open(output_filename, "w", encoding="utf8") as output:
+        for instance in instances:
+            output.write(json.dumps(instance, ensure_ascii=False) + "\n")
+
+def filter_event(data_folder, event_types, output_folder):
+    dump_event_schema(event_types, output_folder) #写schema文件到目标文件夹
+    for split in ["train", "val"]:
+        filename = os.path.join(data_folder, f"{split}.json")
+        instances = [json.loads(line.strip()) for line in open(filename, encoding="utf8")]
+        new_instances = filter_event_in_instance(instances, required_event_types=event_types)
+        dump_instances(new_instances, os.path.join(output_folder, f"{split}.json"))
+
+os.path.join(output_folder, "灾害意外")
+
+load_definition_schema_file(os.path.join(schema_folder, f"灾害意外.yaml"))
+
+# 对事件数据进行预处理，过滤除 `灾害意外` 和 `体育竞赛` 外的事件标注
+for schema in ["灾害意外", "体育竞赛"]:
+    print(f"Building {schema} dataset ...")
+    duee_folder = os.path.join(output_folder, "DUEE") #原始duee数据集
+    schema_file = os.path.join(schema_folder, f"{schema}.yaml")
+    output_folder2 = os.path.join(output_folder, schema)
+    schema = load_definition_schema_file(schema_file)
+    filter_event(
+        duee_folder,# 原数据集的路径
+        schema["事件"],#获取事件里面的具体事件组
+        output_folder2, #要生成数据集的路径
+    )
+
+ty_instances = load_jsonlines_file(f"{output_folder}/体育竞赛/train.json")
+zh_instances = load_jsonlines_file(f"{output_folder}/灾害意外/train.json")
+
+print(len(ty_instances),len(zh_instances))
+
+for i in range(11508,11510):
+    print(ty_instances[i],'|',zh_instances[i])
+
+bb=load_definition_schema_file(os.path.join(schema_folder, "金融信息.yaml"))
+
+for i in bb['事件'].keys():
+    print(i)
+
+mm=list()
+mm+=bb['事件']['中标']["参数"]   
+mm=list(set(mm))
+
+bb["事件"]['中标']["参数"] .keys()
+
+os.path.join(output_folder, "DUEE_FIN_LITE")
+
+for schema in ["金融信息"]:
+    print(f"Building {schema} dataset ...")
+    duee_fin_folder = os.path.join(output_folder, "DUEE_FIN_LITE") # 原金融数据集
+    schema_file = os.path.join(schema_folder, f"{schema}.yaml") # 金融信息schema
+    output_folder2 = os.path.join(output_folder, schema) #要构建的目标数据集存放路径
+    schema = load_definition_schema_file(schema_file) #加载schema
+    # 根据不同事件类型将多事件抽取分割成多个单事件类型抽取
+    # 把多事件分割成单事件提取
+    for event_type in schema["事件"]:
+        filter_event(
+           duee_fin_folder,
+           {event_type: schema["事件"][event_type]},# 具体的事件
+            output_folder2 + "_" + event_type, # 具体事件对应的输出文件夹
+        )
+
+vv=load_jsonlines_file(f"{output_folder}/DUEE_FIN_LITE/train.json")
+
+f"{output_folder}/DUEE_FIN_LITE/train.json"
+
+zb_instances = load_jsonlines_file(f"{output_folder}/金融信息_中标/train.json")
+zy_instances = load_jsonlines_file(f"{output_folder}/金融信息_质押/train.json")
+print(len(zb_instances),len(zy_instances))
+
+for i in range(6985,6986):
+    print(zb_instances[i],'|',zy_instances[i])
+
+def annonote_graph(
+    entities: List[Dict] = [],
+    relations: List[Dict] = [],
+    events: List[Dict] = []):
+    spot_dict = dict() # 信息点字典
+    asoc_dict = defaultdict(list)
+    # 将实体,关系,事件转换为点关联图
+    def add_spot(spot):
+        spot_key = (tuple(spot["offset"]), spot["type"])
+        spot_dict[spot_key] = spot
+    def add_asoc(spot, asoc, tail):
+        spot_key = (tuple(spot["offset"]), spot["type"])
+        asoc_dict[spot_key] += [(tuple(tail["offset"]), tail["text"], asoc)]
+    for entity in entities: # 为实体添加键值映射，其实就是为实体添加了索引
+        add_spot(spot=entity)
+    for relation in relations: # 关系
+        add_spot(spot=relation["args"][0])
+        # 建立relation["args"][0]的索引到组合关系的映射
+        add_asoc(spot=relation["args"][0], asoc=relation["type"], tail=relation["args"][1])
+    for event in events: #整个就是建立一个索引到一堆东西的映射，以便访问
+        add_spot(spot=event)
+        for argument in event["args"]:
+            add_asoc(spot=event, asoc=argument["type"], tail=argument)
+    spot_asoc_instance = list()
+    for spot_key in sorted(spot_dict.keys()): # 遍历索引
+        offset, label = spot_key
+        if len(spot_dict[spot_key]["offset"]) == 0: #这个对应具体的位置，如果没有，就过滤掉
+            continue
+        spot_instance = {
+            "span": spot_dict[spot_key]["text"],
+            "label": label,
+            "asoc": list(),
+        }
+        for tail_offset, tail_text, asoc in sorted(asoc_dict.get(spot_key, [])):
+            if len(tail_offset) == 0:
+                continue
+            spot_instance["asoc"] += [(asoc, tail_text)]
+        spot_asoc_instance += [spot_instance]
+    spot_labels = set([label for _, label in spot_dict.keys()])
+    asoc_labels = set()
+    for _, asoc_list in asoc_dict.items():
+        for _, _, asoc in asoc_list:
+            asoc_labels.add(asoc)
+    return spot_labels, asoc_labels, spot_asoc_instance
+
+def add_spot_asoc_to_single_file(filename):
+    instances = [json.loads(line) for line in open(filename, encoding="utf8")]
+    print(f"Add spot asoc to {filename} ...")
+    with open(filename, "w", encoding="utf8") as output:
+        for instance in instances:
+            spots, asocs, spot_asoc_instance = annonote_graph(
+                entities=instance["entity"],# 实体
+                relations=instance["relation"],# 关系
+                events=instance["event"],# 事件
+            )
+            # 为对象添加spot_asoc
+            instance["spot_asoc"] = spot_asoc_instance
+            # 为对象添加spot
+            instance["spot"] = list(spots)
+            # 为对象添加asoc
+            instance["asoc"] = list(asocs)
+            output.write(json.dumps(instance, ensure_ascii=False) + "\n")
+
+ff = os.path.join(output_folder,'金融信息_企业破产',"train.json")
+ff_instances = [json.loads(line) for line in open(ff, encoding="utf8")]
+
+for i in range(1046,1048):
+    print(ff_instances[i])
+
+a,b,yyj=annonote_graph(entities=ff_instances[5000]["entity"],
+                relations=ff_instances[5000]["relation"],
+                events=ff_instances[5000]["event"],)
+
+data_folder=output_folder
+
+def merge_schema(schema_list: List[RecordSchema]):
+    type_set = set()
+    role_set = set()
+    type_role_dict = defaultdict(list) #字典，字典的值是列表类型
+    for schema in schema_list:
+        for type_name in schema.type_list:
+            type_set.add(type_name)
+        for role_name in schema.role_list:
+            role_set.add(role_name)
+        for type_name in schema.type_role_dict:
+            # type_name为索引
+            type_role_dict[type_name] += schema.type_role_dict[type_name]
+    for type_name in type_role_dict:
+        type_role_dict[type_name] = list(set(type_role_dict[type_name])) # 去重复
+    return RecordSchema(
+        type_list=list(type_set),
+        role_list=list(role_set),
+        type_role_dict=type_role_dict,
+    )
+
+def convert_duuie_to_spotasoc(data_folder, ignore_datasets):
+    #
+    schema_list = list() # 用来保存所有任务的schema
+    for task_folder in os.listdir(data_folder):#遍历下面的子文件夹
+        if task_folder in ignore_datasets: #过滤掉不处理的，这两个是原始数据
+            continue
+        if not os.path.isdir(os.path.join(data_folder, task_folder)):# 过滤掉非文件夹，就是文件
+            continue
+        print(f"Add spot asoc to {task_folder} ...")#为其他的添加spot asoc
+        # 读取单任务的 Schema
+        task_schema_file = os.path.join(data_folder, task_folder, "record.schema")
+        # 向单任务数据中添加 Spot Asoc 标注
+        add_spot_asoc_to_single_file(os.path.join(data_folder, task_folder, "train.json"))
+        add_spot_asoc_to_single_file(os.path.join(data_folder, task_folder, "val.json"))
+        record_schema = RecordSchema.read_from_file(task_schema_file) #读取单任务schema
+        schema_list += [record_schema]
+    # 融合不同任务的 Schema
+    multi_schema = merge_schema(schema_list)
+    multi_schema.write_to_file(os.path.join(data_folder, "record.schema"))
+
+convert_duuie_to_spotasoc(output_folder,ignore_datasets)

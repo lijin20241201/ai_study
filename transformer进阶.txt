@@ -1,0 +1,602 @@
+import torch# pytorch
+import torch.nn as nn# 模型工具包
+import torch.nn.functional as F# 函数运算工具包
+from torch.autograd import Variable# 变量处理包
+import math
+import matplotlib.pyplot as pyp
+import numpy as np
+import copy
+
+#原数据目标数据词嵌入,做的事情是带上了词汇的向量信息,原先词汇只有索引信息
+class Embedding(nn.Module):
+    def __init__(self,d_model,max_words):# 词向量维度,多少个单词或词语要做词向量
+        super(Embedding,self).__init__()#调用父类初始化方法
+        self.embed_=nn.Embedding(max_words,d_model)#构建embedding对象
+        self.d_model=d_model
+    def forward(self,x):#正向传播,(batch_size,seq_len),单词别写错
+        #batch_size是每次放入的样本数,seq_len是文本序列的长度
+        # print('x形状:{},缩放系数:{}'.format(x.shape,math.sqrt(self.d_model)))
+        # 输入(batch_size,seq_len),输出(batch_size,seq_len,d_model)
+        return self.embed_(x)*math.sqrt(self.d_model)
+
+# 位置编码层,做的事情是带上了词汇在序列中的位置信息 
+# 如果词嵌入维度一致,那位置编码是一样的,这里假设不同语句序列,但序列长度一样
+class PositionEncoding(nn.Module):#位置编码
+    # d_model,词嵌入维度,seq_len:序列的长度
+    def __init__(self,d_model,dropout,seq_len=1000):#假设词向量100维,序列长度1000
+        super(PositionEncoding,self).__init__()
+        self.dropout=nn.Dropout(dropout)#定义dropout层,dropout,置0的比率
+        # 定义的文本(序列)到向量的映射,是序列的向量表示
+        seq_cxl_=torch.zeros(seq_len,d_model)# 初始化容器(1000,100)
+        seq_inx=torch.arange(seq_len).unsqueeze(1)# 序列的索引化表示(1000,1)
+        #seq_cxl_是词汇在电脑里的词向量编码,seq_inx是词汇对应的索引
+        # unsqueeze(1)指在1轴增加维度,相当于变了下形,从(1000)变成了(1000,1)
+        #temp_wz,torch.arange(0,d_model,2)是形如2,4,6...形状(50)
+        # 是一维张量,后边乘了一个缩放因子,里面元素的数值越来越小
+        temp_wz=torch.exp(torch.arange(0,d_model,2)\
+                          *-(math.log(10000.0)/d_model))
+        # 第一个:指锁定所有行,第二个::2指锁定偶数列,因为步长是2
+        # seq_inx*temp_fz,(1000,1)*(50),做的是广播机制运算,运算后形状为(1000,50)
+        # 之后偶数列向量正弦处理,奇数列余弦处理,这里面保存的是词汇的位置信息 
+        # 同一个词汇在序列中的不同位置,它对应的位置向量都会不同
+        seq_cxl_[:,::2]=torch.sin(seq_inx*temp_wz)
+        seq_cxl_[:,1::2]=torch.cos(seq_inx*temp_wz)
+        seq_cxl_=seq_cxl_.unsqueeze(0)# 在0轴增加维度,变成了三维张量
+        # 将词向量矩阵注册成模型的buffer,不随优化器同步更新参数,注册后,在模型保存后,和模型一起加载
+        self.register_buffer('seq_cxl_',seq_cxl_)
+    def forward(self,x):# x形状(batch_size,max_len,d_model)
+        # print('seq_cxl_:',self.seq_cxl_.shape)#seq_cxl_(1,seq_len,d_model)
+        # 这个截取,是把seq_len变成了和max_len一样,适应输入形状
+        # 这里做了一个广播机制,因为seq_cxl_[:,:x.size(1)]的形状其实是(1,max_len,d_model)
+        # 这样x中不但有原始序列中词汇的信息(包括某个词汇的索引,某个词汇的词向量信息)
+        #还另外加了一个这个词汇的位置信息
+        x=x+Variable(self.seq_cxl_[:,:x.size(1)],requires_grad=False)
+        return self.dropout(x)
+import matplotlib.pyplot as plt
+# key,query,value代表注意力的三个输入张量,mask:掩码,dropout:随机置0比率
+def attention(query,key,value,mask=None,dropout=None):# 比如key=query=value形状(2,4,64)
+    d_k=query.size(-1)# d_k=64
+    # 对query和key的转置做矩阵乘法,key最后两个轴做转置,除以一个缩放因子
+    # (2,4,64)@(2,64,4)==(2,4,4),除了一个64的开方,相当于把数据变小处理
+    # 结果矩阵是(2,4,4),序列长度是4,结果矩阵中的第一行保存的是序列中的第一个词汇和整个
+    #序列的每一个词汇做内积之后的信息,第二行保存的是第二个词汇与序列中的每一个词汇内积之后得信息
+    #只有是当前词汇和当前词汇内积之后最大,所以每一行最大值的位置就是这个词汇在整个序列的位置
+    #内积就是相关性,自己和自己内积值最大,其他都比这个小
+    #其他依次类推,(2,8,4,64)@(2,8,64,4)=(2,8,4,4)
+    scores=torch.matmul(query,key.transpose(-2,-1))/math.sqrt(d_k)
+    # print('scores形状:',scores.shape)
+    if mask is not None:# 如果有掩码
+        #将scores中mask值为0的部分替换成-1e9,mask最后两维的形状和scores一致
+        #-1e9是一个很大的负数,这样在经过softmax求概率时,被遮掩的地方,概率趋近于0
+        #掩码中0是要遮掩的,就是False,1是能看到的
+        # print('mask:',mask.shape)
+        scores=scores.masked_fill(mask==0,-1e9)
+    # print('scores',scores[0,:,:10])
+    #对scores的最后一个维度做softmax操作,求概率,scores形状(2,4,4),在其上最后一维做softmax
+    # 操作,返回形状也应该是(2,4,4),返回的是概率
+    p_attn=nn.functional.softmax(scores,dim=-1)#(2,4,4)
+    # print('p_attn:',p_attn.shape,p_attn[0,:8,:8])
+    if dropout is not None:# 有dropout层就添加,dropout,随机把p_attn中的一些值置0
+        p_attn=dropout(p_attn)
+    # 最后完成p_attn和value的乘法,和p_attn一起返回,p_attn是概率
+    # print('torch.matmul(p_attn,value)',torch.matmul(p_attn,value))
+    # 返回的attn中的行代表序列的每一个词汇,列代表第i个词汇的向量信息
+    #因为p_attn这个保留了词汇的位置信息,所以,a_ttn中的向量信息里已经带了这个位置信息
+    # 除非掩码里元素全是0,这样的话,p_attn里会全是0.25,因为掩码把scores中元素都换成-1e9了
+    # 所以真实的注意力里,掩码肯定不是全0,可以是下三角,这样scores中单个词汇只会保留这个词汇和它之前的信息
+    #它后边的信息概率
+    return torch.matmul(p_attn,value),p_attn#(2,4,4)@(2,4,64)=(2,4,64),p_attn:(2,4,4)
+# 实现多头注意力机制的类
+class MultiHeadAttent(nn.Module):
+    # 把单个词汇向量分成几组,词维度,dropout层,进行dropout时,置0的比例
+    def __init__(self,head,cxl_dim,dropout=0.1):
+        super(MultiHeadAttent,self).__init__()# 断言词维度能被head整除
+        assert cxl_dim % head==0
+        self.d_k=cxl_dim//head# 每个头获得的深度(词向量维度//8)# 64
+        # print('self.d_k:',self.d_k)
+        self.head=head# 8
+        self.cxl_dim=cxl_dim# 512
+        # 获得线性层,一共四个,Q,K,V,和输出线性层
+        # 拷贝线性层,拷贝4个
+        self.linears=nn.ModuleList(
+            [copy.deepcopy(nn.Linear(cxl_dim,cxl_dim)) for _ in range(4)])
+        self.attn=None# 初始化注意力张量
+        self.dropout=nn.Dropout(dropout)# 初始化dropout
+        # Q,K,v是注意力机制的三个输入张量,mask掩码张量
+    def forward(self,query,key,value,mask=None):# (2,4,512)--样本数,序列长度,词维度
+        # 过滤条件:mask不是None,会被设置掩码,mask(8,4,4)
+        if mask is not None:#这样掩码是4维,(8,1,4,4)
+            mask=mask.unsqueeze(1)# 将掩码在索引1的轴进行扩充,掩码做的是掩盖序列,与样本数无关
+            # 所以取1就行
+        # print('mask:',mask.shape)
+        batch_size=query.size(0)# 得到样本数
+        # 把Q,K,V和他们各自要被输入的层,像拉链一样绑定在一起        
+        zip_group=zip(self.linears,(query,key,value))
+        # 首先变形成(batch_size,seq_len,head,d_k)这样的形状(2,4,8, 64)
+        query,key,value=[model(x).view(batch_size,-1,self.head,self.d_k) \
+                         .transpose(1,2)# 之后让序列和代表几个头的轴交换,
+                         #因为在attention里做的是后两个轴交换
+                         for model,x in zip_group]
+        #(2, 8, 4, 64)
+        # print('query,key,value,mask:',query.shape,key.shape,value.shape,mask.shape)
+        # 把query,key,value传入注意力方法,p_attn和value的乘法,和p_attn一起返回,p_attn是概率
+        # 传入时形状是 (2, 8, 4, 64),之后q与k转置相乘,(2,8,4,64)@(2,8,64,4)=(2,8,4,4)
+        #输出时(2,8,4,4)@(2,8,4,64)=(2,8,4,64)
+        # 要明白传入的key,query,value形状是(2, 8, 4, 64),后面两个轴是(序列长度,分成组的词向量维度)
+        x,self.attn=attention(query,key,value,mask=mask,dropout=self.dropout)
+        # print('x attention之后得形状',x.shape,self.attn.shape)#2, 8, 4, 64
+        # 得到每个头的结果是4维的张量,前面已经进行过1,2两个维度的转置,现在要转置回来
+        # 经过transpose方法后,必须使用contiguous方法,不然无法使用view方法   
+        # (2,4,8,64)--view(2,4,512),做了一个连接变形操作
+        x=x.transpose(1,2).contiguous().view(batch_size,-1,self.head*self.d_k)
+        # print('x concanate后的形状:',x.shape,self.attn.shape)
+        #最后将x输入线性层列表的最后一个线性层进行处理,得到最终的输出
+        return self.linears[-1](x)# linear传入和传出都是512
+# 前馈全连接层
+class Qk_qlj_Layers(nn.Module):
+    # cxl_dim词嵌入维度,qlj_dim全连接层之间传递的维度
+    def __init__(self,cxl_dim,qlj_dim,dropout=0.1):
+        super(Qk_qlj_Layers,self).__init__()
+        self.cxl_dim=cxl_dim
+        self.qlj_dim=qlj_dim
+        self.w1=nn.Linear(cxl_dim,qlj_dim)
+        self.w2=nn.Linear(qlj_dim,cxl_dim)
+        self.dropout=nn.Dropout(dropout)
+        # print(cxl_dim,qlj_dim,dropout)
+    def forward(self,x):
+        # x代表上一层的输出,这里用的是经过多头机制处理后的输出,
+        # 之后经过全连接1层,之后relu激活处理
+        # 之后dropout随机置0处理,最后交由全连接二层处理输出
+        # 输出形状(2,4,512),没有变化
+        return self.w2(self.dropout(F.relu(self.w1(x))))
+# 构造规范化层的类,做标准化处理的层
+class Layer_Normer(nn.Module):
+    # cxl_dim,词嵌入维度,eps:用在规范化计算的分母中,防止除0操作
+    def __init__(self,cxl_dim,eps=1e-6):
+        super(Layer_Normer,self).__init__()
+        self.cxl_dim=cxl_dim
+        self.eps=eps
+        # 初始化两个张量,用来对结果做规范化操作
+        self.a1=nn.Parameter(torch.ones(cxl_dim))
+        self.a2=nn.Parameter(torch.zeros(cxl_dim))
+    def forward(self,x):# (2,4,512)
+        # x:代表上一层网络的输出,首先对x进行最后一个维度上的求均值
+        # 操作,同时保持输入维度和输出维度一致
+        mean=x.mean(-1,keepdim=True)
+        # 接着对x进行最后一个维度上的求标准差的操作,保持输入维度和输出维度一致
+        std=x.std(-1,keepdim=True)
+        # print('正在进行标准化处理........')
+        # 按照规范化公式计算并返回
+        return self.a1*(x-mean)/(std+self.eps)+self.a2
+# 构建子层连接结构的类
+class SubLayerConnection(nn.Module):
+    def __init__(self,cxl_dim,dropout):
+        super(SubLayerConnection,self).__init__()
+        # 实例化一个规范化层的类
+        self.norm=Layer_Normer(cxl_dim)
+        self.dropout=nn.Dropout(dropout)
+        self.cxl_dim=cxl_dim
+    def forward(self,x,sublayer):
+        # x:代表上一层传入的张量
+        # sublayer,该子层连接中的子层函数
+        # 首先将x标准化处理,之后送入子层函数处理,之后经过dropout处理
+        # 最后进行残差连接
+        return x+self.dropout(sublayer(self.norm(x)))
+def copy_(layer, N):
+    return nn.ModuleList([copy.deepcopy(layer) for _ in range(N)])
+ # 构建编码层的类
+class EncoderLayer(nn.Module):
+    # 词嵌入维度,多头自注意力对象,前馈全连接层对象,进行dropout时的置零比例
+    def __init__(self,cxl_dim,selt_attn,qk_qlj,dropout):
+        super(EncoderLayer,self).__init__()
+        # 将这些参数赋值给对象,以便以后调用
+        self.cxl_dim=cxl_dim
+        self.selt_attn=selt_attn
+        self.qk_qlj=qk_qlj
+        #编码器层有两个子层连接结构,用copy_方法
+        self.sublayer_con=copy_(SubLayerConnection(cxl_dim,dropout),2)
+        # print('初始化EncoderLayer.....,有{}个子层连接层'.format(len(self.sublayer_con)))
+    def forward(self,x,mask):
+        # x代表上一层的传人张量,mask代表掩码张量
+        # 首先让x经过第一个子层连接结构,内部包含多头自注意力机制
+        # 再让张量经过第二个子层连接结构,其中包括前馈全连接网络
+        # 调用子连接层需要传入两个参数,x,和子层函数
+        x=self.sublayer_con[0](x,lambda x:self.selt_attn(x,x,x,mask))
+        return self.sublayer_con[1](x,self.qk_qlj)
+# 构建编码器类,经过n个编码器层类和标准化后的输出
+class Encoder(nn.Module):
+    # layer表示编码器层类对象,N表示要几个编码器层
+    def __init__(self,layer,N):
+        super(Encoder,self).__init__()
+        # 首先使用copy函数复制N个编码器层放在self.layers中
+        self.layers=copy_(layer,N)
+        # print(layer.cxl_dim)
+        # 初始化一个标准化层
+        self.norm_layer=Layer_Normer(layer.cxl_dim)
+    def forward(self,x,mask):
+        # x:代表经过位置编码后的输出张量,mask代表掩码张量
+        # 让x依次经过N个编码器层处理,x是一致在被更改的,因为是同一个内存
+        #第一次进入编码器层的x是位置编码后的,但经过第一个编码器层之后
+        #x变成了这个编码器层的输出,这个编码器层内部有两个子层连接,
+        #分别经过多头自注意力机制处理,和前馈全连接层处理,之后依次类推,
+        #每个x都会经过这样的编码器层,最后的x是经过N个编码器层的张量,
+        #虽然形状没变,但内容大大改变
+        for layer in self.layers:
+            x=layer(x,mask)
+        #最后做个标准化后输出
+        return self.norm_layer(x)#别写到循环里面
+#构建解码器层类
+class Decoderlayer(nn.Module):
+    # 参数:词嵌入维度,多头自注意力机制实例对象,普通的注意力机制对象,前馈全连接层对象,
+    # dropout:随机置0的比率,普通注意力对象和自注意力的区别是q和k,v不相同,自注意力的三者全相同
+    def __init__(self,cxl_dim,self_attn,src_attn,qk_qlj,dropout):
+        super(Decoderlayer,self).__init__()
+        # 初始化类对象
+        self.cxl_dim=cxl_dim
+        self.self_attn=self_attn
+        self.src_attn=src_attn
+        self.qk_qlj=qk_qlj
+        # 按照解码器层的结构,复制3个子层连接对象
+        self.sublayer=copy_(SubLayerConnection(cxl_dim,dropout),3)
+        # print('初始化DecoderLayer.....,有{}个子层连接层'.format(len(self.sublayer)))
+        # x:代表上一层输入的张量,memory:代表编码器的语义存储张量
+        # source_mask:原数据的掩码张量,target_mask:目标数据的掩码张量
+        # 要明确的一点是,原数据用掩码和目标数据用掩码不一样,目标用掩码是防止
+        # 当前词汇和之后得信息泄露,电脑看到的只有前面的词汇,而原数据掩码,是防止
+    #电脑过度关注一些不太有用的信息,比如填充的pad
+    def forward(self,x,memory,source_mask,target_mask):
+        # 第一步让x经过第一个子层,多头自注意力的子层,采用target_mask,遮掩当前词和当前词后边的
+        x=self.sublayer[0](x,lambda x : self.self_attn(x,x,x,target_mask))
+        # 第二步,让x经历常规注意力的子层,Q!=K,K==V
+        # 采用source_mask,为了遮掩掉对结果信息无用的数据,memory:编码器的输出
+        x=self.sublayer[1](x,lambda x : self.src_attn(x,memory,memory,source_mask))
+        # 第三步,让x经历第三个子层,前馈全连接层,并返回数据
+        return self.sublayer[2](x,self.qk_qlj)
+ 构建解码器类
+class Decoder(nn.Module):
+    def __init__(self,decoder_layer,N):
+        # layer:代表解码器层对象,N:指要拷贝多少个
+        super(Decoder,self).__init__()
+        self.layers=copy_(decoder_layer,N)
+        # print('进入Decoder类,Decoder有{}个解码器层:'.format(len(self.layers)))
+        # 初始化一个标准化层
+        self.norm_layer=Layer_Normer(decoder_layer.cxl_dim)
+    def forward(self,x,memory,source_mask,target_mask):
+        #x,代表目标数据经过位置编码后的张量,memory,表示编码器的输出张量
+        #一个编码器是由N个编码器层组成,最后还要标准化输出
+        # source_mask:原数据的掩码张量,target_mask:目标数据的掩码张量
+        #要让x经过所有的解码器层处理,最后标准化输出,但是x其实是一直在变的,
+        #每次迭代都会变成下一个编码器层之后得输出,最后的x经过了N个编码器层
+        for layer in self.layers:
+            #调用编码器层对象的forward方法
+            x=layer(x,memory,source_mask,target_mask)
+        #标准化后输出
+        return self.norm_layer(x)
+# 构建Generator类
+class Generator_(nn.Module):
+    # 词嵌入的维度,要词嵌入的词汇大小
+    def __init__(self,d_dim,max_words):
+        super(Generator_,self).__init__()
+        # 定义一个线性层,完成网络输出维度的变换
+        self.linear1=nn.Linear(d_dim,max_words)
+    def forward(self,x):# NotImplementedError,写错方法名会报这个错
+        #x,是编码解码后的输出张量,先将x送入线性层转换维度,之后经由
+        # log_softmax求概率
+        return F.log_softmax(self.linear1(x),dim=-1)
+# 构建编码解码器类
+class Encoder_Decoder(nn.Module):
+    def __init__(self,encoder,decoder,source_embed,target_embed,generator):
+        # encoder,指编码器对象,decoder:指解码器对象,source_embed:原数据的嵌入函数
+        # target_embed:指目标数据的嵌入函数,generator:指输出部分类别生成器对象
+        super(Encoder_Decoder,self).__init__()
+        # 初始化类对象
+        self.encoder=encoder
+        self.decoder=decoder
+        self.src_embed=source_embed
+        self.tgt_embed=target_embed
+        self.generator=generator
+    def forward(self,source,target,source_mask,target_mask):
+        # source:原数据,target:目标数据,source_mask:原数据掩码,target_mask:目标数据掩码
+        # self.encode(source,source_mask)--编码后就是memory
+        return self.decode(self.encode(source,source_mask),\
+                           source_mask,target,target_mask)
+    def encode(self,source,source_mask):
+        #调用真实的编码器对象的forward方法
+        return self.encoder(self.src_embed(source),source_mask)
+        #x,memory,source_mask,target_mask
+    def decode(self,memory,source_mask,target,target_mask):
+        # memory:经过编码器编码后的输出,保存着编码后的信息
+        return self.decoder(self.tgt_embed(target),\
+                            memory,source_mask,target_mask)
+def make_model(source_vocab,target_vocab,N=6,d_dim=512,d_ff=2048,head=8,dropout=0.1):
+    # source_vocab:原数据的词汇总数(这个取决于你选多少词汇),target_vocab:目标数据的词汇总数
+    # N:代表编码器或解码器堆叠的层数,d_dim:代表词嵌入的维度,d_ff:前馈全连接层中变化矩阵的维度
+    # head:多头注意力机制中的头数(把词向量分成几份),dropout:随机置0的比率
+    c=copy.deepcopy
+    attn=MultiHeadAttent(head,d_dim)# 实例化一个多头注意力类实例
+    ff=Qk_qlj_Layers(d_dim,d_ff,dropout)# 实例化一个前馈全连接层的实例
+    position=PositionEncoding(d_dim,dropout)# 实例化一个位置编码器
+    #实例化模型,利用的是Encoder_Decoder类
+    # 编码器层的结构里有两个子层连接层,attention层和前馈全连接层
+    # 解码器层的结构里有三个子层连接,两个attention层和一个前馈全连接
+    model=Encoder_Decoder(
+        # c可以深拷贝,对象在内存占用不同的内存空间
+        Encoder(EncoderLayer(d_dim,c(attn),c(ff),dropout),N),
+        Decoder(Decoderlayer(d_dim,c(attn),c(attn),c(ff),dropout),N),
+        # sequential,有顺序,序列化的意思,nn封装的类
+        nn.Sequential(Embedding(d_dim,source_vocab),c(position)),
+        nn.Sequential(Embedding(d_dim,target_vocab),c(position)),
+        Generator_(d_dim,target_vocab)
+    )
+    # 初始化模型中的参数,如果维度大于1,初始化成一个服从均匀分布的矩阵
+    for p in model.parameters():
+        if p.dim()>1:
+            nn.init.xavier_uniform_(p)
+    return model
+source_vocab=11
+target_vocab=11
+N=6
+res=make_model(source_vocab,target_vocab,N)
+print(res)
+def subsequent_mask(size):# 构建掩码张量
+    attn_shape=(1,size,size)#size指的是序列长度
+    subseq_mask=np.triu(np.ones(attn_shape),k=1).astype('uint8')
+    # print(subseq_mask),返回的是个布尔张量,下三角矩阵
+    return torch.from_numpy(subseq_mask)==0
+# 批处理类,这个类被调用后,原数据,目标数据,原数据掩码,目标数据掩码都被确定了
+# 原数据就是传进来的数据,第一列被置为1,目标数据是不要最后一列,难道是从尾部读的
+#目标数据第一列也是1,原数据掩码是原数据中不是空白的是1,是空白的就是0,形状(batch_size,1,seq_len)
+# 也就是只遮掩了空白,目标数据遮掩了空白和当前词汇之后得词汇,还统计了第一列之后不是空白的数据的总数
+# 目标掩码
+class Batch:
+    def __init__(self, src, trg=None, pad=0):
+        self.src = src# 二维张量(batch_size,seq_len)
+        # 在倒数第二个维度增加一维,假设原先形状(30,5)的话,现在形状就是(30,1,5)
+        # src_mark是布尔型的,这样生成一个原数据掩码,原数据中为0的数据,掩码中也为0
+        #原数据不为0的数据,掩码中为1
+        self.src_mask = (src != pad).unsqueeze(-2)
+        if trg is not None:# trg,目标数据也是个二维张量
+            self.trg = trg[:, :-1]# trg=不要最后一列
+            self.trg_y = trg[:, 1:]#不要第一列,就是赋值为1的那列不要
+            self.trg_mask = \
+                self.make_std_mask(self.trg, pad)
+            # 统计目标数据第一列之后不是填充符的总数,就是是真正的词汇,不是
+            # 不够长度填充的默认pad
+            self.ntokens = (self.trg_y != pad).data.sum()
+    
+    @staticmethod
+    def make_std_mask(tgt, pad):
+        # 构建目标掩码,遮掩pad和该词汇后边的词汇
+        # 现在tgt_mask是没有原数据的最后一列,原数据中其他的数据不等于0的话,在掩码
+        # 里会被设置成True,就是1,为0的会被设置成False.就是0,现在形状变为(30,1,4)
+        tgt_mask = (tgt != pad).unsqueeze(-2)
+        # 这里进行了与运算,这样的话tgt_mask里空白和当前词汇后面的词汇都会是False
+        # 与运算遵循:对应元素都True才Ture,有一个False就是False,False是要被遮住的
+        tgt_mask = tgt_mask & Variable(
+            subsequent_mask(tgt.size(-1)).type_as(tgt_mask.data))
+        # print('tgt_mask:',tgt_mask.shape)
+        return tgt_mask
+def data_gen(V, batch, nbatches):# V词汇数,batch:每个批次放入的样本数,nbatches:批次
+    for i in range(nbatches):
+        # 生成1-V范围的乱数,模拟的,肯定有重复的,不过真正的序列也可以有重复的,形状(batch,10)
+        # 比如batch=128的话,大白话就是生成128个句子(序列),每个句子10个词汇(这里得词汇是广义的)
+        data = torch.from_numpy(np.random.randint(1, V, size=(batch,5)))
+        #将每个样本的第一个词汇赋值为1
+        data[:, 0] = 1
+        # 原数据和目标数据,都是二维张量,原数据代表要翻译的序列,目标数据代表要翻译成什么序列
+        src = Variable(data, requires_grad=False)
+        tgt = Variable(data, requires_grad=False)
+        # yield是一个批次一个批次的返回数据,返回的是Batch对象,里面有原数据,目标数据
+        # 原掩码和目标掩码,原掩码只遮掩pad,目标掩码遮掩pad还有当前词汇后边的词汇
+        yield Batch(src, tgt, 0)
+# 标签平滑
+# 在分类任务中，我们通常使用one-hot编码来表示标签，即目标类别的概率为1，
+# 非目标类别的概率为0。然而，这种“非黑即白”的编码方式可能导致模型过于自信地预测某个类别，
+# 从而忽略了其他可能的类别，进而引发过拟合问题。
+# 尤其是在处理样本相似度较高或数据噪声较大的数据集时，模型容易受到影响。
+# 标签平滑通过修改真实概率的构造来解决上述问题。具体来说，它在one-hot编码的基础上，
+# 添加了一个平滑系数ε，使得目标类别的概率不再是1，而是1-ε，而非目标类别的概率则不再是0，
+# 而是均匀地分配ε/K，其中K是标签的总数量。这样做可以减少实际样本标签的类别在计算损失函数时的权重，
+# 使得模型在预测时不会过于自信地选择某个类别，而是会考虑其他可能的类别
+class LabelSmoothing(nn.Module):
+    # size:seq_len,paddin_inx:不够长度的序列的填充0,smoothing:平滑系数
+    def __init__(self, size, padding_idx, smoothing=0.0):
+        super(LabelSmoothing, self).__init__()
+        self.size=size#
+        # 计算两个概率分布之间的 Kullback-Leibler 散度 (KLD),
+        # reduction='sum'，则损失会被直接加和
+        self.criterion = nn.KLDivLoss(reduction='sum')
+        self.padding_idx = padding_idx# 0
+        self.confidence = 1.0 - smoothing# 0.6
+        self.smoothing = smoothing# 0.4
+        self.true_dist = None# 初始化
+        
+    def forward(self, x, target):
+        #输入x是以e为底的概率的对数值,target,就是目标数据,断言长度一致
+        assert x.size(1) == self.size
+        true_dist = x.data.clone()# 深拷贝一份
+        true_dist.fill_(self.smoothing / (self.size - 2))# 整体填充非目标类别的概率ε/K
+        # print('x:',x)
+        # print('填充标签平滑后的true_dist:',true_dist)
+        #将self.confidence按照target的索引放置到true_dist的相应位置。
+        # 这在处理分类问题、构建one-hot编码或更新某些基于索引的值时特别有用。
+        # 把target中的值当索引去更新ture_dist相应位置,这样的话true_dist
+        # 就被变成真实类别表示,不过非目标类别的概率是0.13,真实目标类别的概率是0.6
+        true_dist.scatter_(1, target.data.unsqueeze(1).long(),self.confidence)
+        # print('target.data:',target.data.unsqueeze(1))
+        # print('true_dist:',true_dist.shape,'\n',true_dist)
+        # print(true_dist),第一列被赋值为0
+        true_dist[:, self.padding_idx] = 0#第一列应该没啥用
+        # print('true_dist第一列被设置0后:',true_dist)
+        # mask的值是tensor([[2]]),返回的是target中值为0的索引
+        # 其实是返回target.data == self.padding_idx不是0的索引
+        # tensor([False, False,  True])==tensor([0,0, 1)
+        mask = torch.nonzero(target.data == self.padding_idx)
+        # print('target.data == self.padding_idx:',target.data == self.padding_idx)
+        # print('mask:',mask)# 这样得到的是目标类别中类别是0的索引,就是2
+        if mask.dim() > 0:
+            # 这个mask.squeeze()会把维度压缩,让数据更紧凑,比如[[2]],会变为2
+            # mask返回的维度要高一维,在这里是二维张量,squeeze()后变成0维张量
+            #这行代码会用mask.squeeze()中的索引填充true_dist中索引0的维度
+            #就是行,填充值是0.0,这说明传入的目标中的数据0没啥意义
+            # print(' mask.squeeze():',mask.squeeze(),mask.squeeze().dim())
+            true_dist.index_fill_(0, mask.squeeze(), 0.0)
+        # print('mask,true_dist结果数据:',mask.dim(),true_dist)
+        self.true_dist = true_dist
+        # print('x应该还是输入的x:,因为被深拷贝:',x)
+        # print('true_dist:',true_dist)
+        #计算损失,x预测值,true_dist真实值
+        return self.criterion(x, Variable(true_dist, requires_grad=False))
+import time
+# 注意：这部分非常重要。需要使用模型的这种设置进行训练。
+class NoamOpt:#自定义优化器
+    def __init__(self, model_size, factor, warmup, optimizer):
+        self.optimizer = optimizer# 底层的优化器，比如Adam
+        self._step = 0#初始化步数
+        self.warmup = warmup# 预热步数，即在达到学习率峰值之前需要经过的步数
+        self.factor = factor# 学习率的一个缩放因子
+        self.model_size = model_size# 词嵌入维度
+        self._rate = 0# 学习率
+        
+    def step(self):
+        # 更新参数和学习率
+        self._step += 1#_step计数器
+        rate = self.rate()# 获取学习率
+        for p in self.optimizer.param_groups:
+            p['lr'] = rate# 改变底层优化器的学习率参数
+        self._rate = rate# 改变自定义优化器对象的学习率
+        self.optimizer.step()# 调用底层优化器的step方法来更新模型的参数
+        
+    def rate(self, step = None):
+        if step is None:
+            step = self._step#获取对象的训练步数
+        # 学习率的计算依赖于模型的维度、当前的步数以及预热步数。
+        # 它使用了一个公式，该公式考虑了步数的倒数
+        # 和步数与预热步数的乘积的倒数，并取两者中的较小值。
+        # 这个公式确保了学习率在训练初期（即预热阶段）逐渐增加，
+        # 并在预热之后逐渐减小。
+        return self.factor * \
+            (self.model_size ** (-0.5) *
+            min(step ** (-0.5), step * self.warmup ** (-1.5)))
+ #定义获取优化器方法  
+# beta1：用于计算梯度的一阶矩估计（即梯度的平均值）。它控制梯度平均值的权重衰减率。
+# beta2：用于计算梯度的二阶矩估计（即梯度的未中心化的方差）。它控制梯度平方的权重衰减率。
+# 较大的beta值意味着优化器会更加重视近期的梯度信息，而较小的beta值则意味着优化器会
+# 更加均匀地考虑过去的梯度信息。
+def get_std_opt(model):
+    return NoamOpt(model.src_embed[0].d_model, 2, 4000,
+            torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9))
+opts = [NoamOpt(512, 1, 4000, None), 
+        NoamOpt(512, 1, 8000, None),
+        NoamOpt(256, 1, 4000, None),
+       NoamOpt(256, 1, 1000, None)]
+# 横轴是步长变化1-20000,纵轴是优化器中的学习率随步长的变化,可见,对于同样大小的模型,预热步数越大,
+# 它达到最大学习率的速度就越慢
+plt.plot(np.arange(1, 20000), [[opt.rate(i) for opt in opts] for i in range(1, 20000)])
+plt.legend(["512:4000", "512:8000", "256:4000","256:1000"])
+plt.show()
+#简单损失计算类
+class SimpleLossCompute:
+    # 传入一个分类器对象,一个标签平滑对象,一个优化器对象
+    def __init__(self, generator, criterion, opt=None):
+        self.generator = generator
+        self.criterion = criterion
+        self.opt = opt
+        
+    def __call__(self, x, y, norm):
+        #x是编解码器处理后对象,之后经过softmax处理,获取的是概率
+        x = self.generator(x)# 
+        # print('经过分类器处理后的x:',x)
+        #经过标签平滑计算损失,x:预测值,`y,真实值
+        loss = self.criterion(x.contiguous().view(-1, x.size(-1)), 
+                              y.contiguous().view(-1)) / norm
+        #反向传播
+        loss.backward()
+        if self.opt is not None:
+            # 有优化器,就更新优化器参数
+            self.opt.step()
+            # 梯度归0
+            self.opt.optimizer.zero_grad()
+        # 
+        return loss.item()* norm
+# 训练,参数:数据生成器,模型,损失计算方式
+def run_epoch(data_iter, model, loss_compute):
+    start = time.time()#起始时间
+    total_tokens = 0# 初始化总分词数为0
+    total_loss = 0# 初始化总损失为0 
+    tokens = 0# 初始化当前批次的分词数为0
+    # i: 当前批次的索引,batch: 从 data_iter 中取出的一个数据批次
+    for i, batch in enumerate(data_iter):
+         # 对当前批次的数据进行前向传播，并返回输出,调用的是编解码器的
+        # forward方法
+        out = model.forward(batch.src, batch.trg, 
+                            batch.src_mask, batch.trg_mask)
+        # 使用模型的输出和真实标签计算损失
+        loss = loss_compute(out, batch.trg_y, batch.ntokens)
+        total_loss += loss#累计损失
+        total_tokens += batch.ntokens# 累计分词数
+        tokens += batch.ntokens# 
+        if i % 50 == 1:# 每50个批次输出一次统计信息
+            elapsed = time.time() - start# 从上一个输出点到现在的时间差
+            # 输出当前批次的索引、平均损失（损失除以当前批次的分词数）以及每秒处理的
+            # 分词数（当前批次的分词数除以时间差)
+            print("Epoch Step: %d Loss: %f Tokens per Sec: %f" %
+                    (i, loss / batch.ntokens, tokens / elapsed))
+            start = time.time()# 重置起始时间
+            tokens = 0#  重置批次分词
+    return total_loss / total_tokens# 返回整个数据集的平均损失
+global max_src_in_batch, max_tgt_in_batch
+#new:新添加到批次的数据,count:当前批次中已有的数据项数,sofar:到目前为止，批次中已经有的元素总数
+def batch_size_fn(new, count, sofar):
+    # 用于存储当前批次中源序列的最大长度,用于存储当前批次中目标序列的最大长度
+    # 目标序列的长度需要加2,目标序列的开始和结束通常会添加特殊的标记
+    global max_src_in_batch, max_tgt_in_batch
+    if count == 1:# 如果 count 为1（即这是批次中的第一个数据项）
+        # 重置 max_src_in_batch 和 max_tgt_in_batch 为0
+        max_src_in_batch = 0
+        max_tgt_in_batch = 0
+    # 更新max_src_in_batch 为当前值和新数据的长度的较大值
+    max_src_in_batch = max(max_src_in_batch,len(new.src))
+    max_tgt_in_batch = max(max_tgt_in_batch,len(new.trg) + 2)
+    #
+    src_elements = count * max_src_in_batch
+    tgt_elements = count * max_tgt_in_batch
+    return max(src_elements, tgt_elements)
+V = 11# 11个词汇
+# 创建标签平滑实例,参数:词汇数,padding_idx:填充,smoothing:平滑系数
+criterion = LabelSmoothing(size=V, padding_idx=0, smoothing=0.0)
+# 构建模型,参数:原数据词汇,目标数据词汇,使用的编解码器层数
+model = make_model(V, V, N=2)
+# 优化器,词嵌入维度,缩放因子,预热步数,底层的优化器
+# 参数 eps 是Adam优化器的一个参数，用于增加数值稳定性，防止除以零的情况。具体来说，
+# eps 会在计算梯度的一阶矩估计（即梯度的平均值）和二阶矩估计（即梯度的未中心化方差）
+# 的分母中出现，确保分母不为零。
+model_opt = NoamOpt(model.src_embed[0].d_model, 1, 400,
+        torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9))
+#迭代10次
+for epoch in range(10):
+    model.train()# 
+    run_epoch(data_gen(V, 30, 20), model, 
+              SimpleLossCompute(model.generator, criterion, model_opt))
+    model.eval()
+    print(run_epoch(data_gen(V, 30, 5), model, 
+                    SimpleLossCompute(model.generator, criterion, None)))
+def greedy_decode(model, src, src_mask, max_len, start_symbol):
+    memory = model.encode(src, src_mask)
+    ys = torch.ones(1, 1).fill_(start_symbol).type_as(src.data)
+    for i in range(max_len-1):
+        out = model.decode(memory, src_mask, 
+                           Variable(ys), 
+                           Variable(subsequent_mask(ys.size(1))
+                                    .type_as(src.data)))
+        prob = model.generator(out[:, -1])
+        _, next_word = torch.max(prob, dim = 1)
+        next_word = next_word.data[0]
+        ys = torch.cat([ys, 
+                        torch.ones(1, 1).type_as(src.data).fill_(next_word)], dim=1)
+    return ys
+
+model.eval()
+src = Variable(torch.LongTensor([[1,2,3,4,5,6,7,8,9,10]]) )
+src_mask = Variable(torch.ones(1, 1, 10) )
+print(greedy_decode(model, src, src_mask, max_len=10, start_symbol=1))

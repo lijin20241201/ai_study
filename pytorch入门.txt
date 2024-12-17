@@ -1,0 +1,227 @@
+相比起keras和tensorflow,个人感觉pytorch更好一些
+相比起程序语言本身,个人感觉,记住解决问题的步骤和方法更重要
+import torch
+t=torch.tensor(1)
+t.size()
+t1=torch.rand((3,4))
+torch.Tensor?
+torch.empty((3,3))
+device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')#实例化device
+torch.zeros((2,3),device=device)
+a=torch.zeros((2,3))
+a.to(device)
+# device=torch.device('cpu')#cpu设备,放tensor到cpu上跑
+a.to(device)#下面不带device='cuda:0'
+x=torch.ones((2,2),requires_grad=True)
+print(x)#需要梯度
+y=x+2#grad_fn里面保存了当前操作,add
+print(y)
+z=y*y*3#grad_fn里面保存了当前操作,复合运算
+print(z)
+out=z.mean()#grad_fn求均值的操作,Mean
+print(out)
+a=torch.rand(2,2)# requires_grad默认是False
+a=(a*3)/(a-1)
+print(a.requires_grad,type(a))
+a.requires_grad=True
+print(a.requires_grad)
+b=(a*a).sum()
+with torch.no_grad():# 指定不保留计算梯度的操作
+    c=(a*a).sum()
+    print(c,c.requires_grad)
+out.backward()# 此时能计算出out对x的导数
+print(a,a.data)#a的requires_grad=True时,只显示a的数据a.data
+a.numpy()# 当requires_grad=True时,用tensortensor.detach().numpy(),相当于深拷贝
+import numpy as np
+np.set_printoptions(suppress=True)
+x=np.random.rand(500,1)
+#准备数据,输入和输出
+x=torch.rand(500,1)
+y=3*x+0.8 #y_true
+#初始化w,b
+w=torch.rand((1,1),requires_grad=True)#w必须初始化为一个2维的tensor
+b=torch.rand(1,requires_grad=True)
+w_i=torch.rand(1,requires_grad=True)# 一维的tensor
+w_i.dim()# 
+learning_rate=1e-2
+np.set_printoptions(suppress=True)
+#迭代,反向传播,更新参数
+for i in range(2000):
+    #计算预测值和损失
+    y_pre=torch.matmul(x,w)+b
+    loss=(y-y_pre).pow(2).mean()
+    if w.grad is not None:# .data属于浅拷贝,改变的话,原数据也改变
+        w.grad.data.zero_()#如果w.grad不为None,就归0,不然会累加
+    if b.grad is not None:
+        b.grad.data.zero_()
+    loss.backward()# 反向传播
+    w.data-=learning_rate*w.grad#更新梯度
+    b.data-=learning_rate*b.grad
+    if i%50==0:
+        print('w,b,loss:',w.item(),b.item(),loss.item())
+import matplotlib.pyplot as plt
+plt.figure(figsize=(20,10))
+plt.rcParams['font.size']=20
+plt.scatter(x.numpy(),y.numpy(),c='red')# detach属于深拷贝
+plt.plot(x,y_pre.detach().numpy(),c='blue')# y_pre.detach().numpy()
+plt.show()
+from torch import nn
+#定义模型
+class MyModel(nn.Module):
+    def __init__(self):
+        super(MyModel,self).__init__()
+        self.linear=nn.Linear(1,1)#输入特征,输出特征
+    def forward(self,x):# 前向传播
+        output=self.linear(x)
+        return output#预测值
+from torch import optim
+device=torch.device('cuda'\
+if torch.cuda.is_available() else 'cpu')#实例化device
+x=torch.rand(500,1).to(device)# 可以变成gpu或cpu下的tensor
+y_true=(3*x+0.8)# 因为x是gpu下tensor,y也被变了
+print(x[:5],y_true[:5])
+model=MyModel().to(device)#其他在模型内的参数等也会变成gpu下的tensor
+yhq=optim.SGD(model.parameters(),5e-3)#优化器,parameters()在模型内,也被变成gpu tensor
+loss_fn=nn.MSELoss()
+#迭代,梯度下降,参数更新
+for i in range(5000):
+    y_pre=model(x)# 预测值,自动调用_call方法,_call调用forward方法
+    loss=loss_fn(y_true,y_pre)#更新损失
+    yhq.zero_grad()#梯度归0
+    loss.backward()#反向传播
+    yhq.step()#更新参数
+    if i%100==0:
+        print('loss,params:',loss.item(),\
+              list(model.parameters())[0].item(),\
+              list(model.parameters())[1].item())
+# model.eval()# 表示设置模型为预测模式
+# model.train(True)#表示设置模型为训练模式
+from torch.utils.data import Dataset
+data_path=r'C:\Users\li\Downloads\train.txt'
+class MyDataset(Dataset):
+    def __init__(self):
+        self.lines=open(data_path,encoding='utf8').readlines()
+    def __getitem__(self,index):
+        line= self.lines[index].strip()
+#         print(line)
+        text,label=line.split('\t')
+        return text,label
+    def __len__(self):
+        return len(self.lines)
+from torch.utils.data import DataLoader
+mydataset=MyDataset()
+dataloader=DataLoader(mydataset,batch_size=32,shuffle=True)
+from torchvision.datasets import MNIST
+from torchtext.datasets import IMDB
+# root是存放数据集的路径,可以没有,没有就自动创建,download,True下载数据集
+mnist=MNIST(root='./datasets',train=True,download=False)
+plt.figure(figsize=(1,1))
+plt.imshow(mnist[0][0],cmap='grey')
+data=np.random.randint(0,255,24)
+img=data.reshape(2,4,3)# 模拟的一个图片,h,w,c,图片数据在0-255
+from torchvision import transforms
+# 用transforms将图片数据转换成tensor(c,h,w),用了permute()方法
+img_tensor=transforms.ToTensor()(img)
+tensor=torch.Tensor(img)
+# print(tensor)
+# tensor.transpose(2,0)
+tensor.permute(2,0,1)#可以交换轴
+ ret=transforms.ToTensor()(mnist[0][0])# 将ndarray转换成c,h,w这样的结构
+# print(ret.size())
+from torch.optim import Adam#梯度和梯度加总都做了ema处理
+def get_dataloader(flag=True,batch_size=128):# 每批次128个
+        # 数据集,手写辨识,变成了tensor,做了标准化处理
+    mnist=MNIST(root='./datasets',train=flag,download=False,
+               transform=transforms.Compose(
+               [transforms.ToTensor(),#把原来的ndarray(h,w,c)变成饿了(c,h,w)
+                #传入的均值和标准差必须和数据集中图片的通道数一致,3通道得3个
+                transforms.Normalize((0.1307,),(0.3081,))
+               ])
+               )
+    print(len(mnist))
+    return DataLoader(mnist,batch_size=batch_size,shuffle=True)
+class MnistNet(nn.Module):
+    def __init__(self):
+        super(MnistNet,self).__init__()
+        self.fc1=nn.Linear(1*28*28,28)#全连接1层28*28--->28
+        self.fc2=nn.Linear(28,10)# 输出层28-->10
+    def forward(self,input_):
+        # -1是batchsize,但batchsize是向上取整,最后那个不一样,写-1,让电脑弄
+        # 要么input_.size(0),view相当于reshape
+        #修改数据形状,相当于keras中的Flattern
+        x=input_.view(-1,28*28*1)#这里不能写死了,因为test时,batch_size大
+        # 全连接
+        x=self.fc1(x)# 这样内部就进行矩阵操作,输出28*1,线性运算
+        x=nn.functional.relu(x)# 激活函数处理,形状不变
+        # 输出层
+        output=self.fc2(x)# 经过输出层处理,28-->10
+        #交叉熵损失,对输出值计算概率和取对数
+        return nn.functional.log_softmax(output,dim=-1)
+import os
+my_model=MnistNet()
+#训练,loss:min_loss:0.0556986965239048,loss:0.05224079266190529
+optimizer=Adam(my_model.parameters(),lr=5e-4)# parameters()带括号
+# 如果路径存在就加载模型,不存在就是新建的模型
+if os.path.exists('./model/mnist_model_best_6_5.pkl'):
+    my_model.load_state_dict(torch.load('./model/mnist_model_best_6_5.pkl'))
+    optimizer.load_state_dict(torch.load('./results/mnist_optim_best_6_5.pkl'))
+def train(epoch):
+    # 每次epoch都会初始化成这个值,但一次epoch内这个值会
+    #取最小
+    min_loss=torch.tensor(1000)
+    dataloader=get_dataloader()#默认是train=True,batchsize=128
+    print('epoch:',epoch+1,len(dataloader))#迭代次数,批次
+    for inx,(data,label) in enumerate(dataloader):
+        optimizer.zero_grad()# 把之前的梯度归零
+        y_pre=my_model(data)#根据data预测,会调用模型的forward方法
+        # 真实值乘概率的对数,计算损失,多元交叉熵
+        cur_loss=nn.functional.nll_loss(y_pre,label)
+        cur_loss.backward()#反向传播,对x求导的过程
+        optimizer.step()# 更新梯度
+        #小于min_loss才改值,确保min_loss是最小值
+        if cur_loss<min_loss:# 如果loss比min_loss小,保存模型
+            torch.save(my_model.state_dict(),\
+                       './model/mnist_model_best_7_{}.pkl'\
+                       .format(epoch+1))#保存模型参数,state_dict必须带括号
+            torch.save(optimizer.state_dict(),\
+                       './results/mnist_optim_best_7_{}.pkl'\
+                       .format(epoch+1))# 保存优化器
+            print('模型保存成功,之前的min_loss:{:.6f},当前loss:{:.6f}'\
+                  .format(min_loss.item(),cur_loss.item()))
+            min_loss=cur_loss# 更改min_loss为当前loss
+        if inx%50==0:# 每隔50个batch打印
+            print('train epoch:{}[{}/{}({:.0f}%)]\tLoss:{:.6f}'\
+                 .format(epoch+1,(inx+1)*len(data),len(dataloader.dataset),\
+                 100.*(inx+1)/len(dataloader),cur_loss.item()        
+            ))
+  for i in range(5):# 迭代5次
+    train(i)
+def test(model):
+    loss_lst=[]
+    acc_lst=[]
+    model.eval()
+    test_dataloader=get_dataloader(flag=False,batch_size=1000)
+    with torch.no_grad():#不计算梯度,测试状态
+        for idx,(data,label) in enumerate(test_dataloader):
+                output=model(data)# 输出(样本数,10)
+                #计算的是一个batch的损失
+                cur_loss=nn.functional.nll_loss(output,label)
+    #             print(output.shape)
+                y_pred=output.max(dim=-1)[-1]# 长度2,最大值和对应的类别
+                # float()之后有1有0,求它的均值就是求和之后/总样本数
+                cur_acc=y_pred.eq(label).float().mean()
+    #             print(cur_acc)
+        #         print(label[0])# 一维张量
+                loss_lst.append(cur_loss)
+                acc_lst.append(cur_acc)
+        return np.mean(loss_lst),np.mean(acc_lst)
+for i in range(5):
+    my_model=MnistNet()
+    optimizer=Adam(my_model.parameters(),lr=5e-4)# parameters()带括号
+    my_model.load_state_dict(torch\
+                 .load('./model/mnist_model_best_6_{}.pkl'.format(i+1)))
+    optimizer.load_state_dict(torch\
+                  .load('./results/mnist_optim_best_6_{}.pkl'.format(i+1)))
+    loss,acc=test(my_model)
+    print(loss,acc)
+    del my_model

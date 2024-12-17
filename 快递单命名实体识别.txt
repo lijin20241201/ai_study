@@ -1,0 +1,210 @@
+​
+
+import sys
+
+import os
+from functools import partial
+import paddle
+from paddlenlp.transformers import AutoModelForTokenClassification, AutoTokenizer
+from paddlenlp.metrics import ChunkEvaluator
+
+paddle.set_device('gpu')
+
+from paddlenlp.data import Pad, Stack, Tuple
+
+import numpy as np
+
+from information_extraction import(
+data,model,utils
+)
+
+train_ds, dev_ds, test_ds = data.load_dataset(datafiles=(
+        './datasets/waybill/train.txt',
+    './datasets/waybill/dev.txt', './datasets/waybill/test.txt'))
+
+for i in range(3):
+    text,label=train_ds[i]
+    print(''.join(text),'|',''.join(label))
+
+ label_vocab = data.load_dict('./datasets/waybill/tag.dic')
+
+tokenizer = AutoTokenizer.from_pretrained("ernie-3.0-medium-zh")
+
+#当某个函数会被多次调用时,可以这样用
+trans_func = partial(utils.convert_to_features, tokenizer=tokenizer,
+                     label_vocab=label_vocab)
+
+ignore_label =-1#计算损失时要忽略的(不是crf模型的设置)
+
+#只用预训练模型的设置
+batchify_fn = lambda samples, fn=Tuple(
+    Pad(axis=0, pad_val=tokenizer.pad_token_id,dtype="int32"),  # input_ids,填充0
+    Pad(axis=0, pad_val=tokenizer.pad_token_type_id,dtype="int32"),  # token_type_ids, 填充0
+    Stack(dtype="int32"), # seq_len
+    # ignore_label,表示在训练过程中应该忽略这个标签索引的损失。
+    Pad(axis=0, pad_val=ignore_label,dtype="int32") #填充-1
+): fn(samples)
+
+BATCH_SIZE=36
+
+train_loader = utils.create_dataloader(
+    dataset=train_ds,
+    batch_size=BATCH_SIZE,
+    trans_fn=trans_func,
+    batchify_fn=batchify_fn)
+
+dev_loader = utils.create_dataloader(
+    dataset=dev_ds,mode='dev',
+    batch_size=BATCH_SIZE,
+    batchify_fn=batchify_fn,trans_fn=trans_func)
+
+test_loader = utils.create_dataloader(
+    dataset=test_ds,mode='test',
+    batch_size=BATCH_SIZE,
+    batchify_fn=batchify_fn,trans_fn=trans_func)
+
+for i1,i2,i3,i4 in train_loader:
+    print(i1.shape,i2.shape,i3.shape,i4.shape)
+    # display(i1.numpy(),i2.numpy(),i3.numpy(),i4.numpy())
+    break
+
+model = AutoModelForTokenClassification.from_pretrained(\
+            "ernie-3.0-medium-zh", num_labels=len(label_vocab))
+
+#度量模型性能的指标,suffix=True,意味着要考虑后缀,因为后缀也有语义信息
+metric = ChunkEvaluator(label_list=label_vocab.keys(), suffix=True)# suffix:后缀
+
+#损失函数:多元交叉熵(其中,ignore_label这样的值会被忽略,不计算损失),mean表示平均token损失
+#none会返回形状于label一样的,sum是所有token损失和的形式,可以忽视填充,不过不要忽视开始和结束符
+#忽略的话性能降低,这个是不带crf的模型的损失函数
+loss_fn = paddle.nn.loss.CrossEntropyLoss(ignore_index=ignore_label,reduction='mean')
+
+input_ =  paddle.to_tensor([[0.,0.,0.,0.,0.,0.,0.,0.,0.,0.,0.1,0.1,0.1],[0.,0.,0.,0.,0.,0.,0.,0.,0.,0.,0.1,0.1,0.1]])
+label =  paddle.to_tensor([[1],[-1]])
+dy_ret =loss_fn(input_, label)
+print(dy_ret)
+
+steps_per_epoch=len(train_loader)#每个轮次的步数,就是批次数
+num_epochs=10
+total_steps=steps_per_epoch*num_epochs#总步数
+
+scheduler=utils.get_scheduler(total_steps)
+
+# 定义优化器
+optimizer = paddle.optimizer.Adam(learning_rate=scheduler,
+                                  parameters=model.parameters())
+
+def train_epochs(epochs):
+    global_step=0
+    best_f1_score=0.
+    for epoch in range(epochs):
+        avg_loss,global_step = utils.train(\
+            model,train_loader,global_step,optimizer,loss_fn,scheduler)
+        print("epoch:%d - global_step:%d - loss: %.4f -best_score:%.5f -lr:%.5f" \
+              % (epoch, global_step, avg_loss,best_f1_score,optimizer.get_lr()))
+        #命名实体识别中的正例和负例是命名实体和非命名实体
+        #精确率越高，说明模型预测为正例的样本中，真正为正例的比例越高，即模型预测为正例的可靠性越高
+        # 召回率衡量的是所有真正例样本中被模型正确预测出来的比例
+        # 召回率越高，说明模型找出了越多的真正例，即模型对正例的覆盖程度越高。
+        # F1 分数是精确率和召回率的调和平均数，用于平衡这两个指标。
+        # F1 分数越高，说明模型在精确率和召回率之间取得了更好的平衡。在需要
+        # 同时考虑精确率和召回率的场景中，F1 分数是一个非常有用的指标。
+        precision, recall, f1_score=utils.evaluate(model,metric,dev_loader)
+        print("[EVAL] Precision: %.4f - Recall: %.4f - F1: %.4f" % (precision, recall, f1_score))
+        if f1_score>best_f1_score:
+            paddle.save(model.state_dict(),\
+                './checkpoints/waybill/best_1.pdparams')
+            best_f1_score=f1_score
+
+train_epochs(num_epochs)#普通训练
+
+reversed_labels={value:key for key,value in label_vocab.items()}
+
+model.set_state_dict(paddle.load('./checkpoints/waybill/best_1.pdparams'))
+
+preds = utils.predict(model,test_loader,test_ds,label_vocab)
+save_dir='./demo_txts/'
+if not os.path.exists(save_dir): os.makedirs(save_dir)
+file_path = save_dir+"快递单命名实体识别_不带crf版.txt"
+with open(file_path, "w", encoding="utf8") as fout:
+    fout.write("\n".join(preds))
+# Print some examples
+print("结果已经保存在: %s, 下面是一些示例: " % file_path)
+print("\n".join(preds[:3]))
+
+#以下是crf版
+
+#crf_model填充处理,批次内要填充到一样的长度
+batchify_fn = lambda samples, fn=Tuple(
+    Pad(axis=0, pad_val=tokenizer.pad_token_id,dtype="int32"),  # input_ids,填充0
+    Pad(axis=0, pad_val=tokenizer.pad_token_type_id,dtype="int32"),  # token_type_ids, 填充0
+    Stack(dtype="int64"), # seq_len,带crf的话,seq_len,下面的labels这两个数据类型必须是int64
+    #填充12,因为crf计算损失必须:填充值在索引范围内
+    Pad(axis=0,pad_val=label_vocab.get("O"),dtype="int64")
+): fn(samples)
+
+train_loader = utils.create_dataloader(
+    dataset=train_ds,
+    batch_size=BATCH_SIZE,
+    trans_fn=trans_func,
+    batchify_fn=batchify_fn)
+
+for i1,i2,i3,i4 in train_loader:
+    print(i1.shape,i2.shape,i3.shape,i4.shape)
+    display(i1.numpy(),i2.numpy(),i3.numpy(),i4.numpy())
+    break
+
+dev_loader = utils.create_dataloader(
+    dataset=dev_ds,mode='dev',
+    batch_size=BATCH_SIZE,
+    batchify_fn=batchify_fn,trans_fn=trans_func)
+
+test_loader = utils.create_dataloader(
+    dataset=test_ds,mode='test',
+    batch_size=BATCH_SIZE,
+    batchify_fn=batchify_fn,trans_fn=trans_func)
+
+steps_per_epoch=len(train_loader)#每个轮次的步数,就是批次数
+num_epochs=10
+total_steps=steps_per_epoch*num_epochs#总步数
+
+ernie = AutoModelForTokenClassification.from_pretrained(\
+            "ernie-3.0-medium-zh", num_labels=len(label_vocab))
+
+crf_model = model.ErnieCrfForTokenClassification(ernie)#crf
+
+crf_scheduler =utils.get_scheduler(total_steps)
+
+crf_optimizer = paddle.optimizer.Adam(learning_rate=crf_scheduler,#crf_model对应的优化器
+                                  parameters=crf_model.parameters())#参数列表,别传方法
+
+def crf_train_epochs(epochs):
+    global_step=0
+    best_f1_score=0.
+    for epoch in range(epochs):
+        avg_loss,global_step = utils.crf_train(\
+            crf_model,train_loader,global_step,crf_optimizer,crf_scheduler)
+        print("epoch:%d - global_step:%d - loss: %.4f -best_score:%.5f -lr:%.5f" \
+              % (epoch, global_step, avg_loss,best_f1_score,crf_optimizer.get_lr()))
+        precision, recall, f1_score=utils.crf_evaluate(crf_model,metric,dev_loader)
+        print("[EVAL] Precision: %.4f - Recall: %.4f - F1: %.4f" % (precision, recall, f1_score))
+        if f1_score>best_f1_score:
+            paddle.save(crf_model.state_dict(),\
+                './checkpoints/waybill/best_crf_1.pdparams')
+            best_f1_score=f1_score
+
+crf_train_epochs(num_epochs)#crf_model训练
+​
+crf_model.set_state_dict(paddle.load('./checkpoints/waybill/best_crf_1.pdparams'))
+
+reversed_labels=dict(zip(label_vocab.values(),label_vocab.keys()))
+
+utils.crf_evaluate(crf_model,metric,test_loader)
+preds = utils.crf_predict(crf_model,test_loader,test_ds,label_vocab)
+file_path = "./demo_txts/快递单命名实体识别_带crf版.txt"
+with open(file_path, "w", encoding="utf8") as fout:
+    fout.write("\n".join(preds))
+# Print some examples
+print("结果已经保存在: %s, 下面是一些示例: " % file_path)
+print("\n".join(preds[:3]))
+

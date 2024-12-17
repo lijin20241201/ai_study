@@ -1,0 +1,315 @@
+import os
+os.environ["KERAS_BACKEND"] = "tensorflow"  # @param ["tensorflow", "jax", "torch"]
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+import numpy as np
+import keras
+from keras import layers
+import tensorflow as tf
+
+gpus = tf.config.list_physical_devices('GPU')  
+if gpus:  
+    # 如果有GPU，设置GPU资源使用率  
+    try:  
+        # 允许GPU内存按需增长  
+        for gpu in gpus:  
+            tf.config.experimental.set_memory_growth(gpu, True)  
+        # 设置可见的GPU设备（这里实际上不需要，因为已经通过内存增长设置了每个GPU）  
+        # tf.config.set_visible_devices(gpus, 'GPU')  
+        print("GPU可用并已设置内存增长模式。")  
+    except RuntimeError as e:  
+        # 虚拟设备未就绪时可能无法设置GPU  
+        print(f"设置GPU时发生错误: {e}")  
+else:  
+    # 如果没有GPU  
+    print("没有检测到GPU设备。")
+
+num_classes = 10
+input_shape = (32, 32, 3)
+(x_train, y_train), (x_test, y_test) = keras.datasets.cifar10.load_data()
+print(f"x_train shape: {x_train.shape} - y_train shape: {y_train.shape}")
+print(f"x_test shape: {x_test.shape} - y_test shape: {y_test.shape}")
+
+weight_decay = 1e-4
+batch_size = 128
+num_epochs = 10  # Recommended num_epochs = 50
+dropout_rate = 0.2
+image_size = 64  # We'll resize input images to this size.
+patch_size = 8  # Size of the patches to be extracted from the input images.
+num_patches = (image_size // patch_size) ** 2  # 64
+embedding_dim = 256  # Number of hidden units.
+num_blocks = 4  # Number of blocks.
+print(f"Image size: {image_size} X {image_size} = {image_size ** 2}")
+print(f"Patch size: {patch_size} X {patch_size} = {patch_size ** 2} ")
+print(f"Patches per image: {num_patches}")
+print(f"Elements per patch (3 channels): {(patch_size ** 2) * 3}")
+
+def build_classifier(blocks, positional_encoding=False):
+    inputs = layers.Input(shape=input_shape)
+    augmented = data_augmentation(inputs)
+    patches = Patches(patch_size)(augmented)
+    x = layers.Dense(units=embedding_dim)(patches)
+    if positional_encoding:
+        x = x + PositionEmbedding(sequence_length=num_patches)(x)
+    # Process x using the module blocks.
+    x = blocks(x)
+    representation = layers.GlobalAveragePooling1D()(x)
+    # Apply dropout.
+    representation = layers.Dropout(rate=dropout_rate)(representation)
+    # Compute logits outputs.
+    logits = layers.Dense(num_classes)(representation)
+    # Create the Keras model.
+    return keras.Model(inputs=inputs, outputs=logits)
+
+def run_experiment(model):
+    optimizer = keras.optimizers.AdamW(
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+    )
+    model.compile(
+        optimizer=optimizer,
+        loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        metrics=[
+            keras.metrics.SparseCategoricalAccuracy(name="acc"),
+            keras.metrics.SparseTopKCategoricalAccuracy(5, name="top5-acc"),
+        ],
+    )
+    #学习率调节器，监视val_loss,2个轮次验证损失不减少,学习率减半
+    reduce_lr = keras.callbacks.ReduceLROnPlateau(
+        monitor="val_loss", factor=0.5, patience=2
+    )
+    #早停回调，监视val_loss,合起来4个轮次不减少就停止
+    early_stopping = keras.callbacks.EarlyStopping(
+        monitor="val_loss", patience=4,restore_best_weights=True
+    )
+    # Fit the model.
+    history = model.fit(
+        x=x_train,
+        y=y_train,
+        batch_size=batch_size,
+        epochs=num_epochs,
+        validation_split=0.1,
+        callbacks=[early_stopping, reduce_lr],
+        verbose=2
+    )
+    _, accuracy, top_5_accuracy = model.evaluate(x_test, y_test)
+    print(f"Test accuracy: {round(accuracy * 100, 2)}%")
+    print(f"Test top 5 accuracy: {round(top_5_accuracy * 100, 2)}%")
+    # Return history to plot learning curves.
+    return history
+
+
+data_augmentation = keras.Sequential(
+    [
+        layers.Normalization(),
+        layers.Resizing(image_size, image_size),
+        layers.RandomFlip("horizontal"),
+        layers.RandomZoom(height_factor=0.2, width_factor=0.2)
+    ],
+    name="data_augmentation",
+)
+# Compute the mean and the variance of the training data for normalization.
+data_augmentation.layers[0].adapt(x_train)
+
+class Patches(layers.Layer):
+    def __init__(self, patch_size, **kwargs):
+        super().__init__(**kwargs)
+        self.patch_size = patch_size
+    def call(self, x):
+        patches = keras.ops.image.extract_patches(x, self.patch_size)#(1,8,8,192)
+        batch_size = keras.ops.shape(patches)[0]
+        num_patches = keras.ops.shape(patches)[1] * keras.ops.shape(patches)[2]
+        patch_dim = keras.ops.shape(patches)[-1]
+        out = keras.ops.reshape(patches, (batch_size, num_patches, patch_dim))
+        return out
+
+class PositionEmbedding(keras.layers.Layer):
+    def __init__(
+        self,
+        sequence_length,
+        initializer="glorot_uniform",
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        if sequence_length is None:
+            raise ValueError("`sequence_length` must be an Integer, received `None`.")
+        self.sequence_length = int(sequence_length)
+        self.initializer = keras.initializers.get(initializer)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update(
+            {
+                "sequence_length": self.sequence_length,
+                "initializer": keras.initializers.serialize(self.initializer),
+            }
+        )
+        return config
+
+    def build(self, input_shape):
+        feature_size = input_shape[-1]
+        self.position_embeddings = self.add_weight(
+            name="embeddings",
+            shape=[self.sequence_length, feature_size],
+            initializer=self.initializer,
+            trainable=True,
+        )
+
+        super().build(input_shape)
+
+    def call(self, inputs, start_index=0):
+        shape = keras.ops.shape(inputs)
+        feature_length = shape[-1]
+        sequence_length = shape[-2]
+        # trim to match the length of the input sequence, which might be less
+        # than the sequence_length of the layer.
+        position_embeddings = keras.ops.convert_to_tensor(self.position_embeddings)
+        position_embeddings = keras.ops.slice(
+            position_embeddings,
+            (start_index, 0),
+            (sequence_length, feature_length),
+        )
+        return keras.ops.broadcast_to(position_embeddings, shape)
+
+    def compute_output_shape(self, input_shape):
+        return input_shape
+
+class MLPMixerLayer(layers.Layer):
+    def __init__(self, num_patches, hidden_units, dropout_rate, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.mlp1 = keras.Sequential( #这个感知机是对小单元块位置做投影
+            [
+                layers.Dense(units=num_patches, activation="gelu"),
+                layers.Dense(units=num_patches),
+                layers.Dropout(rate=dropout_rate),
+            ]
+        )
+        self.mlp2 = keras.Sequential(#这个是对隐层做投影
+            [
+                layers.Dense(units=num_patches, activation="gelu"),
+                layers.Dense(units=hidden_units),
+                layers.Dropout(rate=dropout_rate),
+            ]
+        )
+        self.normalize = layers.LayerNormalization(epsilon=1e-6)
+
+    def build(self, input_shape): # build 方法是定义和初始化层权重的地方
+        return super().build(input_shape)
+
+    def call(self, inputs):
+        # Apply layer normalization.
+        x = self.normalize(inputs)#(b,p,h)
+        # Transpose inputs from [num_batches, num_patches, hidden_units] to [num_batches, hidden_units, num_patches].
+        x_channels = keras.ops.transpose(x, axes=(0, 2, 1))#（b,h,p）
+        # Apply mlp1 on each channel independently.
+        mlp1_outputs = self.mlp1(x_channels)#(b,h,p)
+        # Transpose mlp1_outputs from [num_batches, hidden_dim, num_patches] to [num_batches, num_patches, hidden_units].
+        mlp1_outputs = keras.ops.transpose(mlp1_outputs, axes=(0, 2, 1))#(b,p,h)
+        # Add skip connection.
+        x = mlp1_outputs + inputs #感知机前后的数据做残差(b,p,h)
+        # Apply layer normalization.
+        x_patches = self.normalize(x)
+        # Apply mlp2 on each patch independtenly.
+        mlp2_outputs = self.mlp2(x_patches)
+        # Add skip connection.
+        x = x + mlp2_outputs
+        return x
+
+
+mlpmixer_blocks = keras.Sequential(
+    [MLPMixerLayer(num_patches, embedding_dim, dropout_rate) for _ in range(num_blocks)]
+)
+learning_rate = 5e-3
+mlpmixer_classifier = build_classifier(mlpmixer_blocks)#感知机分类器
+
+history = run_experiment(mlpmixer_classifier)
+
+class FNetLayer(layers.Layer):
+    def __init__(self, embedding_dim, dropout_rate, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ffn = keras.Sequential(
+            [
+                layers.Dense(units=embedding_dim, activation="gelu"),
+                layers.Dropout(rate=dropout_rate),
+                layers.Dense(units=embedding_dim),
+            ]
+        )
+        self.normalize1 = layers.LayerNormalization(epsilon=1e-6)
+        self.normalize2 = layers.LayerNormalization(epsilon=1e-6)
+
+    def call(self, inputs):
+        # Apply fourier transformations.
+        real_part = inputs
+        im_part = keras.ops.zeros_like(inputs) #形状和inputs一样的全0数据
+        x = keras.ops.fft2((real_part, im_part))[0]#傅里叶变换,有实部和虚部
+        # Add skip connection.
+        x = x + inputs#前后做残差
+        # Apply layer normalization.
+        x = self.normalize1(x)
+        # Apply Feedfowrad network.
+        x_ffn = self.ffn(x)#前馈层,感知机
+        # Add skip connection.
+        x = x + x_ffn#残差连接可以让网络学习残差前后的差异,这里是感知机前后的差别
+        # Apply layer normalization.
+        return self.normalize2(x)
+
+fnet_blocks = keras.Sequential(
+    [FNetLayer(embedding_dim, dropout_rate) for _ in range(num_blocks)]
+)
+learning_rate = 1e-3
+fnet_classifier = build_classifier(fnet_blocks, positional_encoding=True)
+
+history = run_experiment(fnet_classifier)
+
+class gMLPLayer(layers.Layer):
+    def __init__(self, num_patches, embedding_dim, dropout_rate, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.channel_projection1 = keras.Sequential(#投影层
+            [
+                layers.Dense(units=embedding_dim * 2, activation="gelu"),
+                layers.Dropout(rate=dropout_rate),
+            ]
+        )
+        self.channel_projection2 = layers.Dense(units=embedding_dim)
+
+        self.spatial_projection = layers.Dense(
+            units=num_patches, bias_initializer="Ones"
+        )
+
+        self.normalize1 = layers.LayerNormalization(epsilon=1e-6)
+        self.normalize2 = layers.LayerNormalization(epsilon=1e-6)
+
+    def spatial_gating_unit(self, x):
+        # Split x along the channel dimensions.
+        # Tensors u and v will in the shape of [batch_size, num_patchs, embedding_dim].
+        u, v = keras.ops.split(x, indices_or_sections=2, axis=2)
+        print(u.shape,v.shape)
+        # Apply layer normalization.
+        v = self.normalize2(v)
+        # [batch_size,embedding_dim, num_patchs].
+        v_channels = keras.ops.transpose(v, axes=(0, 2, 1))
+        v_projected = self.spatial_projection(v_channels)
+        v_projected = keras.ops.transpose(v_projected, axes=(0, 2, 1))
+        # 将经过空间投影并重新排列的 v_projected 与原始的 u 进行逐元素乘法（u * v_projected）。这一步是空间门控单元的核心，
+        # 它允许 v_projected 中的空间信息对 u 进行调制，从而增强模型对空间信息的敏感度。
+        return u * v_projected
+
+    def call(self, inputs):
+        # Apply layer normalization.
+        x = self.normalize1(inputs)
+        # Apply the first channel projection. x_projected shape: [batch_size, num_patches, embedding_dim * 2].
+        x_projected = self.channel_projection1(x)
+        # Apply the spatial gating unit. x_spatial shape: [batch_size, num_patches, embedding_dim].
+        x_spatial = self.spatial_gating_unit(x_projected)
+        # Apply the second channel projection. x_projected shape: [batch_size, num_patches, embedding_dim].
+        x_projected = self.channel_projection2(x_spatial)
+        # Add skip connection.
+        return x + x_projected
+
+gmlp_blocks = keras.Sequential(
+    [gMLPLayer(num_patches, embedding_dim, dropout_rate) for _ in range(num_blocks)]
+)
+learning_rate = 3e-3
+gmlp_classifier = build_classifier(gmlp_blocks)
+
+history = run_experiment(gmlp_classifier)

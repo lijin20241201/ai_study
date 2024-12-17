@@ -1,0 +1,333 @@
+import collections# 集合模块
+import re# 正则模块
+import unicodedata#判断字符类别模块
+import six#判断版本
+import tensorflow as tf
+# 用于检查传入的参数do_lower_case和真正的模型是否一致
+# do_lower_case: 一个布尔值，表示是否将文本转换为小写
+# init_checkpoint: 初始化检查点的路径。检查点通常包含模型在训练过程中的状态，用于后续的训练或推理
+def validate_case_matches_checkpoint(do_lower_case, init_checkpoint):
+  if not init_checkpoint:# 如果检查点为空,直接返回
+    return
+#使用正则表达式从init_checkpoint中提取模型名称。
+  m = re.match("^.*?([A-Za-z0-9_-]+)/bert_model.ckpt", init_checkpoint)
+  if m is None:# 如果没提取到,返回
+    return
+  model_name = m.group(1)#从正则匹配中获取值
+    # 定义两个列表 lower_models 和 cased_models，
+    # 分别包含小写和保留原始大小写的模型名称。
+  lower_models = [
+      "uncased_L-24_H-1024_A-16", "uncased_L-12_H-768_A-12",
+      "multilingual_L-12_H-768_A-12", "chinese_L-12_H-768_A-12"
+  ]
+
+  cased_models = [
+      "cased_L-12_H-768_A-12", "cased_L-24_H-1024_A-16",
+      "multi_cased_L-12_H-768_A-12"
+  ]
+  is_bad_config = False
+    #以下两个都是配置和传参不一致
+    # 如果模型名称在小写模型列表中，但 do_lower_case 为 False，
+    # 则配置错误，因为这意味着模型预期输入为小写文本，但实际上并未这样做。
+  if model_name in lower_models and not do_lower_case:
+    is_bad_config = True
+    actual_flag = "False"
+    case_name = "lowercased"
+    opposite_flag = "True"
+    # 如果模型名称在保留原始大小写的模型列表中，但 do_lower_case 为 True，
+    # 则配置同样错误，因为这意味着模型预期输入保留原始大小写，但实际上输入文本被转换为了小写
+  if model_name in cased_models and do_lower_case:
+    is_bad_config = True
+    actual_flag = "True"
+    case_name = "cased"
+    opposite_flag = "False"
+    # 如果发现配置错误，则抛出一个 ValueError，说明问题所在，并建议如何修复。
+  if is_bad_config:
+    raise ValueError(
+        "传参和模型不一致!"
+        )
+# 将传入的文本转换为utf8 格式
+def convert_to_unicode(text):
+  if six.PY3:
+    if isinstance(text, str):# 如果本身是字符串实例对象,不做处理
+      return text
+    elif isinstance(text, bytes):# 如果是字节实例
+      return text.decode("utf-8", "ignore")# utf8解码后返回
+    else:#否则抛出错误
+      raise ValueError("不支持的数据类型: %s" % (type(text)))
+  elif six.PY2:# 以下都是python2的检验,python3可以不用看
+    if isinstance(text, str):
+      return text.decode("utf-8", "ignore")
+    elif isinstance(text, unicode):
+      return text
+    else:
+      raise ValueError("不支持的字符串类型!: %s" % (type(text)))
+  else:
+    raise ValueError("难道你没运行在python上?")
+# 这和上面的处理一模一样,整合到一起都行
+def printable_text(text):
+  if six.PY3:
+    if isinstance(text, str):
+      return text
+    elif isinstance(text, bytes):
+      return text.decode("utf-8", "ignore")
+    else:
+      raise ValueError("不支持的数据类型: %s" % (type(text)))
+  elif six.PY2:
+    if isinstance(text, str):
+      return text
+    elif isinstance(text, unicode):
+      return text.encode("utf-8")
+    else:
+      raise ValueError("不支持的字符串类型!: %s" % (type(text)))
+  else:
+    raise ValueError("难道你没运行在python上?")
+#构建词汇字典
+#用于从一个词汇表文件中加载词汇，并将其存储为一个有序字典
+def load_vocab(vocab_file):
+  #创建了一个有序字典vocab。有序字典是Python中的一个特殊字典类型
+  vocab = collections.OrderedDict()
+  index = 0# 初始化索引
+  with open(vocab_file, "r",encoding='utf8') as reader:
+    while True:
+      token = convert_to_unicode(reader.readline())# 默认一个词汇一行
+      if not token:# 读完就退出
+        break
+      token = token.strip()# 去掉前后可能存在的空白字符
+      vocab[token] = index# 建立单词和索引间的映射
+      index += 1#索引递增
+  return vocab
+dic1=load_vocab('bert-base-chinese/vocab.txt')
+# 21128个单词
+print(len(dic1),dic1)
+# 获取指定的真实词汇映射的索引,并返回索引列表
+def convert_by_vocab(vocab, items):
+  output = []#初始化一个列表
+  for item in items:#遍历原数据或目标词汇集中的每个词汇
+    output.append(vocab[item])# 把对应索引添加进列表
+  return output# 返回索引列表
+# 啥也没做,就是直接调用上面的方法处理tokens(真实的词汇)
+def convert_tokens_to_ids(vocab, tokens):
+  return convert_by_vocab(vocab, tokens)
+# 这是根据索引获取真实文本内容,从键值互换的字典里获取
+def convert_ids_to_tokens(inv_vocab, ids):
+  return convert_by_vocab(inv_vocab, ids)
+#获取文本分词的列表形式,以空格为分割符
+def whitespace_tokenize(text):
+  text = text.strip()# 文本去前后空格
+  if not text:# 如果没字符
+    return []
+  tokens = text.split()#以空格分词
+  return tokens #返回列表
+#判断词汇是不是空白字符的方法
+def _is_whitespace(char):
+    # 这里把空格,制表符,换行符,回车符都当成空白字符
+  if char == " " or char == "\t" or char == "\n" or char == "\r":
+    return True
+    # 获取字符的类别,字符类别是ZS,也当成空白符
+  cat = unicodedata.category(char)
+  if cat == "Zs":
+    return True
+  return False
+# 判断控制符
+def _is_control(char):
+    #注意:制表符,换行,回车不是控制符
+  if char == "\t" or char == "\n" or char == "\r":
+    return False
+  cat = unicodedata.category(char)# 获取字符类别
+  if cat in ("Cc", "Cf"): #如果字符类别是CC,Cf,这些是控制符
+    return True
+  return False
+# 检查一个字符是否是标点符号
+def _is_punctuation(char):
+  cp = ord(char)# 获取字符对应的unicode码,+-*/也是标点符号
+  if ((cp >= 33 and cp <= 47) or (cp >= 58 and cp <= 64) or
+      (cp >= 91 and cp <= 96) or (cp >= 123 and cp <= 126)):
+    return True
+  cat = unicodedata.category(char)
+  if cat.startswith("P"):
+    return True
+  return False
+# 执行基本的文本分词操作
+class BasicTokenizer(object):
+    # 默认转小写
+    def __init__(self, do_lower_case=True):
+        self.do_lower_case = do_lower_case
+    def tokenize(self, text):
+        text = convert_to_unicode(text)# 将输入的文本转换为Unicode格式
+        text = self._clean_text(text)# 清洗后的文本,文本中只有单词,标点符号和空格符,但还是字符串文本
+        text = self._tokenize_chinese_chars(text) #处理中文字符后的文本,中文字符前后加空格
+        #上面的处理是为了这个,字符串转列表,空格符分割
+        orig_tokens = whitespace_tokenize(text)# 获取源分词列表
+        split_tokens = []
+        for token in orig_tokens:# 遍历所有分词后词汇
+            if self.do_lower_case:# 如果要转小写
+                token = token.lower()# 转小写
+                token = self._run_strip_accents(token)# 也就是说转小写才过滤重音符
+            split_tokens.extend(self._run_split_on_punc(token))#追加列表形式的词汇,
+        output_tokens = whitespace_tokenize(" ".join(split_tokens))#
+        return output_tokens# 列表形式的词汇
+    # 过滤掉重音符
+    # 它接受一个text参数,返回一个新的字符串,删除了原始文本中的所有重音符号 
+    def _run_strip_accents(self, text):#这时的text是一个个的分词
+        # 这行代码使用 unicodedata.normalize 函数将输入的
+        # text字符串标准化为分解形式（NFD）。在 NFD 形式中，
+        #复合字符（如带有重音符号的字符）被分解为基本字符和重音符号  
+        text = unicodedata.normalize("NFD", text)
+        output = []
+        #遍历分词中的每个字符
+        for char in text:
+            #获取字符类别
+            cat = unicodedata.category(char)
+            if cat == "Mn":# 如果是重音符
+                continue# 跳过
+            output.append(char)#
+        return "".join(output)
+    #这个方法区分开了中文字符,标点符号,英文单词,但是遇到数字和单词连起来的情况却没处理
+    # 这个方法的作用是把标点符号单独拎出来,把连续数字,英文单词拎出来,以便之后形成列表
+    def _run_split_on_punc(self, text):#这时的文本,要么是中文字符,要么是其他字符连起来
+        chars = list(text)# 输入的字符串text转换为一个字符列表chars
+        i = 0# 索引初始化
+        start_new_word = True #这时候的分词,中文因为前后有空格,是早被拎出来了
+        # 英文数字,标点符号还没处理
+        output = []
+        while i < len(chars):# 遍历字符列表中的每个字符
+            char = chars[i]# 获取第i个字符
+            if _is_punctuation(char):# 如果是标点符号
+                output.append([char])# 添加标点符号,把标点符号当成单独的词(列表)
+                start_new_word = True # 这里主要是改状态,不然start_new_word会一直False
+            else: # 如果不是标点符号
+                if start_new_word:# 如果是新词
+                    output.append([])# 则向output添加一个空列表,表示开始一个新的子字符串
+                start_new_word = False#已经给新词分配空间了,标记可以为关
+                output[-1].append(char) # 在之前的空列表里添加字符
+            i += 1 #i++
+        return ["".join(x) for x in output]
+    #定义处理中文字符的方法,前后加空格
+    def _tokenize_chinese_chars(self, text):
+        output = []
+        for char in text:
+          cp = ord(char)# 获取字符对应的字符码点
+            # 如果是中文字符,在字符前后加空格
+          if self._is_chinese_char(cp):
+            output.append(" ")
+            output.append(char)
+            output.append(" ")
+          else:# 不是的话,直接加
+            output.append(char)
+        return "".join(output)# 连成字符串
+    # 判断是否是中文字符的方法
+    def _is_chinese_char(self, cp):
+        # 16进制
+        if ((cp >= 0x4E00 and cp <= 0x9FFF) or  #
+            (cp >= 0x3400 and cp <= 0x4DBF) or  #
+            (cp >= 0x20000 and cp <= 0x2A6DF) or  #
+            (cp >= 0x2A700 and cp <= 0x2B73F) or  #
+            (cp >= 0x2B740 and cp <= 0x2B81F) or  #
+            (cp >= 0x2B820 and cp <= 0x2CEAF) or
+            (cp >= 0xF900 and cp <= 0xFAFF) or  #
+            (cp >= 0x2F800 and cp <= 0x2FA1F)):  #
+            return True
+        return False
+    #去除文本中的空字符,替换符,或者控制符,替换文本中的回车,
+    #换行,制表符,空格符为空格符,这样文本中只有单词,标点符号和空格符,返回字符串文本
+    def _clean_text(self, text):
+        output = []# 用于存储清理后的词汇
+        for char in text:# 遍历文本中的每个单词
+            cp = ord(char)# 获取单词的Unicode编码
+            # 检查字符的编码是否为0（空字符）,0xFFFD（Unicode替换字符)
+            #或者控制符,跳出本次循环,接着遍历
+            if cp == 0 or cp == 0xfffd or _is_control(char):
+                continue #跳出当前循环
+            if _is_whitespace(char):#如果是空白字符
+                output.append(" ")# 统一当做空格符
+            else:# 
+                output.append(char)
+        return output
+        return "".join(output)
+# 基于词汇表的分词,处理未登录词(词汇表中没的)和罕见词
+class WordpieceTokenizer(object):
+  def __init__(self, vocab, unk_token="[UNK]", max_input_chars_per_word=200):
+    self.vocab = vocab# 词汇表，一个包含所有有效子词的集合
+    self.unk_token = unk_token #用于标记未知词汇的特殊标记,默认为 "[UNK]"。
+    #定义每个单词的最大输入字符
+    self.max_input_chars_per_word = max_input_chars_per_word
+  def tokenize(self, text):#定义分词方法
+    text = convert_to_unicode(text)# 先转成unicode编码
+    output_tokens = []# 用于存储分词后的结果
+    #遍历词汇列表,whitespace_tokenize,基于空格分割成词汇列表
+    for token in whitespace_tokenize(text):
+        chars = list(token)#把词汇转换成字符列表,看分割后几个字符
+        if len(chars) > self.max_input_chars_per_word:#如果单词字符长度大于给定长度
+            output_tokens.append(self.unk_token)#那这个单词就被贴上unk,之后加进列表的是[UNK]
+            continue# 处理过的,就跳出去继续
+        is_bad = False # 是否是UNK的状态flag
+        start = 0 #初始化
+        sub_tokens = [] #用来存储token或者它的一部分
+        while start < len(chars): #遍历当前分词,start开始等于0
+            end = len(chars) # 分词字符长度
+            cur_substr = None #当前子串
+            while start < end: # 在内循环时,end是在变动的,和上面的len(chars)不一样
+              #这里得理解很关键,比如vocab里如果没我们这个词汇,只有我,##们这样的词汇
+              # 但是我们的token却刚好是我们,第一次进来后substr是我们
+              substr = "".join(chars[start:end])
+              if start > 0: #如果是第一次进来,start只会是0,不会大于0
+                  substr = "##" + substr #start>0,最少是1,那就在前面加##,
+                  # 加了这个是表示是当前token的一部分
+              if substr in self.vocab: #如果是第一次进来,substr='我们'
+                  cur_substr = substr #如果可以在词汇表里找到分词,设置当前子串为substr
+                  break #退出内层循环
+              # 如果没在词汇表找到分词或者分词的子串,减小子串范围
+              end -= 1 
+              # 每次如果找不到end都会减1,直到减到start,目前还在内循环,start也是在变动的
+            # 如果找到,就会退出内循环,接着会让外层的start跳过找到的这部分分词,继续找分词的后面的部分
+            if cur_substr is None: # 如果cur_substr是None,证明没找到这部分分词,就设置成UNK
+                is_bad = True
+                break #退出外循环
+            sub_tokens.append(cur_substr)# 能到这的,cur_substr肯定有值,就在sub_tokens里加进cur_substr
+            start = end # 跳过找到的部分分词的最大索引
+        if is_bad: #如果是UNK(包括整个分词,没一部分在词汇里能找到和,即便有一些找到了,但有一个找不到,也是UNK)
+            output_tokens.append(self.unk_token)
+        else:#如果is_bad是False的话,就追加进去sub_tokens,注意这里不是cur_substr
+            output_tokens.extend(sub_tokens)
+    return output_tokens
+#这里很绕,用个小例子验证下推理
+#因为分词是基于空格分的,所以text里我故意加了空格,可以知道len('我们是')
+#是3个字符,当进入外循环,在内循环,它会先找我们是,找不到,找我们,还找不到
+#找我,找到了,设置start=end,end起始是3,被减了两次,这时是1,之后进入外循环
+#又进入内循环,找们是,先找们是,会加上##,没在词汇里,end-1,继续,找们,找到了
+#退出,这时end=2,之后进外循环,start=2,之后找是,因为start>0,会加##,没找到
+#所以is_bad设为True,结果就是UNK,##说明是分词的一部分
+vocab = ["我", "是", "学生", "##们", "学习", "英语", "很好"]
+text = "我们是 学习 英语 很好"
+tokenizer = WordpieceTokenizer(vocab)  
+tokens = tokenizer.tokenize(text)  
+print(tokens)
+len('我们是')
+#总分词类
+class FullTokenizer(object):
+     #词汇文件
+  def __init__(self, vocab_file, do_lower_case=True):
+    self.vocab = load_vocab(vocab_file) #词汇字典
+    #翻转字典,键值对互换
+    self.inv_vocab = {v: k for k, v in self.vocab.items()}
+      #进行一些基本的分词
+    self.basic_tokenizer = BasicTokenizer(do_lower_case=do_lower_case)
+      #更细粒度的分词类实例
+    self.wordpiece_tokenizer = WordpieceTokenizer(vocab=self.vocab)
+  def tokenize(self, text):
+    split_tokens = []
+      #基本分词,主要是把真实的文本去掉一些控制符,空字符,把一些空白字符统一变成空格符
+    for token in self.basic_tokenizer.tokenize(text):
+        #经过上面的处理,分词基本是英文单词,中文汉字,还有标点符号
+        # 这里进行更细的分词,词汇表有的直接进列表,没的看它能不能分成几部分,
+        #能,加进去,如果有一部分不能在词汇表找到,就设置为UNK
+      for sub_token in self.wordpiece_tokenizer.tokenize(token):
+        split_tokens.append(sub_token)
+    return split_tokens
+    # 文本转索引序列
+  def convert_tokens_to_ids(self, tokens):
+    return convert_by_vocab(self.vocab, tokens)
+    #索引转文本
+  def convert_ids_to_tokens(self, ids):
+    return convert_by_vocab(self.inv_vocab, ids)

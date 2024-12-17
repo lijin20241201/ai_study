@@ -1,0 +1,156 @@
+import tensorflow as tf
+ 设置GPU设备
+gpus = tf.config.experimental.list_physical_devices('GPU')
+try:
+    if gpus:
+        tf.config.experimental.set_visible_devices(gpus[0], 'GPU')
+        tf.config.experimental.set_memory_growth(gpus[0], True)
+        print("GPU set successfully!")
+except Exception as e:
+    print(e)
+import keras
+from keras.datasets import imdb
+import numpy as np
+# 首先要知道imdb是什么数据,它是25000个影评,每个影评单词数不一样,他们内部有评断标准
+# 哪个影评是正影评,哪个影评是负影评,我们得到的就是每个影评和他们对应的标签,或正或负
+# imdb内部有一个字典,这个字典是单词数字的映射,数字越小,证明这个单词越常用
+# 就是在文章中出现频率最高,他们的字典是1-88584这么多单词,我们设置1万,就是只给
+# 1万个最常用单词映射,超出1万的,oov_char=2,都会被映射成2,start_char=1是某个影评的起始位置
+ #index_from=3,这样1,2都有映射的东西了,3之后才是真正的单词,imdb属于二分类
+(train_data,train_label),(test_data,test_label)=imdb.load_data(num_words=10000)
+print(train_data.shape,train_label.shape,test_label.shape,np.unique(train_label))
+# 这个是下面的最大数对应的是哪个影评样本(索引)
+# np.argmax([max(d) for d in train_data])
+#从单个影评里取单词映射的最大数,之后再求这些数的最大数
+#整的就是求的所有影评的单词映射的最大数
+np.max([max(d) for d in train_data])
+# imdb自己编的字典,收集的是最常用的88584个单词
+word_ind=imdb.get_word_index()
+#数字做键,单词做值
+# rwindex=dict([(val,key) for (key,val) in word_ind.items()])
+rwindex={val:key for (key,val) in word_ind.items()}
+#获取数字映射的单词,1,2已经有默认映射了,1代表某个影评的起始位,2表示这个单词不在1万个常用字里
+# 他们内部的字典就是从1开始映射的,11表示this,train_data[0][:10],可以看出影评数据是14表示this
+# 肯定要-3,不然全映射错了,'?',没有就返回?,比如1-3=-2找不到就返回默认?,
+# 但是可能你选最常用的5万字,它就能映射到,不在1万个常用字内的都用2表示,比方说train_data[0][0],
+# 表示的是这个影评的起始光标位,-3之后,不能从字典里get到,就是?
+drview=' '.join([rwindex.get(i-3,'?') for i in train_data[0][:10]])
+display(rwindex,drview)
+display(min(word_ind.values()),max(word_ind.values()))
+# 这个就是按单词映射的数字排序了
+sorted(word_ind.items(),key=lambda x:x[1])
+# seqs是训练数据,这个数据虽然是1维ndarray,但里面的元素是list
+# dimension=10000,这个是常用的10000字
+def vect_sequences(seqs,dimension=10000):--相当于对影评做了one-hot编码
+    #先开一个(25000,10000)的矩阵,里面元素都是0
+    res=np.zeros(shape=(len(seqs),dimension))
+#     print(enumerate(seqs))
+    #遍历所有影评
+    # enumerate(seqs)是形如(0,某个影评对应的单词列表)这样的形式
+    # 可以理解成索引从0-24999的所有影评,遍历得到的是某个影评
+    for i,seq in enumerate(seqs):
+#         print(len(seq),[rwindex.get(i) for i in seq])
+#         print(i,seq)
+        # 这个会把影评有对应单词的那个设为1,做的事是
+        # 看某一篇影评,单词映射数字,为1的地方证明影评里有这个单词
+        # 相当于花式索引,i是变动的,但每次迭代都只表示一个影评
+        # 把矩阵中的一行当成一个影评,列当成这个影评的特征就对了
+        # 影评数据已经被数字化了,现在就是把对应位设为1,比如this
+        # 对应14,那有this的影评第14列就应该是1,这个有个隐藏的
+        #点,影评映射的数据,里面重复数字很多,不过重复被设为1了
+        # 只要影评中有那个数,那一列就会被设为1,没有就默认
+        # 要明白一点,影评被数据化了,一篇影评现在就是一维的列表数据
+        # 只有影评中有的数字,那一列才会被设为1,所以电脑看到那一列
+        # 有1,就知道这组数据里有这个单词,电脑里默认1True0False
+        res[i,seq]=1
+    return res
+这个大矩阵(25000x10000),行代表影评个数
+#也就是样本数,列是10000个常用单词映射的数字
+x_train=vect_sequences(train_data)
+x_test=vect_sequences(test_data)
+display(x_train.shape)
+# i就是某个影评,len(i)算的是它的单词数,max取的是所有影评的最大单词数
+# 查到索引17934的影评有2494个单词
+np.max([len(i) for i in train_data])
+np.argmax([len(i) for i in train_data])
+# display(train_data[0])
+# df=pd.DataFrame(data=x_train)
+a=np.zeros((3,5))
+display(a)
+# ndarray赋值,可以看到
+# 索引1的行里的1,2,4索引列被赋值1
+a[1,[1,2,4]]=1
+display(a)
+y_train=np.array(train_label,dtype=np.float32)
+y_test=np.array(test_label,dtype=np.float32)
+from keras import models
+from keras import layers
+model=models.Sequential()
+#input_shape输入的单个影评数据的形状,16神经元个数,relu激活函数
+model.add(layers.Dense(16,activation='relu',input_shape=(10000,)))
+model.add(layers.Dense(16,activation='relu'))
+#二分类问题,用sigmoid就行
+model.add(layers.Dense(1,activation='sigmoid'))
+model.summary()#(10000+1)*16,(16+1)*16,(16+1)*1
+from keras import optimizers
+model.compile(optimizer=optimizers.RMSprop(learning_rate=0.001),\
+              loss='binary_crossentropy',metrics=['accuracy'])
+#验证集,测试集
+yzj_x=x_train[:10000]
+csj_x=x_train[10000:]
+# 验证集标签,测试集标签
+yzj_y=y_train[:10000]
+csj_y=y_train[10000:]
+display(yzj_x.shape,csj_x.shape,yzj_y.shape,csj_y.shape)
+#validation_data验证和测试一起,验证资料是不用来估计参数的
+# 验证数据是用来衡量模型好坏的,毕竟我们是要预测未知,不是预测已知
+history=model.fit(csj_x,csj_y,epochs=20,batch_size=512,validation_data=(yzj_x,yzj_y))
+history_dict=history.history
+#训练资料的loss,正确率,验证资料的loss.正确率,
+history_dict.keys()
+np.argmin(history_dict['val_loss'])# 第四次epoch验证损失最小
+import matplotlib.pyplot as plt
+#过拟合,太想拟合训练资料,所以在拟合新资料时就有很大偏差
+xl_loss=history.history['loss']
+xl_zql=history.history['accuracy']
+yz_loss=history.history['val_loss']
+yz_zql=history.history['val_accuracy']
+epochs=range(1,1+len(xl_loss))
+plt.figure(figsize=(20,10))
+plt.rcParams['font.size']=18
+ax1=plt.subplot(121)
+ax1.plot(epochs,xl_loss,'b',label='xl_loss')
+ax1.plot(epochs,yz_loss,'bo',label='yz_loss')
+ax1.set_xlabel('epochs')
+ax1.set_ylabel('loss')
+plt.title('xl_loss, yz_loss')
+plt.legend()
+ax2=plt.subplot(122)
+ax2.plot(epochs,xl_zql,'r',label='xl_zql')
+ax2.plot(epochs,yz_zql,'ro',label='yz_zql')
+plt.title('xl_zql,yz_zql')
+plt.legend()
+plt.show()
+# 根据之前的验证loss,在第4个epoch时,val_loss最小,所以我们选
+#迭代4次,这次我们把训练数据整体做训练,同时预测测试数据
+# 注意细节,这个模型是重新造的模型,不是上面的那个模型,
+#虽然变量名一样,但引用的数据不一样
+model=models.Sequential()
+#input_shape输入的单个影评数据的形状,16神经元个数,relu激活函数
+model.add(layers.Dense(16,activation='relu',input_shape=(10000,)))
+model.add(layers.Dense(16,activation='relu'))
+#二分类问题,用sigmoid就行
+model.add(layers.Dense(1,activation='sigmoid'))
+model.compile(optimizer='rmsprop',loss='binary_crossentropy',metrics=['acc'])
+model.fit(x_train,y_train,epochs=4,batch_size=512,verbose=2)
+#评估
+results=model.evaluate(x_test,y_test)
+#预测影评的正评论的概率
+#是对测试资料整体的预估概率
+# 概率超过0.5,会贴上1的标签,小于0.5贴上0的标签
+model.predict(x_test)
+import copy
+test_copy=y_test.copy()
+#随机瞎蒙
+np.random.shuffle(test_copy)
+float(np.sum(np.array(y_test)==np.array(test_copy)))/len(y_test)

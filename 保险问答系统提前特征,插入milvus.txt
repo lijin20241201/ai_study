@@ -1,0 +1,373 @@
+import os
+import sys
+from tqdm import tqdm
+import numpy as np
+from scipy.special import softmax
+
+import paddle
+from paddle import inference
+from paddlenlp.transformers import AutoTokenizer
+from paddlenlp.data import Stack, Tuple, Pad
+from paddlenlp.utils.log import logger
+
+import paddle.nn as nn
+
+class SimCSE(nn.Layer):
+    def __init__(self,
+                 pretrained_model,
+                 dropout=None,
+                 margin=0.0,
+                 scale=20,
+                 output_emb_size=None):
+        super().__init__()
+        self.ptm = pretrained_model
+        self.dropout = nn.Dropout(dropout if dropout is not None else 0.1)
+        self.output_emb_size = output_emb_size
+        if output_emb_size > 0:
+            weight_attr = paddle.ParamAttr(
+                initializer=paddle.nn.initializer.TruncatedNormal(std=0.02))
+            self.emb_reduce_linear = paddle.nn.Linear(768,
+                                                      output_emb_size,
+                                                      weight_attr=weight_attr)
+
+        self.margin = margin
+        self.sacle = scale
+        self.classifier = nn.Linear(output_emb_size, 2)
+        self.rdrop_loss = paddlenlp.losses.RDropLoss()
+
+    @paddle.jit.to_static(input_spec=[
+        paddle.static.InputSpec(shape=[None, None], dtype='int64'),
+        paddle.static.InputSpec(shape=[None, None], dtype='int64')
+    ])
+    def get_pooled_embedding(self,
+                             input_ids,
+                             token_type_ids=None,
+                             position_ids=None,
+                             attention_mask=None,
+                             with_pooler=True):
+        sequence_output, cls_embedding = self.ptm(input_ids, token_type_ids,
+                                                  position_ids, attention_mask)
+
+        if with_pooler == False:
+            cls_embedding = sequence_output[:, 0, :]
+        if self.output_emb_size > 0:
+            cls_embedding = self.emb_reduce_linear(cls_embedding)
+        cls_embedding = self.dropout(cls_embedding)
+        cls_embedding = F.normalize(cls_embedding, p=2, axis=-1)
+        return cls_embedding
+    def get_semantic_embedding(self, data_loader):
+        self.eval()
+        with paddle.no_grad():
+            for batch_data in data_loader:
+                input_ids, token_type_ids = batch_data
+                text_embeddings = self.get_pooled_embedding(
+                    input_ids, token_type_ids=token_type_ids)
+                yield text_embeddings
+
+    def cosine_sim(self,
+                   query_input_ids,
+                   title_input_ids,
+                   query_token_type_ids=None,
+                   query_position_ids=None,
+                   query_attention_mask=None,
+                   title_token_type_ids=None,
+                   title_position_ids=None,
+                   title_attention_mask=None,
+                   with_pooler=True):
+
+        query_cls_embedding = self.get_pooled_embedding(query_input_ids,
+                                                        query_token_type_ids,
+                                                        query_position_ids,
+                                                        query_attention_mask,
+                                                        with_pooler=with_pooler)
+        title_cls_embedding = self.get_pooled_embedding(title_input_ids,
+                                                        title_token_type_ids,
+                                                        title_position_ids,
+                                                        title_attention_mask,
+                                                        with_pooler=with_pooler)
+        cosine_sim = paddle.sum(query_cls_embedding * title_cls_embedding,
+                                axis=-1)
+        return cosine_sim
+
+    def forward(self,
+                query_input_ids,
+                title_input_ids,
+                query_token_type_ids=None,
+                query_position_ids=None,
+                query_attention_mask=None,
+                title_token_type_ids=None,
+                title_position_ids=None,
+                title_attention_mask=None):
+        query_cls_embedding = self.get_pooled_embedding(query_input_ids,
+                                                        query_token_type_ids,
+                                                        query_position_ids,
+                                                        query_attention_mask)
+        title_cls_embedding = self.get_pooled_embedding(title_input_ids,
+                                                        title_token_type_ids,
+                                                        title_position_ids,
+                                                        title_attention_mask)
+        logits1 = self.classifier(query_cls_embedding)
+        logits2 = self.classifier(title_cls_embedding)
+        kl_loss = self.rdrop_loss(logits1, logits2)
+        cosine_sim = paddle.matmul(query_cls_embedding,
+                                   title_cls_embedding,
+                                   transpose_y=True)
+        margin_diag = paddle.full(shape=[query_cls_embedding.shape[0]],
+                                  fill_value=self.margin,
+                                  dtype=paddle.get_default_dtype())
+        cosine_sim = cosine_sim - paddle.diag(margin_diag)
+        cosine_sim *= self.sacle
+        labels = paddle.arange(0, query_cls_embedding.shape[0], dtype='int64')
+        labels = paddle.reshape(labels, shape=[-1, 1])
+        loss = F.cross_entropy(input=cosine_sim, label=labels)
+        return loss, kl_loss
+
+def convert_example(example,
+                    tokenizer,
+                    max_seq_length=512,
+                    pad_to_max_seq_len=False):
+    result = []
+    for key, text in example.items():
+        encoded_inputs = tokenizer(text=text,
+                                   max_seq_len=max_seq_length,
+                                   pad_to_max_seq_len=pad_to_max_seq_len)
+        input_ids = encoded_inputs["input_ids"]
+        token_type_ids = encoded_inputs["token_type_ids"]
+        result += [input_ids, token_type_ids]
+    return result
+
+model_dir='./output/bxqa/'
+corpus_file='./datasets/bxqa/corpus.csv'
+max_seq_length=64
+batch_size=32
+device='gpu'
+
+class Predictor(object):
+    def __init__(self,
+                 model_dir,
+                 device="gpu",
+                 max_seq_length=128,
+                 batch_size=32,
+                 use_tensorrt=False,
+                 precision="fp32",
+                 cpu_threads=10,
+                 enable_mkldnn=False):
+        self.max_seq_length = max_seq_length
+        self.batch_size = batch_size
+        model_file = model_dir + "inference.get_pooled_embedding.pdmodel"
+        params_file = model_dir + "inference.get_pooled_embedding.pdiparams"
+        if not os.path.exists(model_file):
+            raise ValueError("not find model file path {}".format(model_file))
+        if not os.path.exists(params_file):
+            raise ValueError("not find params file path {}".format(params_file))
+        config = paddle.inference.Config(model_file, params_file)
+        if device == "gpu":
+            config.enable_use_gpu(100, 0)
+            precision_map = {
+                "fp16": inference.PrecisionType.Half,
+                "fp32": inference.PrecisionType.Float32,
+                "int8": inference.PrecisionType.Int8
+            }
+            precision_mode = precision_map[precision]
+            if  use_tensorrt:
+                config.enable_tensorrt_engine(max_batch_size=batch_size,
+                                              min_subgraph_size=30,
+                                              precision_mode=precision_mode)
+        elif device == "cpu":
+            config.disable_gpu()
+            if args.enable_mkldnn:
+                # cache 10 different shapes for mkldnn to avoid memory leak
+                config.set_mkldnn_cache_capacity(10)
+                config.enable_mkldnn()
+            config.set_cpu_math_library_num_threads(args.cpu_threads)
+        elif device == "xpu":
+            config.enable_xpu(100)
+        config.switch_use_feed_fetch_ops(False)
+        self.predictor = paddle.inference.create_predictor(config)
+        self.input_handles = [
+            self.predictor.get_input_handle(name)
+            for name in self.predictor.get_input_names()
+        ]
+        self.output_handle = self.predictor.get_output_handle(
+            self.predictor.get_output_names()[0])
+
+    def predict(self, data, tokenizer):
+        batchify_fn = lambda samples, fn=Tuple(
+            Pad(axis=0, pad_val=tokenizer.pad_token_id, dtype='int64'),  # input
+            Pad(axis=0, pad_val=tokenizer.pad_token_id, dtype='int64'
+                ),  # segment
+        ): fn(samples)
+        all_embeddings = []#存放所有数据
+        examples = []#用来临时存放一个批次数据
+        for idx, text in enumerate(tqdm(data)):
+            input_ids, segment_ids = convert_example(
+                text,
+                tokenizer,
+                max_seq_length=self.max_seq_length,
+                pad_to_max_seq_len=True)
+            examples.append((input_ids, segment_ids))
+            if (len(examples) >= self.batch_size):#够一个批次就做下面的事
+                input_ids, segment_ids = batchify_fn(examples)
+                self.input_handles[0].copy_from_cpu(input_ids)
+                self.input_handles[1].copy_from_cpu(segment_ids)
+                self.predictor.run()
+                logits = self.output_handle.copy_to_cpu()
+                all_embeddings.append(logits)
+                examples = []
+        if (len(examples) > 0):#处理最后一个批次数据
+            input_ids, segment_ids = batchify_fn(examples)
+            self.input_handles[0].copy_from_cpu(input_ids)
+            self.input_handles[1].copy_from_cpu(segment_ids)
+            self.predictor.run()
+            logits = self.output_handle.copy_to_cpu()
+            all_embeddings.append(logits)
+        all_embeddings = np.concatenate(all_embeddings, axis=0)
+        np.save('bxqa_corpus_embedding', all_embeddings)
+
+def read_text(file_path):
+    file = open(file_path)
+    id2corpus = {}
+    for idx, data in enumerate(file.readlines()):
+        id2corpus[idx] = data.strip()
+    return id2corpus
+
+predictor = Predictor(model_dir, device, max_seq_length,
+                  batch_size)
+
+tokenizer = AutoTokenizer.from_pretrained('ernie-3.0-medium-zh')
+
+ id2corpus = read_text(corpus_file)
+
+corpus_list = [{idx: text} for idx, text in id2corpus.items()]
+
+predictor.predict(corpus_list, tokenizer)
+
+from pymilvus import *
+
+import pymilvus
+
+MILVUS_HOST = '127.0.0.1'
+MILVUS_PORT =19530
+data_dim = 256
+top_k = 10
+collection_name = 'bxqa'
+partition_tag = 'partition_1'
+embedding_name = 'embeddings'
+index_config = {
+    "index_type": "IVF_FLAT",
+    "metric_type": "L2",
+    "params": {
+        "nlist": 500
+    },
+}
+search_params = {
+    "metric_type": "L2",
+    "params": {
+        "nprobe": 20
+    },
+}
+
+fmt = "\n=== {:30} ===\n"
+text_max_len = 1000
+fields = [
+    FieldSchema(name="pk",
+                dtype=DataType.INT64,
+                is_primary=True,
+                auto_id=False,
+                max_length=100),
+    FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=text_max_len),
+    FieldSchema(name="embeddings", dtype=DataType.FLOAT_VECTOR, dim=data_dim)
+]
+schema = CollectionSchema(fields, "bxqa Index")
+class VecToMilvus():
+    def __init__(self):
+        print(fmt.format("start connecting to Milvus"))
+        connections.connect("default", host=MILVUS_HOST, port=MILVUS_PORT)
+        self.collection = None
+    def has_collection(self, collection_name):
+        try:
+            has = utility.has_collection(collection_name)
+            print(f"Does collection {collection_name} exist in Milvus: {has}")
+            return has
+        except Exception as e:
+            print("Milvus has_table error:", e)
+    def creat_collection(self, collection_name):
+        try:
+            print(fmt.format("Create collection {}".format(collection_name)))
+            self.collection = Collection(collection_name,
+                                         schema,
+                                         consistency_level="Strong")
+        except Exception as e:
+            print("Milvus create collection error:", e)
+    def drop_collection(self, collection_name):
+        try:
+            utility.drop_collection(collection_name)
+        except Exception as e:
+            print("Milvus delete collection error:", e)
+    def create_index(self, index_name):
+        try:
+            print(fmt.format("Start Creating index"))
+            self.collection.create_index(index_name, index_config)
+            print(fmt.format("Start loading"))
+            self.collection.load()
+        except Exception as e:
+            print("Milvus create index error:", e)
+    def has_partition(self, partition_tag):
+        try:
+            result = self.collection.has_partition(partition_tag)
+            return result
+        except Exception as e:
+            print("Milvus has partition error: ", e)
+    def create_partition(self, partition_tag):
+        try:
+            self.collection.create_partition(partition_tag)
+            print('create partition {} successfully'.format(partition_tag))
+        except Exception as e:
+            print('Milvus create partition error: ', e)
+    def insert(self, entities, collection_name, index_name, partition_tag=None):
+        try:
+            if not self.has_collection(collection_name):#没有集合就创建
+                self.creat_collection(collection_name)
+                self.create_index(index_name)
+            else:
+                self.collection = Collection(collection_name)
+            if (partition_tag #没有分区就创建
+                    is not None) and (not self.has_partition(partition_tag)):
+                self.create_partition(partition_tag)
+            self.collection.insert(entities, partition_name=partition_tag)
+            print(
+                f"Number of entities in Milvus: {self.collection.num_entities}"
+            )  # check the num_entites
+        except Exception as e:
+            print("Milvus insert error:", e)
+
+embeddings = np.load('bxqa_corpus_embedding.npy')
+
+embedding_ids = [i for i in range(embeddings.shape[0])]
+
+client = VecToMilvus()
+
+collection_name = 'faq_finance'
+
+client.has_collection(collection_name)
+
+partition_tag = 'partition_1'
+data_size = len(embedding_ids)
+
+corpus_list=[list(i.values())[0] for i in corpus_list]
+
+batch_size = 10000
+for i in tqdm(range(0, data_size, batch_size)):
+    cur_end = i + batch_size
+    if (cur_end > data_size):
+        cur_end = data_size
+    batch_emb = embeddings[np.arange(i, cur_end)]
+    entities = [
+            [j for j in range(i, cur_end, 1)],
+            [corpus_list[j][:text_max_len - 1] for j in range(i, cur_end, 1)],
+            batch_emb  # field embeddings, supports numpy.ndarray and list
+        ]
+    client.insert(collection_name=collection_name,
+                  entities=entities,
+                  index_name=embedding_name,
+                  partition_tag=partition_tag)

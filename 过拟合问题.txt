@@ -1,0 +1,182 @@
+优化(拟合已知)和泛化(预测未知)
+对抗overfitting
+1.获取更多数据
+2.循序渐进的开大网络,直到出现overfitting,不要一开始开太大
+3.L1,L2约束,但是这个有个缺点,虽然overfitting的过程变慢,但也不容易找到loss的最小值
+4.添加drop-out层,这个蛮有用的
+5.增强数据,想一下,我们给电脑的数据无非就是输入和输出,电脑要找到为何这个输入映射到了输出,比如在图片神经网络时,我们变换图片的位置,旋转,都是为了让机器学到,变换位置,旋转不是得到y的因素,换言之,这些不重要,不是被贴上标签的真正原因,这样电脑就会试图抓更重要的因素
+6.或者做特征工程
+import tensorflow as tf
+import keras
+from keras.datasets import imdb
+import numpy as np
+import matplotlib.pyplot as plt
+(train_data,train_labels),(test_data,test_labels)=imdb.load_data(num_words=10000)
+# 对影评输入数据做one-hot,告诉电脑那个影评都出现了哪些单词
+def vect_sequences(seqs,dimension=10000):
+    res=np.zeros(shape=(len(seqs),dimension))
+#     print(enumerate(seqs))
+    #遍历所有影评
+    #seq是当前遍历到的影评
+    for i,seq in enumerate(seqs):
+#         print(len(seq),[rwindex.get(i) for i in seq])
+#         print(i,seq)
+        # 影评内单词映射的数字,有就映射为1
+        res[i,seq]=1
+    return res
+x_train=vect_sequences(train_data)
+x_train=x_train.astype(np.float16)
+x_test=vect_sequences(test_data)
+x_test=x_test=x_test.astype(np.float16)
+display(x_train.shape)
+y_train=np.array(train_labels,dtype=np.float16)
+y_test=np.array(test_labels,dtype=np.float16)
+from keras import models
+from keras import layers
+from keras import optimizers
+model=models.Sequential()
+#input_shape输入的单个数据的形状,16神经元个数,relu激活函数
+model.add(layers.Dense(16,activation='relu',input_shape=(10000,)))
+model.add(layers.Dense(16,activation='relu'))
+#二分类问题,用sigmoid就行
+model.add(layers.Dense(1,activation='sigmoid'))
+model.compile(optimizer='rmsprop',loss='binary_crossentropy',metrics=['acc'])
+
+model_s=models.Sequential()
+#input_shape输入的单个数据的形状,16神经元个数,relu激活函数
+model_s.add(layers.Dense(4,activation='relu',input_shape=(10000,)))
+model_s.add(layers.Dense(4,activation='relu'))
+#二分类问题,用sigmoid就行
+model_s.add(layers.Dense(1,activation='sigmoid'))
+model_s.compile(optimizer='rmsprop',loss='binary_crossentropy',metrics=['acc'])
+ysmx_his=model.fit(x_train,y_train,epochs=20,batch_size=512,validation_data=(x_test,y_test))
+his=model_s.fit(x_train,y_train,epochs=20,batch_size=512,validation_data=(x_test,y_test))
+epochs=range(1,21)
+list(epochs)
+ys_val_loss=ysmx_his.history['val_loss']
+s_model_val_loss=his.history['val_loss']
+display(len(ys_val_loss),len(s_model_val_loss))
+
+原始神经元16的模型迭代次数低时,验证损失就达到了最小,之后过拟合,
+# 电脑过度拟合训练数据,当给他新的数据时,却找不到规律,
+# 训练数据中有些不准确的也要拟合,所以给他新数据
+#就出现偏差
+# 小的神经元4个,出现过拟合要晚些
+plt.plot(epochs,ys_val_loss,'r',label='ys_val_loss')
+plt.plot(epochs,s_model_val_loss,'b--',label='s_model_val_loss')
+plt.xlabel('chcs')
+plt.ylabel('yzss')
+plt.legend()
+plt.show()
+model_big=models.Sequential()
+#input_shape输入的单个数据的形状,16神经元个数,relu激活函数
+model_big.add(layers.Dense(512,activation='relu',input_shape=(10000,)))
+model_big.add(layers.Dense(512,activation='relu'))
+#二分类问题,用sigmoid就行
+model_big.add(layers.Dense(1,activation='sigmoid'))
+model_big.compile(optimizer='rmsprop',loss='binary_crossentropy',metrics=['acc'])
+
+big_model_his=model_big.fit(x_train,y_train,epochs=20,batch_size=512,validation_data=(x_test,y_test))
+big_model_val_loss=big_model_his.history['val_loss']
+#隐层数相同,每层神经元个数不同,每层神经元少的要很久才能到达梯度的相对低点
+#每层神经元超大的模型基本迭代一两次就能到验证的最低损失
+# 每层神经元16的会随迭代次数先找到损失最小,再过拟合
+# 训练和测试能否两者兼得,如果不能,那就只能舍弃训练,毕竟是用来预测未知的
+plt.plot(epochs,s_model_val_loss,'go',label='s_model_val_loss')
+plt.plot(epochs,ys_val_loss,'r',label='ys_val_loss')
+plt.plot(epochs,big_model_val_loss,'b--',label='big_model_val_loss')
+plt.xlabel('chcs')
+plt.ylabel('yzss')
+plt.legend()
+plt.show()
+model_dc=models.Sequential()
+#input_shape输入的单个数据的形状,16神经元个数,relu激活函数
+model_dc.add(layers.Dense(8,activation='relu',input_shape=(10000,)))
+model_dc.add(layers.Dense(8,activation='relu'))
+model_dc.add(layers.Dense(8,activation='relu'))
+#二分类问题,用sigmoid就行
+model_dc.add(layers.Dense(1,activation='sigmoid'))
+model_dc.compile(optimizer='rmsprop',loss='binary_crossentropy',metrics=['acc'])
+his_dc=model_dc.fit(x_train,y_train,epochs=20,batch_size=512,validation_data=(x_test,y_test))
+dc_model_loss=his_dc.history['val_loss']
+epochs=range(1,21)
+ys_val_loss=ysmx_his.history['val_loss']
+plt.plot(epochs,ys_val_loss,'r',label='ys_val_loss')
+plt.plot(epochs,dc_model_loss,'b--',label='dc_model_loss')
+plt.xlabel('chcs')
+plt.ylabel('yzss')
+plt.legend()
+plt.show()
+from keras import regularizers
+l2_model=models.Sequential()
+#input_shape输入的单个数据的形状,16神经元个数,relu激活函数
+l2_model.add(layers.Dense(16,activation='relu',\
+                          # L2约束
+                          kernel_regularizer=regularizers.l2(0.001),input_shape=(10000,)))
+l2_model.add(layers.Dense(16,activation='relu',kernel_regularizer=regularizers.l2(0.001)))
+#二分类问题,用sigmoid就行
+l2_model.add(layers.Dense(1,activation='sigmoid'))
+l2_model.compile(optimizer='rmsprop',loss='binary_crossentropy',metrics=['acc'])
+
+l2_his=l2_model.fit(x_train,y_train,epochs=20,batch_size=512,validation_data=(x_test,y_test))
+l1_l2_model=models.Sequential()
+#input_shape输入的单个数据的形状,16神经元个数,relu激活函数
+l1_l2_model.add(layers.Dense(16,activation='relu',kernel_regularizer=regularizers.l1_l2(l1=0.001, l2=0.001),input_shape=(10000,)))
+l1_l2_model.add(layers.Dense(16,activation='relu',kernel_regularizer=regularizers.l1_l2(l1=0.001, l2=0.001)))
+#二分类问题,用sigmoid就行
+l1_l2_model.add(layers.Dense(1,activation='sigmoid'))
+l1_l2_model.compile(optimizer='rmsprop',loss='binary_crossentropy',metrics=['acc'])
+l1l2_his=l1_l2_model.fit(x_train,y_train,epochs=20,batch_size=512,validation_data=(x_test,y_test))
+l1_model=models.Sequential()
+#input_shape输入的单个数据的形状,16神经元个数,relu激活函数
+l1_model.add(layers.Dense(16,activation='relu',kernel_regularizer=regularizers.l1(0.001),input_shape=(10000,)))
+l1_model.add(layers.Dense(16,activation='relu',kernel_regularizer=regularizers.l1(0.001)))
+#二分类问题,用sigmoid就行
+l1_model.add(layers.Dense(1,activation='sigmoid'))
+l1_model.compile(optimizer='rmsprop',loss='binary_crossentropy',metrics=['acc'])
+l1_his=l1_model.fit(x_train,y_train,epochs=20,batch_size=512,validation_data=(x_test,y_test))
+val_losses=l2_his.history['val_loss']
+np.argmin(val_losses)
+arr=np.array(val_losses)
+arr
+l1_model_loss=l1_his.history['val_loss']
+l2_model_loss=l2_his.history['val_loss']
+l1l2_model_loss=l1l2_his.history['val_loss']
+plt.figure(figsize=(9,6))
+plt.plot(epochs,ys_val_loss,'r+',label='ys_val_loss')
+plt.plot(epochs,l2_model_loss,'bo',label='l2_model_loss')
+plt.plot(epochs,l1_model_loss,'g-.',label='l1_model_loss')
+plt.plot(epochs,l1l2_model_loss,'p--',label='l1l2_model_loss')
+plt.xlabel('chcs')
+plt.ylabel('yzss')
+plt.legend()
+plt.show()
+#在训练时,
+# layer_output*=np.random.randint(0,high=2,size=layer_output.shape)
+# layer_output/=0.5
+from keras.models import Sequential  
+from keras.layers import Dense  
+
+dpt_model=models.Sequential()
+#input_shape输入的单个数据的形状,16神经元个数,relu激活函数
+dpt_model.add(layers.Dense(16,activation='relu',input_shape=(10000,)))
+dpt_model.add(layers.Dropout(0.5))
+dpt_model.add(layers.Dense(16,activation='relu'))
+dpt_model.add(layers.Dropout(0.5))
+#二分类问题,用sigmoid就行
+dpt_model.add(layers.Dense(1,activation='sigmoid'))
+dpt_model.compile(optimizer='rmsprop',loss='binary_crossentropy',metrics=['acc'])
+dpt_model_his=dpt_model.fit(x_train,y_train,epochs=20,batch_size=512,validation_data=(x_test,y_test))
+
+dpt_model_val_loss=dpt_model_his.history['val_loss']
+dpt_model_val_loss
+#索引是3,其实对应第四次迭代
+display(np.argmin(dpt_model_val_loss),np.min(dpt_model_val_loss))
+
+plt.plot(epochs,ys_val_loss,'ro',label='ys_val_loss')
+plt.plot(epochs,dpt_model_val_loss,'b+',label='dpt_model_val_loss')
+plt.xlabel('chcs')
+plt.ylabel('yzss')
+plt.legend()
+plt.show(
+

@@ -1,0 +1,459 @@
+import os
+os.environ["KERAS_BACKEND"] = "tensorflow"
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+import resource
+low, high = resource.getrlimit(resource.RLIMIT_NOFILE)
+
+resource.setrlimit(resource.RLIMIT_NOFILE, (high, high))
+
+import math
+import matplotlib.pyplot as plt
+import tensorflow as tf
+import keras
+from keras import ops
+from keras import layers
+
+gpus = tf.config.list_physical_devices('GPU')  
+if gpus:  
+    # 如果有GPU，设置GPU资源使用率  
+    try:  
+        # 允许GPU内存按需增长  
+        for gpu in gpus:  
+            tf.config.experimental.set_memory_growth(gpu, True)  
+        # 设置可见的GPU设备（这里实际上不需要，因为已经通过内存增长设置了每个GPU）  
+        # tf.config.set_visible_devices(gpus, 'GPU')  
+        print("GPU可用并已设置内存增长模式。")  
+    except RuntimeError as e:  
+        # 虚拟设备未就绪时可能无法设置GPU  
+        print(f"设置GPU时发生错误: {e}")  
+else:  
+    # 如果没有GPU  
+    print("没有检测到GPU设备。")
+
+unlabeled_dataset_size = 50000
+labeled_dataset_size = 5000
+image_channels = 3
+num_epochs = 30
+batch_size =110
+temperature = 0.1
+contrastive_augmentation = {"min_area": 0.25, "brightness": 0.6, "jitter": 0.2}
+classification_augmentation = {
+    "min_area": 0.75,
+    "brightness": 0.3,
+    "jitter": 0.1,
+}
+
+import numpy as np
+
+root_dir='./datasets/stl10_binary'
+
+import random
+
+def read_bin_image(filename, width, height):  
+    # 打开二进制文件  
+    with open(filename, 'rb') as f:  
+        bin_data = f.read()
+        #这里读取到的是每一个通道的像素数据
+        pixels = np.frombuffer(bin_data, dtype=np.uint8)
+        # print(len(pixels))
+        # 重塑为图像的形状(n,c,w,h)-->(n,h,w,c),先reshape,是因为原来像素数据就是按那
+        #种方式摊平的,之后换一下轴转换成tensorflow形式
+        image = pixels.reshape(-1,3,width,height).transpose(0,3,2,1)  
+    return image 
+
+def read_bin_label(filename):
+    with open(filename, 'rb') as f:
+        labels=np.fromfile(f,dtype=np.uint8)
+    return labels
+
+filename=root_dir+'/train_X.bin'
+x_train=read_bin_image(filename,96,96)
+
+filename2=root_dir+'/train_y.bin'
+
+y_train=read_bin_label(filename2)
+
+y_train=y_train-1
+
+classes=[line.strip()for line in open(root_dir+'/class_names.txt').readlines()]
+
+plt.figure(figsize=(10,10))
+x_t=random.sample(range(len(x_train)),9)#随机选取9个样本图片
+for i in range(9):
+    plt.subplot(3,3,i+1)
+    plt.imshow(x_train[x_t[i]])#x_t[i]会依次获取其中的每一个索引
+    plt.axis('off')
+    # print(y_train[x_t[i]])
+    plt.title(classes[int(y_train[x_t[i]])])
+plt.show()
+
+train_dataset=tf.data.Dataset.from_tensor_slices((x_train,y_train))
+
+for i,j in train_dataset.take(1):
+    print(i.shape,j,i.numpy().max(),i.numpy().min())
+    plt.imshow(i)
+
+filename=root_dir+'/test_X.bin'
+x_test=read_bin_image(filename,96,96)
+
+filename2=root_dir+'/test_y.bin'
+y_test=read_bin_label(filename2)
+
+y_test=y_test-1
+
+plt.figure(figsize=(10,10))
+x_t_2=random.sample(range(len(x_test)),9)#随机选取9个样本图片
+for i in range(9):
+    plt.subplot(3,3,i+1)
+    plt.imshow(x_test[x_t_2[i]])#x_t[i]会依次获取其中的每一个索引
+    plt.axis('off')
+    # print(y_train[x_t[i]])
+    plt.title(classes[int(y_test[x_t_2[i]])])
+plt.show()
+
+filename=root_dir+'/unlabeled_X.bin'
+unlabed_x_train=read_bin_image(filename,96,96)
+
+plt.figure(figsize=(10,10))
+x_t_2=random.sample(range(len(unlabed_x_train)),9)#随机选取9个样本图片
+for i in range(9):
+    plt.subplot(3,3,i+1)
+    plt.imshow(unlabed_x_train[x_t_2[i]])#x_t[i]会依次获取其中的每一个索引
+    plt.axis('off')
+plt.show()
+
+steps_per_epoch = (unlabeled_dataset_size + labeled_dataset_size) // batch_size
+
+unlabeled_batch_size = unlabeled_dataset_size // steps_per_epoch
+labeled_batch_size = labeled_dataset_size // steps_per_epoch
+
+labeled_train_dataset = (
+        train_dataset
+        .shuffle(buffer_size=10 *labeled_batch_size)
+        .batch(labeled_batch_size)
+    )
+
+test_dataset = (
+    tf.data.Dataset.from_tensor_slices((x_test,y_test))
+    .batch(batch_size)
+    .prefetch(buffer_size=tf.data.AUTOTUNE)
+)
+
+ unlabeled_train_dataset = (
+        tf.data.Dataset.from_tensor_slices(unlabed_x_train[:50000])
+        .shuffle(buffer_size=10 * unlabeled_batch_size)
+        .batch(unlabeled_batch_size)
+    )
+
+train_dataset = tf.data.Dataset.zip(
+        (unlabeled_train_dataset, labeled_train_dataset)
+    ).prefetch(buffer_size=tf.data.AUTOTUNE)
+
+# 用于在训练期间对图像进行随机颜色和亮度调整
+class RandomColorAffine(layers.Layer):
+    # rightness 和 jitter 是两个参数，分别用于控制亮度的调整范围和颜色抖动的大小。
+    def __init__(self, brightness=0, jitter=0, **kwargs):
+        super().__init__(**kwargs)
+        self.seed_generator = keras.random.SeedGenerator(1337)
+        self.brightness = brightness
+        self.jitter = jitter
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"brightness": self.brightness, "jitter": self.jitter})
+        return config
+
+    def call(self, images, training=True):
+        if training:
+            batch_size = ops.shape(images)[0]
+            brightness_scales = 1 + keras.random.uniform(
+                (batch_size, 1, 1, 1),
+                minval=-self.brightness,
+                maxval=self.brightness,
+                seed=self.seed_generator,
+            )
+            jitter_matrices = keras.random.uniform(
+                (batch_size, 1, 3, 3),
+                minval=-self.jitter,
+                maxval=self.jitter,
+                seed=self.seed_generator,
+            )
+            color_transforms = (
+                ops.tile(ops.expand_dims(ops.eye(3), axis=0), (batch_size, 1, 1, 1))
+                * brightness_scales
+                + jitter_matrices
+            )
+            images = ops.clip(ops.matmul(images, color_transforms), 0, 1)
+        return images
+
+# 数据增强
+def get_augmenter(min_area, brightness, jitter):
+    zoom_factor = 1.0 - math.sqrt(min_area)
+    return keras.Sequential(
+        [
+            layers.Rescaling(1 / 255),#归一化
+            layers.RandomFlip("horizontal"),#随机水平翻转
+            layers.RandomTranslation(zoom_factor / 2, zoom_factor / 2),#随机平移
+            layers.RandomZoom((-zoom_factor, 0.0), (-zoom_factor, 0.0)),#随机缩放
+            RandomColorAffine(brightness, jitter),#随机颜色,亮度变化
+        ]
+    )
+
+def visualize_augmentations(num_images):
+    images = next(iter(labeled_train_dataset))[0][:num_images]
+    # print(images.shape)
+    augmented_images = zip(
+        images,
+        get_augmenter(**classification_augmentation)(images),
+        get_augmenter(**contrastive_augmentation)(images),
+        get_augmenter(**contrastive_augmentation)(images),
+    )
+    row_titles = [
+        "Original:",
+        "Weakly augmented:",
+        "Strongly augmented:",
+        "Strongly augmented:",
+    ]
+    plt.figure(figsize=(num_images * 2.2, 4 * 2.2), dpi=100)
+    for column, image_row in enumerate(augmented_images):
+        for row, image in enumerate(image_row):
+            plt.subplot(4, num_images, row * num_images + column + 1)
+            plt.imshow(image)
+            if column == 0:
+                plt.title(row_titles[row], loc="left")
+            plt.axis("off")
+    plt.tight_layout()# plt.tight_layout() 会尝试调整子图参数，以减小子图之间的重叠，并优化标题、标签、刻度标签等的位置。
+visualize_augmentations(num_images=8)
+
+width=128
+
+def get_encoder():
+    return keras.Sequential(
+        [
+            # layers.Input((96,96,3)),
+            layers.Conv2D(width, kernel_size=3, strides=2,padding='same', activation="relu"),
+            layers.Conv2D(width, kernel_size=3, strides=2,padding='same',activation="relu"),
+            layers.Conv2D(width, kernel_size=3, strides=2,padding='same',activation="relu"),
+            layers.Conv2D(width, kernel_size=3, strides=2,padding='same',activation="relu"),
+            layers.Flatten(),
+            layers.Dropout(0.5),
+            layers.Dense(width, activation="relu"),
+        ],
+        name="encoder",
+    )
+
+baseline_model = keras.Sequential(
+    [
+        # layers.Input((96,96,3)),
+        get_augmenter(**classification_augmentation),#数据增强层
+        get_encoder(),#编码层
+        layers.Dense(10),#输出层
+    ],
+    name="baseline_model",
+)
+
+learning_rate=2e-3
+weight_decay=1e-4
+
+baseline_model.compile(
+    optimizer=keras.optimizers.AdamW(learning_rate,weight_decay),
+    loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+    metrics=[keras.metrics.SparseCategoricalAccuracy(name="acc")],
+)
+
+from tensorflow.keras.callbacks import ReduceLROnPlateau 
+
+checkpoint_filepath='./checkpoint/simclr_best_3.keras'
+callbacks = [ keras.callbacks.ModelCheckpoint(
+    filepath=checkpoint_filepath,monitor='val_loss',\
+        verbose=1,save_best_only=True,mode='min'),
+    ReduceLROnPlateau(monitor='val_loss', factor=0.5,  
+                               patience=2, min_lr=1e-5)]
+
+baseline_history = baseline_model.fit(
+    labeled_train_dataset, epochs=num_epochs, validation_data=test_dataset,callbacks=callbacks
+)
+
+# 对比学习（Contrastive Learning）中，ContrastiveModel 代表一个用于学习数据表示（或特征）的神经网络模型
+# 这个模型通常包含两个主要部分：一个编码器（Encoder）和一个投影头（Projection Head）。编码器负责从原始数据中提取特征，
+# 而投影头将这些特征映射到一个更小的空间中，用于对比损失的计算
+class ContrastiveModel(keras.Model):
+    def __init__(self):
+        super().__init__()
+        self.temperature = temperature#
+        self.contrastive_augmenter = get_augmenter(**contrastive_augmentation)#对比学习增强层
+        self.classification_augmenter = get_augmenter(**classification_augmentation)#分类器增强层
+        self.encoder = get_encoder()#编码器层,负责提取图片特征
+        # 投影头
+        self.projection_head = keras.Sequential(
+            [
+                keras.Input(shape=(width,)),#输入特征
+                layers.Dense(width, activation="relu"),#线性转换层
+                layers.Dense(width),#
+            ],
+            name="projection_head",
+        )
+        # 线性探针（linear probe）。线性探针通常用于评估模型学习到的特征的质量.这里它被用于一个分类任务
+        self.linear_probe = keras.Sequential(
+            [layers.Input(shape=(width,)), layers.Dense(10)],
+            name="linear_probe",
+        )
+        # self.encoder.summary()
+        # self.projection_head.summary()
+        # self.linear_probe.summary()
+    #对比学习模型编译方法
+    def compile(self, contrastive_optimizer, probe_optimizer, **kwargs):
+        super().compile(**kwargs)
+
+        self.contrastive_optimizer = contrastive_optimizer#对比学习优化器
+        self.probe_optimizer = probe_optimizer#探针优化器
+
+        # 探针损失:多元交叉熵(sparse:带了这个标签自动one-hot)
+        self.probe_loss = keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+        #这行代码创建了一个 Mean 类型的 Keras 度量（metric），用于跟踪和计算对比损失（contrastive loss）的平均值
+        self.contrastive_loss_tracker = keras.metrics.Mean(name="c_loss")
+        #对比学习准确率
+        self.contrastive_accuracy = keras.metrics.SparseCategoricalAccuracy(
+            name="c_acc"
+        )
+        #探针度量:p_loss
+        self.probe_loss_tracker = keras.metrics.Mean(name="p_loss")
+        self.probe_accuracy = keras.metrics.SparseCategoricalAccuracy(name="p_acc")#探针准确率
+
+    @property
+    def metrics(self):# 它是一个由@property装饰的“getter”方法
+        return [
+            self.contrastive_loss_tracker,#c_loss
+            self.contrastive_accuracy,#c_acc
+            self.probe_loss_tracker,#p_loss
+            self.probe_accuracy,#p_acc
+        ]
+
+    def contrastive_loss(self, projections_1, projections_2):
+        #增强1,增强2特征单位化,对每个样本的 feature_dim维度的特征向量进行归一化，使其L2范数（即向量的长度或模）变为1。
+        projections_1 = tf.linalg.l2_normalize(projections_1, axis=1)
+        projections_2 = tf.linalg.l2_normalize(projections_2, axis=1)
+        # 较小的温度系数会放大相似度分数之间的差异，使得模型对正负样本对之间的细微差别更加敏感
+        #计算余弦相似度,同一个样本的不同增强的相似度最大化,不同样本之间的相似度最小化
+        similarities = (
+            ops.matmul(projections_1, ops.transpose(projections_2)) / self.temperature
+        )
+        
+        batch_size = ops.shape(projections_1)[0]#批次大小
+        contrastive_labels = ops.arange(batch_size)
+        self.contrastive_accuracy.update_state(contrastive_labels, similarities)#更新对比学习准确率
+        self.contrastive_accuracy.update_state(
+            contrastive_labels, ops.transpose(similarities)
+        )
+
+        #取的两个损失的平均值
+        loss_1_2 = keras.losses.sparse_categorical_crossentropy(
+            contrastive_labels, similarities, from_logits=True
+        )
+        loss_2_1 = keras.losses.sparse_categorical_crossentropy(
+            contrastive_labels, ops.transpose(similarities), from_logits=True
+        )
+        return (loss_1_2 + loss_2_1) / 2
+
+    def train_step(self,data):
+        # 假设 data 是一个元组，第一个元素是无标签图像，第二个元素是另一个元组，包含带标签图像和标签  
+        unlabeled_images= data[0]
+        labeled_images, labels=data[1]
+        # print(unlabeled_images.shape,labeled_images.shape)
+        #合并样本
+        images = ops.concatenate((unlabeled_images, labeled_images), axis=0)
+        #增强图片
+        augmented_images_1 = self.contrastive_augmenter(images, training=True)
+        augmented_images_2 = self.contrastive_augmenter(images, training=True)
+        with tf.GradientTape() as tape:#梯度带
+            features_1 = self.encoder(augmented_images_1, training=True)#提前图片特征
+            features_2 = self.encoder(augmented_images_2, training=True)
+            projections_1 = self.projection_head(features_1, training=True)#获取投影特征
+            projections_2 = self.projection_head(features_2, training=True)
+            #计算对比学习损失
+            contrastive_loss = self.contrastive_loss(projections_1, projections_2)
+        #计算损失对encoder的可训练参数和投影的可训练参数的梯度
+        gradients = tape.gradient(
+            contrastive_loss,
+            self.encoder.trainable_weights + self.projection_head.trainable_weights,
+        )
+        self.contrastive_optimizer.apply_gradients(#更新参数
+            zip(
+                gradients,
+                self.encoder.trainable_weights + self.projection_head.trainable_weights,
+            )
+        )
+        self.contrastive_loss_tracker.update_state(contrastive_loss)#更新对比损失状态
+
+        # 分类器增强层
+        preprocessed_images = self.classification_augmenter(
+            labeled_images, training=True
+        )
+        with tf.GradientTape() as tape:
+            # 这个training=False,不训练encoder
+            features = self.encoder(preprocessed_images, training=False)
+            class_logits = self.linear_probe(features, training=True)# 接的分类输出层
+            probe_loss = self.probe_loss(labels, class_logits)#计算损失
+        #这里是用带标签的损失来计算梯度和更新参数
+        gradients = tape.gradient(probe_loss, self.linear_probe.trainable_weights)
+        self.probe_optimizer.apply_gradients(
+            zip(gradients, self.linear_probe.trainable_weights)
+        )
+        self.probe_loss_tracker.update_state(probe_loss)
+        self.probe_accuracy.update_state(labels, class_logits)
+        return {m.name: m.result() for m in self.metrics}
+
+    def test_step(self,data):
+        labeled_images, labels = data#图片和标签
+        #分类器增强
+        preprocessed_images = self.classification_augmenter(
+            labeled_images, training=False
+        )
+        features = self.encoder(preprocessed_images, training=False)#提前特征
+        class_logits = self.linear_probe(features, training=False)#获取logits
+        probe_loss = self.probe_loss(labels, class_logits)#计算损失(带标签)
+        self.probe_loss_tracker.update_state(probe_loss)#更新探针损失
+        self.probe_accuracy.update_state(labels, class_logits)#更新探针准确率
+
+        # 在测试时只返回探针指标
+        return {m.name: m.result() for m in self.metrics[2:]}
+
+pretraining_model = ContrastiveModel()
+pretraining_model.compile(
+    contrastive_optimizer=keras.optimizers.Adam(),
+    probe_optimizer=keras.optimizers.Adam(),
+)
+
+pretraining_history = pretraining_model.fit(
+train_dataset, epochs=num_epochs, validation_data=test_dataset
+)
+# print(
+#     "Maximal validation accuracy: {:.2f}%".format(
+#         max(pretraining_history.history["val_p_acc"]) * 100
+#     )
+# )
+pretraining_model.encoder.summary()
+finetuning_model = keras.Sequential(
+    [
+        get_augmenter(**classification_augmentation),
+        pretraining_model.encoder,
+        layers.Dense(10),
+    ],
+    name="finetuning_model",
+)
+finetuning_model.compile(
+    optimizer=keras.optimizers.Adam(),
+    loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+    metrics=[keras.metrics.SparseCategoricalAccuracy(name="acc")],
+)
+
+finetuning_history = finetuning_model.fit(
+    labeled_train_dataset, epochs=num_epochs, validation_data=test_dataset
+)
+print(
+    "Maximal validation accuracy: {:.2f}%".format(
+        max(finetuning_history.history["val_acc"]) * 100
+    )
+)
+

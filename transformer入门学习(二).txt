@@ -1,0 +1,318 @@
+import torch# pytorch
+import torch.nn as nn# 模型工具包
+import torch.nn.functional as F# 函数运算工具包
+from torch.autograd import Variable# 变量处理包
+import math
+import matplotlib.pyplot as pyp
+import numpy as np
+import copy
+import math
+# embedding
+class Embedding(nn.Module):
+    def __init__(self,d_model,max_words):# 词向量维度,多少个单词或词语要做词向量
+        super(Embedding,self).__init__()#调用父类初始化方法
+        self.lut=nn.Embedding(max_words,d_model)#embedding层
+        self.d_model=d_model
+    def forward(self,x):#正向传播,(batch_size,max_len),单词别写错
+        print('x形状:{},系数:{}'.format(x.shape,math.sqrt(self.d_model)))
+        return self.lut(x)*math.sqrt(self.d_model)
+# 位置编码层
+class PositionEncoding(nn.Module):#位置编码
+    # cxl_len,一个序列中某个单元(可以是单词,词组)对应的向量维度,seq_len:序列的长度
+    def __init__(self,cxl_len,dropout,seq_len=1000):#假设词向量100维
+        super(PositionEncoding,self).__init__()
+        self.dropout=nn.Dropout(dropout)#定义dropout层,dropout,里面参数置0的比例
+        # 定义的句子(序列)到向量的映射,是序列的向量表示
+        seq_cxl_=torch.zeros(seq_len,cxl_len)# 初始化容器(200,100)
+        seq_inx=torch.arange(seq_len).unsqueeze(1)# 序列的索引化表示(200,1)
+        # ,unsqueeze(1)指在1轴增加维度
+        temp_fz=torch.exp(torch.arange(0,cxl_len,2)\
+                          *-(math.log(10000.0)/cxl_len))# 步长2,偶数列(1*50)
+        # 第一个:指锁定所有行,第二个::2指锁定所有列,不过步长是2,其实选定的是偶数列
+        # 因为选定偶数列,所以seq_cxl_[:,::2]形状是(200,50)==(200,1)*(1*50)
+        # 偶数列向量值被赋正弦值,奇数列向量值被赋余弦值
+        seq_cxl_[:,::2]=torch.sin(seq_inx*temp_fz)
+        seq_cxl_[:,1::2]=torch.cos(seq_inx*temp_fz)
+        seq_cxl_=seq_cxl_.unsqueeze(0)# 在0轴增加维度
+        # 将词向量矩阵注册成模型的buffer,不随优化器同步更新参数,注册后,在模型保存后,和模型一起加载
+        self.register_buffer('seq_cxl',seq_cxl_)
+    def forward(self,x):# x形状(batch_size,seq_len),截取列到和x形状一样
+        x=x+Variable(self.seq_cxl[:,:x.size(1)],requires_grad=False)
+        return self.dropout(x)
+def get_mask_tensor(size):# 构建掩码张量
+    mask_shape=(1,size,size)#size指的是序列长度
+    subseq_mask=np.triu(np.ones(mask_shape),k=1).astype('uint8')
+    return torch.from_numpy(1-subseq_mask)# 得到下三角矩阵
+# key,query,value代表注意力的三个输入张量,mask:掩码,dropout:Dropout对象
+def attention(key,query,value,mask=None,dropout=None):# 比如key=query=value形状(2,4,512)
+    cxl_dim=query.size(-1)# cxl_dim=512
+    # 对query和key的转置做矩阵乘法,key最后两个轴做转置,除以一个缩放因子
+    # (2,4,512)@(2,512,4)==(2,4,4),除了一个512的开方,相当于把数据变小处理
+    # 这行代码的深层次意义就是构造了一个(seq_len,seq_len)的方阵,是为了遮掩,
+    # 这样序列后边的信息才不会提前泄露,第一个词汇的向量会依次和整个序列的每一个词汇
+    # 的向量做点乘,之后放到第一个词汇的一行(一共4(保存的是相关性)个信息),之后依次类推
+    # 第二个词汇和整个序列的每个词汇做点乘,也有4个信息(保存的是第二个词汇和序列中每个词汇的相关性)
+    # 最后就形成了一个方阵.最后除的那个是常数,只是为了把数据变小(2,8,4,64)@(2,8,64,4)=(2,8,4,4)
+    scores=torch.matmul(query,key.transpose(-2,-1))/math.sqrt(cxl_dim)
+    print('scores形状:',scores.shape)
+    if mask is not None:# 如果有掩码
+        #将scores中mask值为0的部分替换成一个很小的值,1的部分不变
+        #mask形状和scores一致,mask中1的部分起了遮掩的作用
+        print('mask',mask.shape)
+        scores=scores.masked_fill(mask==0,1e-9)
+    #对scores的最后一个维度做softmax操作,求概率,scores形状(2,4,4),在其上最后一维做softmax
+    # 操作,返回形状也应该是(2,4,4),返回的是概率对应的标签
+    p_attn=nn.functional.softmax(scores,dim=-1)#(2,4,4),2表示两个样本,4*4是上面计算的结果形状
+    if dropout is not None:# 有dropout层就添加,dropout随机把p_attn中的一些值置0
+        p_attn=dropout(p_attn)
+    # 最后完成p_attn和value的乘法,和p_attn一起返回,p_attn是概率
+    return torch.matmul(p_attn,value),p_attn#(2,4,4)@(2,4,512)=(2,4,512),p_attn:(2,4,4)
+# 实现多头注意力机制的类
+class MultiHeadAttent(nn.Module):
+    # 把单个词汇向量分成几组,词维度,dropout层,进行dropout时,置0的比例
+    def __init__(self,head,cxl_dim,dropout=0.1):
+        super(MultiHeadAttent,self).__init__()# 断言词维度能被head整除
+        assert cxl_dim % head==0
+        self.d_k=cxl_dim//head# 每个头获得的深度(词向量维度//4)# 64
+        print(self.d_k)
+        self.head=head# 8
+        self.cxl_dim=cxl_dim# 512
+        # 获得线性层,一共四个,Q,K,V,和输出线性层
+        # 拷贝线性层,拷贝4个
+        self.linears=nn.ModuleList(
+            [copy.deepcopy(nn.Linear(cxl_dim,cxl_dim)) for _ in range(4)])
+        self.attn=None# 初始化注意力张量
+        self.dropout=nn.Dropout(dropout)# 初始化dropout
+        # Q,K,v是注意力机制的三个输入张量,mask掩码张量
+    def forward(self,query,key,value,mask=None):# (2,4,512)--样本数,序列长度,词维度
+        # 过滤条件:mask不是None,会被设置掩码,mask(8,4,4)
+        if mask is not None:#这样掩码是4维,(8,1,4,4)
+            mask=mask.unsqueeze(0)# 将掩码在索引0的轴进行扩充,掩码做的是掩盖序列,与样本数无关
+            # 所以取1就行
+        print('mask:',mask.shape)
+        batch_size=query.size(0)# 得到样本数
+        # 把Q,K,V和他们各自要被输入的层,像拉链一样绑定在一起        
+        zip_group=zip(self.linears,(query,key,value))
+        # 首先变形成(batch_size,seq_len,head,d_k)这样的形状(2,4,8, 64)
+        query,key,value=[model(x).view(batch_size,-1,self.head,self.d_k) \
+                         .transpose(1,2)# 之后让序列和代表几个头的轴交换,
+                         #因为在attention里做的是后两个轴交换
+                         for model,x in zip_group]
+        #(2, 8, 4, 64)
+        print('query,key,value,mask:',query.size(),key.shape,value.size(),mask.size())
+        # 把query,key,value传入注意力方法,p_attn和value的乘法,和p_attn一起返回,p_attn是概率
+        # 传入时形状是 (2, 8, 4, 64),之后q与k转置相乘,(2,8,4,64)@(2,8,64,4)=(2,8,4,4)
+        #输出时(2,8,4,4)@(2,8,4,64)=(2,8,4,64)
+        # 要明白传入的key,query,value形状是(2, 8, 4, 64),后面两个轴是(序列长度,分成组的词向量维度)
+        x,self.attn=attention(key,query,value,mask=mask,dropout=self.dropout)
+        print('x attention之后得形状',x.shape,self.attn.shape)#2, 8, 4, 64
+        # 得到每个头的结果是4维的张量,前面已经进行过1,2两个维度的转置,现在要转置回来
+        # 经过transpose方法后,必须使用contiguous方法,不然无法使用view方法   
+        # (2,4,8,64)--view(2,4,512),做了一个连接变形操作
+        x=x.transpose(1,2).contiguous().view(batch_size,-1,self.head*self.d_k)
+        print('x concanate后的形状:',x.shape,self.attn.shape)
+        #最后将x输入线性层列表的最后一个线性层进行处理,得到最终的输出
+        return self.linears[-1](x)# linear传入和传出都是512
+# 前馈全连接层
+class Qk_qlj_Layers(nn.Module):
+    # cxl_dim词嵌入维度,qlj_dim全连接层之间传递的维度
+    def __init__(self,cxl_dim,qlj_dim,dropout=0.1):
+        super(Qk_qlj_Layers,self).__init__()
+        self.cxl_dim=cxl_dim
+        self.qlj_dim=qlj_dim
+        self.w1=nn.Linear(cxl_dim,qlj_dim)
+        self.w2=nn.Linear(qlj_dim,cxl_dim)
+        self.dropout=nn.Dropout(dropout)
+        print(cxl_dim,qlj_dim,dropout)
+    def forward(self,x):
+        # x代表上一层的输出,这里用的是经过多头机制处理后的输出,
+        # 之后经过全连接1层,之后relu激活处理
+        # 之后dropout随机置0处理,最后交由全连接二层处理输出
+        # 输出形状(2,4,512),没有变化
+        return self.w2(self.dropout(F.relu(self.w1(x))))
+# 构造规范化层的类,做标准化处理的层
+class Layer_Normer(nn.Module):
+    # cxl_dim,词嵌入维度,eps:用在规范化计算的分母中,防止除0操作
+    def __init__(self,cxl_dim,eps=1e-6):
+        super(Layer_Normer,self).__init__()
+        self.cxl_dim=cxl_dim
+        self.eps=eps
+        # 初始化两个张量,用来对结果做规范化操作
+        self.a1=nn.Parameter(torch.ones(cxl_dim))
+        self.a2=nn.Parameter(torch.zeros(cxl_dim))
+    def forward(self,x):# (2,4,512)
+        # x:代表上一层网络的输出,首先对x进行最后一个维度上的求均值
+        # 操作,同时保持输入维度和输出维度一致
+        mean=x.mean(-1,keepdim=True)
+        # 接着对x进行最后一个维度上的求标准差的操作,保持输入维度和输出维度一致
+        std=x.std(-1,keepdim=True)
+        print('正要进行标准化处理........')
+        # 按照规范化公式计算并返回
+        return self.a1*(x-mean)/(std+self.eps)+self.a2
+# 构建子层连接结构的类
+class SubLayerConnection(nn.Module):
+    def __init__(self,cxl_dim,dropout=0.1):
+        super(SubLayerConnection,self).__init__()
+        # 实例化一个规范化层的类
+        self.norm=Layer_Normer(cxl_dim)
+        self.dropout=nn.Dropout(dropout)
+        self.cxl_dim=cxl_dim
+    def forward(self,x,sublayer):
+        # x:代表上一层传入的张量
+        # sublayer,该子层连接中的子层函数
+        # 首先将x标准化处理,之后送入子层函数处理,之后经过dropout处理
+        # 最后进行残差连接
+        return x+self.dropout(sublayer(self.norm(x)))
+def copy_(layer,n):
+    return [copy.deepcopy(layer) for _ in range(n)]
+# 构建编码器层的类
+class EncoderLayer(nn.Module):
+    # 词嵌入维度,多头注意力对象,前馈全连接层对象,进行dropout时的置零比例
+    def __init__(self,cxl_dim,multhead,qk_qlj,dropout=0.1):
+        super(EncoderLayer,self).__init__()
+        # 将这些参数赋值给对象,以便以后调用
+        self.cxl_dim=cxl_dim
+        self.multhead=multhead
+        self.qk_qlj=qk_qlj
+        #编码器层有两个子层连接结构,用copy_方法
+        self.sublayer_con=copy_(SubLayerConnection(cxl_dim,dropout),2)
+        print('进入EncoderLayer.....')
+    def forward(self,x,mask):
+        # x代表上一层的传人张量,mask代表掩码张量
+        # 首先让x经过第一个子层连接结构,内部包含多头自注意力机制
+        # 再让张量经过第二个子层连接结构,其中包括前馈全连接网络
+        # 调用子连接层需要传入两个参数,x,和子层函数
+        x=self.sublayer_con[0](x,lambda x:self.multhead(x,x,x,mask))
+        return self.sublayer_con[1](x,self.qk_qlj)
+# 构建编码器类,经过n个编码器层类和标准化后的输出
+class Encoder(nn.Module):
+    # layer表示编码器层类对象,N表示要几个编码器层
+    def __init__(self,layer,N):
+        super(Encoder,self).__init__()
+        # 首先使用copy函数复制N个编码器层放在self.layers中
+        self.layers=copy_(layer,N)
+        print(layer.cxl_dim)
+        # 初始化一个标准化层
+        self.norm_layer=Layer_Normer(layer.cxl_dim)
+    def forward(self,x,mask):
+        # x:代表上一层的输出张量,mask代表掩码张量
+        # 让x依次经过N个编码器层处理,之后经过标准化层处理输出
+        for layer in self.layers:
+            x=layer(x,mask)
+        return self.norm_layer(x)#别写到循环里面
+#构建解码器层类
+class Decoderlayer(nn.Module):
+    # 参数:词嵌入维度,多头自注意力机制实例对象,普通的注意力机制对象,前馈全连接层对象,
+    # dropout:随机置0的比率,普通注意力对象和自注意力的区别是q和k,v不相同,自注意力的三者全相同
+    def __init__(self,cxl_dim,self_attn,src_attn,qk_qlj,dropout):
+        super(Decoderlayer,self).__init__()
+        # 初始化类对象
+        self.cxl_dim=cxl_dim
+        self.self_attn=self_attn
+        self.src_attn=src_attn
+        self.qk_qlj=qk_qlj
+        # 按照解码器层的结构,复制3个子层连接对象
+        self.sublayer=copy_(SubLayerConnection(cxl_dim,dropout),3)
+        print('进入Decoderlayer.....',len(self.sublayer))
+        # x:代表上一层输入的张量,memory:代表编码器的语义存储张量
+        # source_mask:原数据的掩码张量,target_mask:目标数据的掩码张量
+        # 要明确的一点是,原数据用掩码和目标数据用掩码不一样,目标用掩码是防止
+        # 当前词汇和之后得信息泄露,电脑看到的只有前面的词汇,而原数据掩码,是防止
+    #电脑过度关注一些不太有用的信息
+    def forward(self,x,memory,source_mask,target_mask):
+        # 第一步让x经过第一个子层,多头自注意力的子层,采用target_mask,遮掩当前词和当前词后边的
+        x=self.sublayer[0](x,lambda x : self.self_attn(x,x,x,target_mask))
+        # 第二步,让x经历常规注意力的子层,Q!=K,K==V
+        # 采用source_mask,为了遮掩掉对结果信息无用的数据,memory之前的编码输出
+        x=self.sublayer[1](x,lambda x : self.src_attn(x,memory,memory,source_mask))
+        # 第三步,让x经历第三个子层,前馈全连接层,并返回数据
+        return self.sublayer[2](x,self.qk_qlj)
+ 构建解码器类
+class Decoder(nn.Module):
+    def __init__(self,decoder_layer,N):
+        # layer:代表解码器层对象,N:指要拷贝多少个
+        super(Decoder,self).__init__()
+        self.layers=copy_(decoder_layer,N)
+        print('layers:',len(self.layers))
+        # 初始化一个标准化层
+        self.norm_layer=Layer_Normer(decoder_layer.cxl_dim)
+    def forward(self,x,memory,source_mask,target_mask):
+        #x,代表目标数据的嵌入表示,memory,表示编码器的输出张量
+        # source_mask:原数据的掩码张量,target_mask:目标数据的掩码张量
+        #要让x经过所有的解码器层处理,最后标准化输出
+        for layer in self.layers:
+            x=layer(x,memory,source_mask,target_mask)
+        return self.norm_layer(x)
+
+#构建Generator类
+class Generator_(nn.Module):
+    # 词嵌入的维度,要词嵌入的词汇大小
+    def __init__(self,d_dim,max_words):
+        super(Generator_,self).__init__()
+        # 定义一个线性层,完成网络输出维度的变换
+        self.linear1=nn.Linear(d_dim,max_words)
+    def forward(self,x):# NotImplementedError,写错方法名会报这个错
+        #x,是上一层的输出张量,先将x送入线性层转换维度,之后经由
+        # log_softmax求概率
+        return F.log_softmax(self.linear1(x),dim=-1)
+# 构建编码解码器类
+class Encoder_Decoder(nn.Module):
+    def __init__(self,encoder,decoder,source_embed,target_embed,generator):
+        # encoder,指编码器对象,decoder:指解码器对象,source_embed:原数据的嵌入函数
+        # target_embed:指目标数据的嵌入函数,generator:指输出部分类别生成器对象
+        super(Encoder_Decoder,self).__init__()
+        # 初始化类对象
+        self.encoder=encoder
+        self.decoder=decoder
+        self.src_embed=source_embed
+        self.tgt_embed=target_embed
+        self.generator=generator
+    def forward(self,source,target,source_mask,target_mask):
+        # source:原数据,target:目标数据,source_mask:原数据掩码,target_mask:目标数据掩码
+        # self.encode(source,source_mask)--编码后就是memory
+        de_output=self.decode(self.encode(source,source_mask),\
+                           source_mask,target,target_mask)
+        return self.generator(de_output)
+    def encode(self,source,source_mask):
+        #调用真实的编码器对象的forward方法
+        return self.encoder(self.src_embed(source),source_mask)
+        #x,memory,source_mask,target_mask
+    def decode(self,memory,source_mask,target,target_mask):
+        # memory:经过编码器编码后的输出,保存着编码后的信息
+        return self.decoder(self.tgt_embed(target),\
+                            memory,source_mask,target_mask)
+def make_model(source_vocab,target_vocab,N=6,d_dim=512,d_ff=2048,head=8,dropout=0.1):
+    # source_vocab:原数据的词汇总数(这个取决于你选多少词汇),target_vocab:目标数据的词汇总数
+    # N:代表编码器或解码器堆叠的层数,d_dim:代表词嵌入的维度,d_ff:前馈全连接层中变化矩阵的维度
+    # head:多头注意力机制中的头数(把词向量分成几份),dropout:随机置0的比率
+    c=copy.deepcopy
+    attn=MultiHeadAttent(head,d_dim)# 实例化一个多头注意力类实例
+    ff=Qk_qlj_Layers(d_dim,d_ff,dropout)# 实例化一个前馈全连接层的实例
+    position=PositionEncoding(d_dim,dropout)# 实例化一个位置编码器
+    #实例化模型,利用的是Encoder_Decoder类
+    # 编码器层的结构里有两个子层连接层,attention层和前馈全连接层
+    # 解码器层的结构里有三个子层连接,两个attention层和一个前馈全连接
+    model=Encoder_Decoder(
+        # c可以深拷贝,对象在内存占用不同的内存空间
+        Encoder(EncoderLayer(d_dim,c(attn),c(ff),dropout),N),
+        Decoder(Decoderlayer(d_dim,c(attn),c(attn),c(ff),dropout),N),
+        nn.Sequential(Embedding(d_dim,source_vocab),c(position)),
+        nn.Sequential(Embedding(d_dim,target_vocab),c(position)),
+        Generator_(d_dim,target_vocab)
+    )
+    # 初始化模型中的参数,如果维度大于1,初始化成一个服从均匀分布的矩阵
+    for p in model.parameters():
+        if p.dim()>1:
+            nn.init.xavier_uniform_(p)
+    return model
+
+source_vocab=11
+target_vocab=11
+N=6
+res=make_model(source_vocab,target_vocab,N)
+print(res)
+
+np.set_printoptions(suppress=True)
+w=torch.empty(3,5)
+# 随机初始化为均匀分布
+w=nn.init.xavier_uniform_(w,gain=nn.init.calculate_gain('relu'))

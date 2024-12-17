@@ -1,0 +1,318 @@
+import ast
+import os
+import csv
+import json
+import warnings
+import random
+
+import traceback
+from functools import partial
+from collections import namedtuple
+
+import numpy as np
+import paddle
+import paddle.nn.functional as F
+from paddlenlp.data import Stack, Tuple, Pad
+from paddlenlp.transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+def read_by_lines(path):
+    result = list()
+    with open(path, "r", encoding="utf8") as infile:
+        for line in infile:
+            result.append(line.strip())
+    return result
+
+def write_by_lines(path, data):
+    with open(path, "w", encoding="utf8") as outfile:
+        [outfile.write(d + "\n") for d in data]
+
+def load_dict(dict_path):
+    vocab = {}
+    for line in open(dict_path, 'r', encoding='utf-8'):
+        value, key = line.strip('\n').split('\t')
+        vocab[key] = int(value)
+    return vocab
+
+num_epoch=10
+learning_rate=8e-5
+tag_path='./conf/DuEE-Fin/enum_tag.dict'
+train_data='./datasets/DuEE-Fin/enum/train.tsv'
+dev_data='./datasets/DuEE-Fin/enum/dev.tsv'
+test_data='./datasets/DuEE-Fin/enum/test.tsv'
+weight_decay=0.0
+max_seq_len=300
+batch_size=10
+checkpoints='./checkpoints/Duee_extract/enum/'
+seed=1000
+device='gpu'
+
+def set_seed(random_seed):
+    random.seed(random_seed)
+    np.random.seed(random_seed)
+    paddle.seed(random_seed)
+
+def convert_example(example,
+                    tokenizer,
+                    label_map=None,
+                    max_seq_len=512,
+                    is_test=False):
+    has_text_b = False
+    if isinstance(example, dict):
+        has_text_b = "text_b" in example.keys()
+    else:
+        has_text_b = "text_b" in example._fields
+    text_b = None
+    if has_text_b:
+        text_b = example.text_b
+    tokenized_input = tokenizer(text=example.text_a,
+                                text_pair=text_b,max_length=max_seq_len,
+                                truncation=True)
+    input_ids = tokenized_input['input_ids']
+    token_type_ids = tokenized_input['token_type_ids']
+    if is_test:
+        return input_ids, token_type_ids
+    else:
+        label = np.array([label_map[example.label]], dtype="int64")
+        return input_ids, token_type_ids, label
+
+class DuEventExtraction(paddle.io.Dataset):
+    def __init__(self, data_path, tag_path):
+        self.label_vocab = load_dict(tag_path)
+        self.examples = self._read_tsv(data_path)
+    def _read_tsv(self, input_file, quotechar=None):
+        with open(input_file, "r", encoding="UTF-8") as f:
+            reader = csv.reader(f, delimiter="\t", quotechar=quotechar)
+            headers = next(reader)
+            text_indices = [
+                index for index, h in enumerate(headers) if h != "label"
+            ]
+            Example = namedtuple('Example', headers)
+            examples = []
+            for line in reader:
+                for index, text in enumerate(line):
+                    if index in text_indices:
+                        line[index] = text
+                try:
+                    example = Example(*line)
+                except Exception as e:
+                    traceback.print_exc()
+                    raise Exception(e)
+                examples.append(example)
+            return examples
+    def __len__(self):
+        return len(self.examples)
+    def __getitem__(self, index):
+        return self.examples[index]
+
+def data_2_examples(datas):
+    has_text_b, examples = False, []
+    if isinstance(datas[0], list):
+        Example = namedtuple('Example', ["text_a", "text_b"])
+        has_text_b = True
+    else:
+        Example = namedtuple('Example', ["text_a"])
+    for item in datas:
+        if has_text_b:
+            example = Example(text_a=item[0], text_b=item[1])
+        else:
+            example = Example(text_a=item)
+        examples.append(example)
+    return examples
+
+ paddle.set_device(device)
+
+set_seed(seed)
+label_map = load_dict(tag_path)
+id2label = {val: key for key, val in label_map.items()}
+
+model = AutoModelForSequenceClassification.from_pretrained( "ernie-3.0-medium-zh", num_classes=len(label_map))
+# model = paddle.DataParallel(model)
+tokenizer = AutoTokenizer.from_pretrained("ernie-3.0-medium-zh")
+
+train_ds = DuEventExtraction(train_data, tag_path)
+dev_ds = DuEventExtraction(dev_data, tag_path)
+test_ds = DuEventExtraction(test_data,tag_path)
+
+trans_func = partial(convert_example,
+                         tokenizer=tokenizer,
+                         label_map=label_map,
+                         max_seq_len=max_seq_len)
+
+batchify_fn = lambda samples, fn=Tuple(
+        Pad(axis=0, pad_val=tokenizer.vocab[tokenizer.pad_token], dtype='int32'
+            ),
+        Pad(axis=0, pad_val=tokenizer.vocab[tokenizer.pad_token], dtype='int32'
+            ),
+        Stack(dtype="int64")  # label
+    ): fn(list(map(trans_func, samples)))
+
+batch_sampler = paddle.io.BatchSampler( train_ds, batch_size=batch_size, shuffle=True)
+
+train_loader = paddle.io.DataLoader(dataset=train_ds,
+                                        batch_sampler=batch_sampler,
+                                        collate_fn=batchify_fn)
+dev_loader = paddle.io.DataLoader(dataset=dev_ds,
+                                  batch_size=batch_size,
+                                  collate_fn=batchify_fn)
+test_loader = paddle.io.DataLoader(dataset=test_ds,
+                                   batch_size=batch_size,
+                                   collate_fn=batchify_fn)
+
+for i in dev_loader:
+    print(i)
+    break
+
+num_training_steps = len(train_loader) *num_epoch
+
+metric = paddle.metric.Accuracy()#准确率
+
+loss_fn = paddle.nn.loss.CrossEntropyLoss()
+
+warmup_steps=0
+
+import paddlenlp
+
+lr_scheduler = paddlenlp.transformers.LinearDecayWithWarmup(learning_rate, num_training_steps,
+                                    warmup_steps)
+
+decay_params = [
+        p.name for n, p in model.named_parameters()
+        if not any(nd in n for nd in ["bias", "norm"])
+    ]
+optimizer = paddle.optimizer.AdamW(
+    learning_rate=lr_scheduler,
+    parameters=model.parameters(),
+    weight_decay=weight_decay,
+    apply_decay_param_fun=lambda x: x in decay_params)#刨除"bias", "norm"
+
+@paddle.no_grad()
+def evaluate(model,loss_fn, metric, data_loader,mode='valid'):
+    model.eval()#评估模式
+    metric.reset()#指标重置
+    losses = []#损失
+    for batch in data_loader:
+        input_ids, token_type_ids, labels = batch
+        logits = model(input_ids, token_type_ids)
+        loss = loss_fn(logits, labels)
+        losses.append(loss.item())
+        correct = metric.compute(logits, labels)#计算正确数
+        metric.update(correct)#更新正确率
+    accuracy = metric.accumulate()
+    avg_loss=float(np.mean(losses))
+    print("%s: eval loss: %.5f,acc: %.3f" %
+          (mode, avg_loss,accuracy))
+    model.train()
+    metric.reset()
+    return avg_loss
+
+logging_steps=15
+import time
+eval_steps=100
+global_step,best_loss=0,float('inf')
+tic_train = time.time()
+model.train()
+for epoch in range(1,num_epoch+1):
+    for step, batch in enumerate(train_loader,start=1):
+        metric.reset()#每个批次指标都重置
+        input_ids, token_type_ids, labels = batch
+        logits = model(input_ids,token_type_ids)#模型预测置信度
+        loss = loss_fn(logits,labels)#损失
+        correct = metric.compute(logits,labels)#计算当前批次正确数
+        metric.update(correct)#更新正确数
+        acc = metric.accumulate()#当前批次准确率
+        global_step += 1
+        if global_step %logging_steps == 0:
+            print("global step %d, epoch:%d,batch: %d, loss: %.4f,acc: %.4f \
+            speed: %.2f step/s,best_loss:%.4f,lr:%.5f"
+                % (global_step,epoch,step, loss.item(),acc, \
+                   logging_steps /(time.time() - tic_train),best_loss,optimizer.get_lr()))
+            tic_train = time.time()
+        loss.backward()
+        optimizer.step()
+        lr_scheduler.step()
+        optimizer.clear_grad()
+        if global_step % eval_steps==0 :
+            avg_loss=evaluate(model, loss_fn,metric,dev_loader)
+            if avg_loss<best_loss:
+                best_loss=avg_loss
+                paddle.save( model.state_dict(),os.path.join(checkpoints,'best_enum.pdparams'))
+
+init_ckpt='./checkpoints/Duee_extract/enum/best_enum.pdparams'
+
+if not init_ckpt or not os.path.isfile(init_ckpt):
+    raise Exception("init checkpoints {} not exist".format(init_ckpt))
+else:
+    state_dict = paddle.load(init_ckpt)
+    model.set_dict(state_dict)
+    print("Loaded parameters from %s" % init_ckpt)
+
+evaluate(model,loss_fn,metric,dev_loader)
+
+predict_data='./datasets/DuEE-Fin/sentence/test.json'
+
+sentences = read_by_lines(predict_data)  # origin data format
+sentences = [json.loads(sent) for sent in sentences]
+
+sentences=sentences[:30]
+
+encoded_inputs_list = []
+for sent in sentences:
+    sent = sent["text"]
+    input_sent = [sent]  # only text_a
+    if "text_b" in sent:
+        input_sent = [[sent, sent["text_b"]]]  # add text_b
+    example = data_2_examples(input_sent)[0]
+    input_ids, token_type_ids = convert_example(
+        example, tokenizer, max_seq_len=max_seq_len, is_test=True)
+    encoded_inputs_list.append((input_ids, token_type_ids))
+
+batchify_fn = lambda samples, fn=Tuple(
+    Pad(axis=0, pad_val=tokenizer.pad_token_id),
+    Pad(axis=0, pad_val=tokenizer.pad_token_type_id),
+): fn(samples)
+
+batch_size=1
+
+batch_encoded_inputs = [
+    encoded_inputs_list[i:i +batch_size]
+    for i in range(0, len(encoded_inputs_list), batch_size)
+]
+
+results = []
+model.eval()
+for batch in batch_encoded_inputs:
+    input_ids, token_type_ids = batchify_fn(batch)# ndarray
+    input_ids = paddle.to_tensor(input_ids)# tensor
+    token_type_ids = paddle.to_tensor(token_type_ids)
+    logits = model(input_ids, token_type_ids)# 分值
+    probs = F.softmax(logits, axis=-1)#概率
+    probs_ids = paddle.argmax(probs, -1).numpy()#预测的标签索引
+    probs = probs.numpy()
+    # print(probs.shape,probs_ids) # (1, 4) (1,)
+    #prob_one:模型预测的样本属于各个类别的概率，p_id:模型预测的样本的标签索引
+    for prob_one, p_id in zip(probs, probs_ids):
+        label_probs = {}
+        # print(prob_one) # [2.9129196e-02 8.2434231e-04 9.6857232e-01 1.4740758e-03]
+        for idx, p in enumerate(prob_one):
+            label_probs[id2label[idx]] = p#当前样本属于各个类别的概率
+        results.append({"probs": label_probs, "label": id2label[p_id]})
+
+assert len(results) == len(sentences)
+
+for sent, ret in zip(sentences, results):
+        sent["pred"] = ret
+
+for s in sentences:
+    probs = s['pred']['probs'] # 字典
+    # print(probs)
+    for key, value in probs.items():  
+        probs[key] = float(value) #转换成float,numpy不能被序列化
+
+sentences = [json.dumps(sent, ensure_ascii=False) for sent in sentences]
+
+predict_save_path='./ckpt/DuEE-Fin/enum'
+
+os.makedirs(predict_save_path, exist_ok=True) 
+
+write_by_lines(predict_save_path+'/test_pred.json', sentences)
+print("save data {} to {}".format(len(sentences), predict_save_path+'/test_pred.json'))

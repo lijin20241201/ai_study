@@ -1,0 +1,344 @@
+import tensorflow as tf
+import numpy as np
+import matplotlib.pyplot as plt
+import scipy
+import keras
+print(tf.config.list_physical_devices('GPU'))
+# 设置GPU设备
+gpus = tf.config.experimental.list_physical_devices('GPU')
+try:
+    if gpus:
+        tf.config.experimental.set_visible_devices(gpus[0], 'GPU')
+        tf.config.experimental.set_memory_growth(gpus[0], True)
+        print("GPU set successfully!")
+except Exception as e:
+    print(e)
+rom keras.applications import VGG16
+from keras.models import Model  
+from keras.layers import Dense, GlobalAveragePooling2D
+# include_top=False,因为后边有时间序列的网络,而序列一般是按水平摆放,
+#所以这种不带时间序列的网络是竖起来放的,top层就是后边他们自己模型处理分类的那些层
+# 我们只要他们前面抓几何图案的层,要全部设置好的系数,输入图形形状是(150,150,3)
+base_model = VGG16(weights='imagenet', include_top=False,input_shape=(150,150,3))
+#要估计的参数
+#(9*3+1)*64,(9*64+1)*64,(9*64+1)*128,(9*128+1)*128,
+#(9*128+1)*256,(9*256+1)*256,(9*256+1)*256,
+#(9*256+1)*512,(9*512+1)*512,后面几层一样,input_deep
+#output_deep都是512,使用的卷积是3x3,卷积层做了填充0
+#使用的是最大池化,抓2x2中的最大数
+#卷积神经网络通用的使用方法,滤镜越用越多个
+#参数是14,714,688个,目前是可训练状态,后面我们要设为不可训练
+#状态
+base_model.summary()
+from keras.utils import plot_model#画模型
+#有向无环图,input,四维张量(样本数,某一层通道的宽,某层通道的高,层数)
+plot_model(base_model,show_shapes=True,to_file='VGG16.png')
+import os,shutil
+from keras.preprocessing.image import ImageDataGenerator
+basedir='../datasets/cats_dogs_s'
+train_dir=os.path.join(basedir,'train')#训练数据文件夹
+test_dir=os.path.join(basedir,'test')#测试数据文件夹
+yz_dir=os.path.join(basedir,'yz')#验证数据文件夹
+# 第一种方法,把数据过一下base_model(别人的模型),转化成特征图数据
+batch_size=20#小批量的丢进去,每个批量20个样本
+datagen=ImageDataGenerator(rescale=1./255)#把图片变成数据的生成器,rescale是最后把像素数据变成0-1之间
+#提取特征方法,参数:要提取特征的文件夹,样本数
+def extract_features(directory,ybs):
+    print('ybs:',ybs)
+    #初始化一个4维张量,4x4是滚过VGG16之后的图片大小,512是最后一层有512个神经元
+    #这个是存储特征图形的容器(2000,4,4,512)
+    features=np.zeros(shape=(ybs,4,4,512))
+    #初始化了一个一维张量,用来存放标签
+    #标签是用来分类的,0-猫,1-狗
+    labels=np.zeros(shape=(ybs))
+    # 这个方法处理后,图片就变成了4维张量数据,并被设置了y
+    #就是标签,你要读取的文件夹下有几类,标签就会设成几类
+    #类似0-猫,1-狗之类的,每个批次20个样本,设置的图片大小是(150,150)
+    #经过这个方法后,图片数据形状是(20,150,150,3),这个是个死循环
+    generator=datagen.flow_from_directory(
+        #读取的图片的文件夹
+        directory,
+        # 设置的图片大小
+        target_size=(150,150),
+        batch_size=batch_size,#每次生成20个图片数据
+        class_mode='binary'#二分类
+    )
+    i=0 #设置的标志位,遍历生成器,得到的是输入张量和输出标签
+    # inputs_batch(20,150,150,3),labels_batch(20,)里面是0,1
+    for inputs_batch,labels_batch in generator:
+        # 经过这个处理后的特征图形是(20,4,4,512)
+        features_batch=base_model.predict(inputs_batch)
+        print('fetures_batch:',features_batch.shape)
+        # i=99时,切片位置是[1980:2000],这个数把每次迭代的20个特征图
+        #数据放进容器,一次是放20个特征图,每个特征图是512层
+        features[i*batch_size:(i+1)*batch_size]=features_batch
+        # 这个是上面输入数据对应的标签,也就是y真实值
+        labels[i*batch_size:(i+1)*batch_size]=labels_batch
+        i+=1
+        # i等于99就退出了
+        if i*batch_size>=ybs:
+            print('i:',i)
+            break
+    return features,labels
+#经过别人模型处理的特征图和标签,特征图保留的是特别的几何图形,用来识别类别的
+train_features,train_labels=extract_features(train_dir,2000)
+yz_features,yz_labels=extract_features(yz_dir,1000)
+test_features,test_labels=extract_features(test_dir,1000)
+#变一下形,就是摊平,我们没用vgg16密集连接层,因为他们处理的是1000分类
+train_features=train_features.reshape(2000,4*4*512)
+yz_features=yz_features.reshape(1000,4*4*512)
+test_features=test_features.reshape(1000,4*4*512)
+print(np.max(train_features),np.min(train_features),np.argmax(train_features))
+#VGG16处理后的特征图像素的最大值是10.988969802856445,最小值是0
+a=train_features.reshape(-1)
+print(a[13438107])
+from keras import layers
+from keras import models
+from keras import optimizers
+
+#第一种用别人模型的方法,只是用别人模型处理一下自己的数据,变成特征图
+model=models.Sequential()
+#隐藏层
+model.add(layers.Dense(256,activation='relu',input_dim=4*4*512))
+# dropout层
+model.add(layers.Dropout(0.5))
+# 二分类问题,sigmoid,输出层
+model.add(layers.Dense(1,activation='sigmoid'))
+#我们自己要估计的参数(8192+1)*256,256+1,8192是摊平了
+# 4*4*512
+model.summary()
+model.compile(optimizer=optimizers.RMSprop(learning_rate=1e-4),\
+              loss='binary_crossentropy',metrics=['acc'])
+#loss: 0.1419 - acc: 0.9460 - val_loss: 0.2610 - val_acc: 0.8860
+his=model.fit(train_features,train_labels,  
+    epochs=20,  # 训练轮数  
+    verbose=2,  # 日志显示模式 
+    batch_size=20, 
+    validation_data=(yz_features,yz_labels), 
+    shuffle=True
+)
+#训练损失,验证损失,训练准确率,验证准确率
+xl_loss=his.history['loss']
+yz_loss=his.history['val_loss']
+xl_acc=his.history['acc']
+yz_acc=his.history['val_acc']
+plt.rcParams['font.size'] = 22
+plt.figure(figsize=(20,9),dpi=100)
+plt.subplot((121))
+#横坐标是迭代次数,纵坐标是损失
+x=range(1,len(xl_loss)+1)
+plt.plot(x,xl_loss,'b',label='xl_loss')
+plt.plot(x,yz_loss,'bo',label='yz_loss')
+plt.legend()
+plt.subplot((122))
+plt.plot(x,xl_acc,'r',label='xl_acc')
+plt.plot(x,yz_acc,'ro',label='yz_acc')
+plt.legend()
+plt.show()
+# 第二种用别人模型的方法,我们要增强数据,
+# 就得把别人的前面处理几何图形的层都加进来
+# 但不能动人家模型的参数
+model_=models.Sequential()
+model_.add(base_model)#别人模型的处理空间相关性的那些层
+model_.add(layers.Flatten())#拍平特征图数据
+model_.add(layers.Dense(256,activation='relu'))
+model_.add(layers.Dropout(0.5))
+# 二分类问题,sigmoid,输出层
+model_.add(layers.Dense(1,activation='sigmoid'))
+# 冻结之前,Non-trainable params: 0
+model_.summary()
+#冻结别人模型之前,要估计的层数,别人的13层+自己的2层,15层,有w和b两个,所以是30
+print('冻结别人模型之前:',len(model_.trainable_weights))
+#冻结别人模型
+base_model.trainable=False
+#之所以是4,可训练的层数,是因为我们自己加的就两层,每一层都要估计w和b两个张量,2*2=4
+print('冻结别人模型之后:',len(model_.trainable_weights))
+#冻结之后,模型参数,Non-trainable params: 14,714,688
+model_.summary()
+#增强数据
+#因为训练准确率高,所以给训练增加难度,又是旋转
+#又是平移,让电脑能抓住本质,fill_mode='nearest'是默认
+train_datagen=ImageDataGenerator(
+        #图片数据*rescale设定值
+        rescale=1./255,
+        #旋转角度
+        rotation_range=40,
+        #平移
+        width_shift_range=0.2,
+        height_shift_range=0.2,
+        shear_range=0.2,
+        zoom_range=0.2,#放大缩小
+        #水平翻转
+        horizontal_flip=True
+    
+)
+#验证资料就不要数据增强了,数据增强是为了让电脑抓到
+#输入数据被贴上特定标签的本质原因,验证数据
+# 是展示数据增强的成果的
+yz_datagen=ImageDataGenerator(rescale=1./255)
+# train_datagen经历过图片平移,旋转之类的,增强训练难度
+# 相当于我们在模拟考试前训练有些难度的题目
+train_generator=train_datagen.flow_from_directory(
+    train_dir,
+    target_size=(150,150),
+    batch_size=20,
+    class_mode='binary'
+)
+# yz_datagen只是把数据变到0-1,电脑喜欢小一些的浮点数据
+vald_generator=yz_datagen.flow_from_directory(
+    yz_dir,
+    target_size=(150,150),
+    batch_size=20,
+    class_mode='binary'
+)
+# learning_rate=1e-4,损失函数,二元交叉熵,衡量模型标准:准确率
+model_.compile(optimizer=optimizers.RMSprop(learning_rate=5e-5),\
+              loss='binary_crossentropy',metrics=['acc'])
+#loss: 0.3203 - acc: 0.8540 - val_loss: 0.2496 - val_acc: 0.8960
+his_=model_.fit(train_generator,  
+    epochs=30,  # 训练轮数  
+    verbose=2,  # 日志显示模式  
+    steps_per_epoch=100,  # 每个epoch需要完成的步数，通常设置为训练集的总样本数除以批次大小  
+    validation_data=vald_generator,  # 如果有验证集的话，这里也应该是另一个DirectoryIterator实例  
+    validation_steps=50,  # 验证集的步数 
+    shuffle=True
+)
+model_.compile(optimizer=optimizers.RMSprop(learning_rate=1e-5),\
+              loss='binary_crossentropy',metrics=['acc'])
+#loss: 0.2657 - acc: 0.8850 - val_loss: 0.2505 - val_acc: 0.8970
+model_.fit(train_generator,  
+    epochs=20,  # 训练轮数  
+    verbose=2,  # 日志显示模式  
+    steps_per_epoch=100,  # 每个epoch需要完成的步数，通常设置为训练集的总样本数除以批次大小  
+    validation_data=vald_generator,  # 如果有验证集的话，这里也应该是另一个DirectoryIterator实例  
+    validation_steps=50,  # 验证集的步数 
+    shuffle=True
+)
+# 设置VGG16 block5_conv1层和之后的层可训练
+base_model.trainable=True# 先设置VGG16所有层都可训练
+set_trainable=False# 设个标志
+for layer in base_model.layers:#遍历VGG16的层
+    if layer.name=='block5_conv1':# 如果是block5_conv1(它是Ture的话,它后边的层也会是True)
+        set_trainable=True
+    if set_trainable:# 标志是Ture,就把那层设为可训练
+        layer.trainable=True
+    else:# 否则设为不可训练
+        layer.trainable=False
+# 自己的两层+VGG16的3层,5*2,w和b
+print('设置之后:',len(model_.trainable_weights))
+# set_trainable之后,trainable params: 9,177,089,自己设置的(2097408+257),base_model的7079424
+#和起来就是9177089
+model_.summary()
+model_.save('cats_and_dogs_small_32.h5')
+# 如果按第二种添加别人模型的方法,而且自己训练的模型loss,acc都差不多
+#的情况下,就可以解冻别人模型的block5_conv1之后得层,因为这些层
+# 都多少是为他们自己的分类器设置系数了,我们这样设置后,就会更新这些层的系数
+#learning_rate=1e-5微调就行
+model_.compile(optimizer=optimizers.RMSprop(learning_rate=1e-5),\
+              loss='binary_crossentropy',metrics=['acc'])
+#在开启别人的一些参数可训练之前,一定要已经
+# 经过(base_model参数不可训练的)的模型训练差不多之后,参数不需要大幅度调整
+#不然,反向传播会打乱别人模型里的增加的可调参数,达不到预期
+# loss: 0.0790 - acc: 0.9700 - val_loss: 0.2804 - val_acc: 0.9330
+#有些时候val_acc和这个差不多,可是val_loss却非常大,都到1以上了,
+#应该是学习率调的过大,搞坏了模型,但是为啥显示的验证准确率却很高呢,
+#看那验证损失都1.5了.最好的模型应该是验证准确率和验证损失都比较小.
+#而且训练准确率和训练损失也会和验证准确率和验证损失一致
+#不能出现准确率显示很高,损失却很大的情况,如果出现说明学习率调大了
+#搞坏了模型
+history=model_.fit(train_generator,  
+    epochs=30,  # 训练轮数  
+    verbose=2,  # 日志显示模式  
+    steps_per_epoch=100,  # 每个epoch需要完成的步数，通常设置为训练集的总样本数除以批次大小  
+    validation_data=vald_generator,  # 如果有验证集的话，这里也应该是另一个DirectoryIterator实例  
+    validation_steps=50,  # 验证集的步数 
+    shuffle=True
+)
+#在之前的30次epoch上继续微调
+#loss: 0.0385 - acc: 0.9870 - val_loss: 0.2845 - val_acc: 0.9400
+model_.compile(optimizer=optimizers.RMSprop(learning_rate=1e-5),\
+              loss='binary_crossentropy',metrics=['acc'])
+history=model_.fit(train_generator,  
+    epochs=20,  # 训练轮数  
+    verbose=2,  # 日志显示模式  
+    steps_per_epoch=100,  # 每个epoch需要完成的步数，通常设置为训练集的总样本数除以批次大小  
+    validation_data=vald_generator,  # 如果有验证集的话，这里也应该是另一个DirectoryIterator实例  
+    validation_steps=50,  # 验证集的步数 
+    shuffle=True
+)
+model_.save('cats_and_dogs_small_33.h5')#保存一下模型
+#在之前的模型上继续调整,学习率调为5e-6,
+#loss: 0.0248 - acc: 0.9895 - val_loss: 0.2841 - val_acc: 0.9540
+#这是猫狗训练图片才2000张的情况下,准确率就已经95.4%,损失也不大
+model_.compile(optimizer=optimizers.RMSprop(learning_rate=5e-6),\
+              loss='binary_crossentropy',metrics=['acc'])
+history=model_.fit(train_generator,  
+    epochs=20,  # 训练轮数  
+    verbose=2,  # 日志显示模式  
+    steps_per_epoch=100,  # 每个epoch需要完成的步数，通常设置为训练集的总样本数除以批次大小  
+    validation_data=vald_generator,  # 如果有验证集的话，这里也应该是另一个DirectoryIterator实例  
+    validation_steps=50,  # 验证集的步数 
+    shuffle=True
+)
+# 可以看到验证准确率最大出现在第20次epoch,而验证损失最小是出现在第8次epoch
+print(np.max(history.history['val_acc']),np.argmax(history.history['val_acc']))
+print(np.min(history.history['val_loss']),np.argmin(history.history['val_loss']))
+xl_loss=history.history['loss']
+yz_loss=history.history['val_loss']
+xl_acc=history.history['acc']
+yz_acc=history.history['val_acc']
+plt.rcParams['font.size'] = 22
+plt.figure(figsize=(20,9),dpi=100)
+plt.subplot((121))
+x=range(1,len(xl_loss)+1)
+plt.plot(x,xl_loss,'b',label='xl_loss')
+plt.plot(x,yz_loss,'bo',label='yz_loss')
+plt.legend()
+plt.subplot((122))
+plt.plot(x,xl_acc,'r',label='xl_acc')
+plt.plot(x,yz_acc,'ro',label='yz_acc')
+plt.legend()
+plt.show()
+#经过指数平滑处理的图表,指数平滑EMA
+def smth_(points,w=0.8):
+    #装平滑点的集合
+    smt_ps=[]
+    for point in points:
+        if not smt_ps:
+#             print(smt_ps)
+            smt_ps.append(point)
+        else:
+            # 平滑点集合里的最后一个,就是上一个点
+            syg_ps=smt_ps[-1]
+#             print('----',smt_ps)
+            smt_ps.append(w*syg_ps+(1-w)*point)
+    return smt_ps
+xl_loss=smth_(history.history['loss'])
+yz_loss=smth_(history.history['val_loss'])
+xl_acc=smth_(history.history['acc'])
+yz_acc=smth_(history.history['val_acc'])
+plt.rcParams['font.size'] = 22
+plt.figure(figsize=(20,9),dpi=100)
+plt.subplot((121))
+x=range(1,len(xl_loss)+1)
+plt.plot(x,xl_loss,'b',label='xl_loss')
+plt.plot(x,yz_loss,'bo',label='yz_loss')
+plt.title('xl_loss,yz_loss')
+plt.legend()
+plt.subplot((122))
+plt.plot(x,xl_acc,'r',label='xl_acc')
+plt.plot(x,yz_acc,'ro',label='yz_acc')
+plt.title('xl_acc,yz_acc')
+plt.legend()
+plt.show()
+model_.save('./cats_and_dogs_small_36.h5')
+test_generator=yz_datagen.flow_from_directory(
+    test_dir,
+    target_size=(150,150),
+    batch_size=20,
+    class_mode='binary'
+)
+#预测测试资料:test_loss,0.2628508508205414,test_acc,0.9449999928474426
+test_loss,test_acc=model_.evaluate(test_generator,steps=50)
+print('test_loss',test_loss)
+print('test_acc',test_acc)

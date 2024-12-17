@@ -1,0 +1,459 @@
+# 配置YOLOS模型的基础参数
+# YolosConfig 类继承自 PretrainedConfig，用于定义YOLOS模型的配置信息。
+class YolosConfig(PretrainedConfig):
+    model_type = "yolos"
+    def __init__(
+        self,
+        hidden_size=768, # 隐藏层的维度大小。
+        num_hidden_layers=12, # 隐藏层的数量。
+        num_attention_heads=12, # 多头注意力机制的头数
+        intermediate_size=3072, # 前馈神经网络（FFN）的中间层大小。
+        hidden_act="gelu", # 隐藏层激活函数。
+        hidden_dropout_prob=0.0,# 隐藏层的Dropout概率。
+        attention_probs_dropout_prob=0.0, # 注意力概率的Dropout概率。
+        initializer_range=0.02,# 决定了模型权重初始化的范围，通常使用截断正态分布进行初始化。
+        layer_norm_eps=1e-12,# 层规范化中的epsilon值。
+        image_size=[512, 864],# 输入图像的大小。
+        patch_size=16, # 图像分割的补丁大小。
+        num_channels=3, # 图像的通道数
+        qkv_bias=True,# 查询、键、值（Query-Key-Value）是否使用偏置。
+        num_detection_tokens=100,# 检测目标的标记数量。
+        # 是否使用中间位置嵌入。
+        # 在某些变体中，可能会在编码器和解码器之间加入位置嵌入，以增强模型的空间感知能力。
+        use_mid_position_embeddings=True,
+        # 是否启用辅助损失,在训练过程中，除了主损失外，还可以启用辅助损失来改善训练效果。
+        auxiliary_loss=False,
+        # 匈牙利匹配器相关参数：
+        # 这些参数用于匈牙利算法（Hungarian matcher），该算法用于匹配预测框和真实框，以计算损失。
+        class_cost=1,# 类别匹配成本。
+        bbox_cost=5,# 边界框匹配成本。
+        giou_cost=2,# 广义交并比（GIoU）匹配成本。
+        # 作用：这些系数用于平衡不同类型的损失贡献，以优化总体损失函数。
+        # 损失系数：bbox_loss_coefficient：边界框损失系数。
+        # giou_loss_coefficient：广义交并比损失系数。
+        # eos_coefficient：结束符号（EOS）损失系数。
+        bbox_loss_coefficient=5,
+        giou_loss_coefficient=2,
+        eos_coefficient=0.1,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+
+        self.hidden_size = hidden_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.intermediate_size = intermediate_size
+        self.hidden_act = hidden_act
+        self.hidden_dropout_prob = hidden_dropout_prob
+        self.attention_probs_dropout_prob = attention_probs_dropout_prob
+        self.initializer_range = initializer_range
+        self.layer_norm_eps = layer_norm_eps
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.num_channels = num_channels
+        self.qkv_bias = qkv_bias
+        self.num_detection_tokens = num_detection_tokens
+        self.use_mid_position_embeddings = use_mid_position_embeddings
+        self.auxiliary_loss = auxiliary_loss
+        # Hungarian matcher
+        self.class_cost = class_cost
+        self.bbox_cost = bbox_cost
+        self.giou_cost = giou_cost
+        # Loss coefficients
+        self.bbox_loss_coefficient = bbox_loss_coefficient
+        self.giou_loss_coefficient = giou_loss_coefficient
+        self.eos_coefficient = eos_coefficient
+
+# 用于配置YOLOS模型导出为ONNX格式的相关信息。
+class YolosOnnxConfig(OnnxConfig):
+    # 支持ONNX导出的PyTorch最低版本。确保使用的PyTorch版本支持ONNX导出所需的特性。
+    torch_onnx_minimum_version = version.parse("1.11")
+    # 模型输入的形状描述。定义了模型输入的形状，包括批量大小、通道数、高度和宽度。
+    @property
+    def inputs(self) -> Mapping[str, Mapping[int, str]]:
+        return OrderedDict(
+            [
+                ("pixel_values", {0: "batch", 1: "num_channels", 2: "height", 3: "width"}),
+            ]
+        )
+    # 验证ONNX模型时的绝对容差。用于验证ONNX模型输出与原生模型输出之间的差异。
+    @property
+    def atol_for_validation(self) -> float:
+        return 1e-4
+    # 默认的ONNX操作集版本。指定ONNX模型导出时使用的基本操作集版本。
+    @property
+    def default_onnx_opset(self) -> int:
+        return 12
+# 这个类使用了Python的 dataclass 装饰器来简化类的定义，自动实现了构造函数、字符串表示等方法。这个类用
+# 于封装YOLOS模型的输出数据，包括但不限于：
+@dataclass
+# 用于封装YOLOS模型的输出
+class YolosObjectDetectionOutput(ModelOutput):
+    loss: Optional[torch.FloatTensor] = None # 可选的总损失
+    loss_dict: Optional[Dict] = None # 可选的损失字典，可能包含不同损失项的详细信息。
+    logits: torch.FloatTensor = None # 模型的分类得分。
+    pred_boxes: torch.FloatTensor = None # 预测的边界框坐标。
+    auxiliary_outputs: Optional[List[Dict]] = None # 辅助输出，可能包含中间层的结果。
+    last_hidden_state: Optional[torch.FloatTensor] = None # 最后一个隐藏状态。
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None # 所有隐藏层的状态。
+    attentions: Optional[Tuple[torch.FloatTensor]] = None # 所有注意力层的注意力权重。
+# 这个类继承自 nn.Module，定义了YOLOS模型的嵌入层，包括CLSToken、检测Token、位置嵌入和补丁嵌入。
+# 嵌入层的主要作用是将输入的图像转换为适合模型处理的形式，并添加位置信息。
+class YolosEmbeddings(nn.Module):
+    def __init__(self, config: YolosConfig) -> None:
+        super().__init__()
+        # cls_token：分类标记（CLS Token），用于表示整个输入序列的表示。
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
+        # detection_tokens：检测tokens，用于捕获图像中的潜在目标对象。
+        self.detection_tokens = nn.Parameter(torch.zeros(1, config.num_detection_tokens, config.hidden_size))
+        # patch_embeddings：补丁嵌入，将图像分割成补丁并嵌入到隐藏空间。
+        self.patch_embeddings = YolosPatchEmbeddings(config)
+        num_patches = self.patch_embeddings.num_patches # np,图片被分成的块数
+        # pe：位置嵌入，用于表示图像块和检测tokens和cls的位置信息。1 是批处理维度，表示位置嵌入对于每个样本都是一样的
+        self.position_embeddings = nn.Parameter(
+            torch.zeros(1, num_patches + config.num_detection_tokens + 1, config.hidden_size)
+        )
+        # dropout：丢弃层，用于防止过拟合。
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        # interpolation：插值模块，用于处理输入图像尺寸的变化。
+        self.interpolation = InterpolateInitialPositionEmbeddings(config)
+        self.config = config
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        # 处理输入：获取输入图像的尺寸信息。b,c,h,w
+        batch_size, num_channels, height, width = pixel_values.shape
+        # 生成图像块嵌入：将输入图像转换为图像块嵌入。
+        embeddings = self.patch_embeddings(pixel_values)
+        batch_size, seq_len, _ = embeddings.size() # b,s,d
+        # 添加CLSToken和检测Tokens：将CLSToken和检测Tokens扩展到当前批次大小，并与图像块嵌入拼接。
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1) # (b,1,d)
+        detection_tokens = self.detection_tokens.expand(batch_size, -1, -1) #(b,n_det,d)
+        # 依次将cls token的嵌入和图像块token的嵌入和要检测的token的嵌入在Time轴拼接
+        embeddings = torch.cat((cls_tokens, embeddings, detection_tokens), dim=1)
+        # add positional encoding to each token
+        # this might require interpolation of the existing position embeddings
+        # 位置嵌入插值：根据输入图像的尺寸对位置嵌入进行插值处理。
+        position_embeddings = self.interpolation(self.position_embeddings, (height, width))
+        # 添加位置嵌入：将位置嵌入加到补丁嵌入上。
+        embeddings = embeddings + position_embeddings
+        # 应用Dropout：最后应用Dropout层，减少过拟合的风险。
+        embeddings = self.dropout(embeddings)
+        return embeddings
+# nn.Module 子类，其目的是处理位置嵌入（position embeddings）的尺寸调整。位置嵌入是用于提供序列中
+# 每个元素位置信息的重要组件，尤其在视觉Transformer模型中，位置嵌入帮助模型理解图像中不同补丁（patches）
+# 的相对位置。当输入图像的尺寸与预训练模型中使用的图像尺寸不同时，就需要对位置嵌入进行调整，使其适应新的输入尺寸。
+class InterpolateInitialPositionEmbeddings(nn.Module):
+    def __init__(self, config) -> None:
+        super().__init__()
+        # 初始化方法接收一个 config 对象，该对象包含了模型的配置信息，如补丁大小、图像尺寸等。
+        self.config = config
+    # 前向传播方法 forward
+    # pos_embed：位置嵌入张量，形状为 (1,seq_len,hidden_size)。
+    # img_size：当前输入图像的尺寸，是一个二元组 (height, width)。
+    def forward(self, pos_embed, img_size=(800, 1344)) -> torch.Tensor:
+        # 分离CLSToken的位置嵌入,这里把cls放前面,作为序列的开始
+        cls_pos_embed = pos_embed[:, 0, :] # (1,d),因为中间是一个索引,维度会紧凑
+        cls_pos_embed = cls_pos_embed[:, None] # (1,1,d)
+        # 从位置嵌入张量的序列长度轴中抽取最后num_detection_tokens个元素（即检测Token的位置嵌入）。
+        det_pos_embed = pos_embed[:, -self.config.num_detection_tokens :, :] # (1,num_det,d)
+        # 从位置嵌入张量的序列长度的轴中抽取从第二个元素开始到最后 num_detection_tokens 之前的元素
+        # （即图像块Token的位置嵌入），并将维度进行转置
+        patch_pos_embed = pos_embed[:, 1 : -self.config.num_detection_tokens, :] # (1,num_patch,d)
+        patch_pos_embed = patch_pos_embed.transpose(1, 2) # (1,d,num_patch)
+        batch_size, hidden_size, seq_len = patch_pos_embed.shape  # 1,d,s
+        # 获取默认的配置得到的patch_height, patch_width
+        patch_height, patch_width = (
+            self.config.image_size[0] // self.config.patch_size,
+            self.config.image_size[1] // self.config.patch_size,
+        )
+        # 将图像块位置嵌入的形状从 (b,d,s) 转换为 (b,d, patch_height, patch_width)。
+        patch_pos_embed = patch_pos_embed.view(batch_size, hidden_size, patch_height, patch_width)
+        height, width = img_size # 获取输入图片的h,w
+        # 根据输入图片的h,w计算新的new_patch_heigth,new_patch_width
+        new_patch_heigth, new_patch_width = height // self.config.patch_size, width // self.config.patch_size
+        # 使用双三次插值（bicubic interpolation）调整补丁位置嵌入的大小，以适应当前输入图像的尺寸。
+        # 当 align_corners=False 时，默认情况下，输入和输出的角点不再是对应关系。取而代之的是，插值操作会根据输入和输
+        # 出的像素索引进行线性插值。这意味着插值操作会根据输入和输出的像素索引进行均匀分布的插值。这种方式通常更加灵活，并
+        # 且避免了边缘像素的重复问题。
+        # 设置 align_corners=False 可以避免在插值过程中出现的一些不自然的现象，尤其是在处理非均匀缩放或者非线性变换
+        # 的情况下。使用 False 通常会产生更自然的插值结果，并且在大多数情况下是推荐的做法
+        patch_pos_embed = nn.functional.interpolate( # (1,d,new_patch_heigth, new_patch_width)
+            patch_pos_embed, size=(new_patch_heigth, new_patch_width), mode="bicubic", align_corners=False
+        )
+        # 重塑并拼接最终的位置嵌入：将调整后的补丁位置嵌入展平并转置，再与CLSToken和检测Token的位
+        # 置嵌入拼接起来，形成最终的位置嵌入张量。
+        # 2表示从索引2的轴开始展平,之后换轴(1,d,s)-->(1,s,d)
+        patch_pos_embed = patch_pos_embed.flatten(2).transpose(1, 2)
+        # 之后在序列长度维度合并
+        scale_pos_embed = torch.cat((cls_pos_embed, patch_pos_embed, det_pos_embed), dim=1)
+        return scale_pos_embed
+class InterpolateMidPositionEmbeddings(nn.Module):
+    def __init__(self, config) -> None:
+        super().__init__()
+        self.config = config
+    def forward(self, pos_embed, img_size=(800, 1344)) -> torch.Tensor:
+        # pos_embed:(5,1,65,256),分别表示层的深度,批次大小,序列长度,嵌入维度
+        cls_pos_embed = pos_embed[:, :, 0, :] # (5,1,256)
+        cls_pos_embed = cls_pos_embed[:, None] # (5,1,1,256)
+        det_pos_embed = pos_embed[:, :, -self.config.num_detection_tokens :, :] #(5,1,num_det,256)
+        patch_pos_embed = pos_embed[:, :, 1 : -self.config.num_detection_tokens, :] # (5,1,n_pat,256)
+        patch_pos_embed = patch_pos_embed.transpose(2, 3) # (5,1,256,n_pat)
+        depth, batch_size, hidden_size, seq_len = patch_pos_embed.shape # 自动拆包
+        # 获取配置的patch_height, patch_width(就是高和宽上的分成的块数)
+        patch_height, patch_width = (
+            self.config.image_size[0] // self.config.patch_size,
+            self.config.image_size[1] // self.config.patch_size,
+        )
+        # (5*1,256,patch_height, patch_width)
+        patch_pos_embed = patch_pos_embed.view(depth * batch_size, hidden_size, patch_height, patch_width)
+        height, width = img_size # 传入的输入图片的高和宽
+        # 根据输入图片的高和宽计算new_patch_height, new_patch_width
+        new_patch_height, new_patch_width = height // self.config.patch_size, width // self.config.patch_size
+        # (depth*1,new_patch_heigth, new_patch_width)
+        patch_pos_embed = nn.functional.interpolate(
+            patch_pos_embed, size=(new_patch_height, new_patch_width), mode="bicubic", align_corners=False
+        )
+        # (depth*1,d,new_patch_heigth, new_patch_width)-->(depth*1,d,n_s)-->(depth*1,n_s,d)
+        # 之后设置成内存连续,-->(depth,1,n_s,d)
+        patch_pos_embed = (
+            patch_pos_embed.flatten(2)
+            .transpose(1, 2)
+            .contiguous()
+            .view(depth, batch_size, new_patch_height * new_patch_width, hidden_size)
+        )
+        # 在序列长度所在的轴合并
+        scale_pos_embed = torch.cat((cls_pos_embed, patch_pos_embed, det_pos_embed), dim=2)
+        return scale_pos_embed
+# 用于将输入图像转换为一系列补丁（patches）并嵌入到隐藏空间的模块。这个类首先将输入图像分割成补丁，然
+# 后通过一个卷积层将这些补丁映射到隐藏空间中，从而得到补丁嵌入
+class YolosPatchEmbeddings(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        # 输入图像的尺寸，可以是单个整数（正方形图像）或一个二元组（非正方形图像）
+        # patch_size：分割图像时的补丁尺寸，可以是单个整数或一个二元组。
+        image_size, patch_size = config.image_size, config.patch_size # size,patch_size
+        # 输入图像的通道数，通常是3（RGB图像）。隐藏空间的维度。
+        num_channels, hidden_size = config.num_channels, config.hidden_size # c,d
+        image_size = image_size if isinstance(image_size, collections.abc.Iterable) else (image_size, image_size)
+        patch_size = patch_size if isinstance(patch_size, collections.abc.Iterable) else (patch_size, patch_size)
+        # 根据输入图像尺寸和补丁尺寸计算得出的补丁总数。
+        num_patches = (image_size[1] // patch_size[1]) * (image_size[0] // patch_size[0]) # n_patches
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.num_channels = num_channels
+        self.num_patches = num_patches
+        # 一个卷积层，用于将补丁映射到隐藏空间。这样图像块都被一个嵌入向量表示
+        self.projection = nn.Conv2d(num_channels, hidden_size, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        batch_size, num_channels, height, width = pixel_values.shape
+        # 输入验证：确保输入图像的通道数与配置文件中设定的一致。
+        if num_channels != self.num_channels:
+            raise ValueError(
+                "Make sure that the channel dimension of the pixel values match with the one set in the configuration."
+            )
+        # 补丁嵌入生成,卷积操作：通过 projection 卷积层将输入图像分割成补丁，并将每个补丁映射到隐藏空间。
+        # 展平操作：将卷积后的张量展平为 (batch_size, hidden_size, num_patches) 的形状。
+        # 转置操作：将张量的形状从 (batch_size, hidden_size, num_patches) 转置为
+        # (batch_size, num_patches, hidden_size)，这样可以更好地适应后续的 Transformer 层。
+        # (b,d,h,w)-->(b,d,s)-->(b,s,d)
+        embeddings = self.projection(pixel_values).flatten(2).transpose(1, 2)
+        return embeddings
+class YolosSelfAttention(nn.Module):
+    def __init__(self, config: YolosConfig) -> None:
+        super().__init__()
+        # 嵌入维度必须能被头数整除
+        if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
+            raise ValueError(
+                f"The hidden size {config.hidden_size,} is not a multiple of the number of attention "
+                f"heads {config.num_attention_heads}."
+            )
+        self.num_attention_heads = config.num_attention_heads # h
+        self.attention_head_size = int(config.hidden_size / config.num_attention_heads) # dk
+        self.all_head_size = self.num_attention_heads * self.attention_head_size # d
+        # q,k,v线性层
+        self.query = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
+        self.key = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
+        self.value = nn.Linear(config.hidden_size, self.all_head_size, bias=config.qkv_bias)
+        # dropout层
+        self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
+
+    def transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
+        # (b,s,h,dk)
+        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
+        x = x.view(new_x_shape)
+        return x.permute(0, 2, 1, 3) #(b,h,s,dk)
+
+    def forward(
+        self, hidden_states, head_mask: Optional[torch.Tensor] = None, output_attentions: bool = False
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]:
+        mixed_query_layer = self.query(hidden_states) # (b,s,d)
+        key_layer = self.transpose_for_scores(self.key(hidden_states)) # (b,h,s,dk)
+        value_layer = self.transpose_for_scores(self.value(hidden_states))
+        query_layer = self.transpose_for_scores(mixed_query_layer) # (b,h,s,dk)
+        
+        # (b,h,q_len,dk)@(b,h,dk,k_len)-->(b,h,q_len,k_len)
+        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+        # 缩放
+        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+        # 在k_len上进行归一化,值的大小表示和q_len上指定token的相似度,值越大越相似,能捕捉到
+        # 长距离的关系
+        attention_probs = nn.functional.softmax(attention_scores, dim=-1)
+        # dropout
+        attention_probs = self.dropout(attention_probs)
+        # 如果有掩码,就对应元素相乘,这样对应掩码中0的位置会变成0,但是这样其他token的概率和
+        # 将不会是1,这个和传统的方式不一样,传统方式是先掩码,之后归一化,填充之外token的概率
+        # 和会是1
+        if head_mask is not None:
+            attention_probs = attention_probs * head_mask
+        # (b,h,q_len,k_len)@(b,h,v_len,dk)-->(b,h,q_len,dk)
+        context_layer = torch.matmul(attention_probs, value_layer)
+        # (b,h,q_len,dk)-->(b,q_len,h,dk),之后设置成内存连续
+        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
+        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
+        # (b,q_len,h,dk)-->（b,q_len,d）
+        context_layer = context_layer.view(new_context_layer_shape)
+        # 如果输出注意力权重就加上,否则只输出多头自注意力的输出
+        outputs = (context_layer, attention_probs) if output_attentions else (context_layer,)
+        return outputs
+# 继承自YolosSelfAttention
+class YolosSdpaSelfAttention(YolosSelfAttention):
+    def __init__(self, config: YolosConfig) -> None:
+        super().__init__(config)
+        # 设置dropout
+        self.attention_probs_dropout_prob = config.attention_probs_dropout_prob
+    def forward(
+        self, hidden_states, head_mask: Optional[torch.Tensor] = None, output_attentions: bool = False
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]:
+        mixed_query_layer = self.query(hidden_states)
+        key_layer = self.transpose_for_scores(self.key(hidden_states)) # (b,h,s,dk)
+        value_layer = self.transpose_for_scores(self.value(hidden_states))
+        query_layer = self.transpose_for_scores(mixed_query_layer)
+        context_layer = torch.nn.functional.scaled_dot_product_attention(
+            query_layer,
+            key_layer,
+            value_layer,
+            head_mask,
+            self.attention_probs_dropout_prob if self.training else 0.0,
+            is_causal=False,
+            scale=None,
+        )
+        #(b,h,q_len,dk)-->(b,q_len,h,dk)
+        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
+        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
+        context_layer = context_layer.view(new_context_layer_shape) # (b,s,d)
+        return context_layer, None
+class YolosSelfOutput(nn.Module): # 最后一个线性层
+    def __init__(self, config: YolosConfig) -> None:
+        super().__init__()
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+    def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.dense(hidden_states)
+        hidden_states = self.dropout(hidden_states)
+        return hidden_states
+class YolosAttention(nn.Module):
+    def __init__(self, config: YolosConfig) -> None:
+        super().__init__()
+        self.attention = YolosSelfAttention(config)
+        self.output = YolosSelfOutput(config)
+        # 存储已经修剪的头集合
+        self.pruned_heads = set()
+    def prune_heads(self, heads: Set[int]) -> None:
+        #如果没有要修剪的头,直接返回
+        if len(heads) == 0:
+            return
+        # 当前修剪过的头索引列表,未修剪的头索引对应的嵌入位置
+        heads, index = find_pruneable_heads_and_indices(
+            heads, self.attention.num_attention_heads, self.attention.attention_head_size, self.pruned_heads
+        )
+        # 修剪线性层
+        self.attention.query = prune_linear_layer(self.attention.query, index)
+        self.attention.key = prune_linear_layer(self.attention.key, index)
+        self.attention.value = prune_linear_layer(self.attention.value, index)
+        self.output.dense = prune_linear_layer(self.output.dense, index, dim=1)
+        # 去除修剪的头,就是当前模型具有的头数
+        self.attention.num_attention_heads = self.attention.num_attention_heads - len(heads)
+        # 更新q,k,v的嵌入维度
+        self.attention.all_head_size = self.attention.attention_head_size * self.attention.num_attention_heads
+        # 合并集合,去重
+        self.pruned_heads = self.pruned_heads.union(heads)
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        head_mask: Optional[torch.Tensor] = None,
+        output_attentions: bool = False,
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]:
+        self_outputs = self.attention(hidden_states, head_mask, output_attentions)
+        # 经过最后一个线性层转换,因为有修剪头,转换刚好又变成hidden_size
+        attention_output = self.output(self_outputs[0], hidden_states)
+        outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
+        return outputs
+class YolosSdpaAttention(YolosAttention):
+    def __init__(self, config: YolosConfig) -> None:
+        super().__init__(config)
+        self.attention = YolosSdpaSelfAttention(config)
+class YolosIntermediate(nn.Module):
+    def __init__(self, config: YolosConfig) -> None:
+        super().__init__()
+        self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
+        if isinstance(config.hidden_act, str):
+            self.intermediate_act_fn = ACT2FN[config.hidden_act]
+        else:
+            self.intermediate_act_fn = config.hidden_act
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # (h,s,d)-->(h,s,h_d)
+        hidden_states = self.dense(hidden_states)
+        hidden_states = self.intermediate_act_fn(hidden_states)
+        return hidden_states
+class YolosOutput(nn.Module):
+    def __init__(self, config: YolosConfig) -> None:
+        super().__init__()
+        self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+    def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
+        # (h,s,h_d)-->(h,s,d)
+        hidden_states = self.dense(hidden_states)
+        hidden_states = self.dropout(hidden_states)
+        hidden_states = hidden_states + input_tensor # 残差
+        return hidden_states
+class YolosLayer(nn.Module):
+    def __init__(self, config: YolosConfig) -> None:
+        super().__init__()
+        # 是否在进入前馈层前拆分样本的嵌入维度
+        self.chunk_size_feed_forward = config.chunk_size_feed_forward
+        self.seq_len_dim = 1 # 序列长度所在轴
+        # 获取配置的自注意力
+        self.attention = YOLOS_ATTENTION_CLASSES[config._attn_implementation](config)
+        #前馈层前部分
+        self.intermediate = YolosIntermediate(config)
+        # 前馈层后部分
+        self.output = YolosOutput(config)
+        # 层标准化
+        self.layernorm_before = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.layernorm_after = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        head_mask: Optional[torch.Tensor] = None,
+        output_attentions: bool = False,
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]:
+        #
+        self_attention_outputs = self.attention(
+            self.layernorm_before(hidden_states),# 在自注意力之前用标准化
+            head_mask, # 传入的掩码
+            # 是否输出注意力权重
+            output_attentions=output_attentions,
+        )
+        attention_output = self_attention_outputs[0] # 注意力输出
+        outputs = self_attention_outputs[1:]  # 权重
+        # 自注意力前后残差
+        hidden_states = attention_output + hidden_states
+        # 前馈层前的标准化
+        layer_output = self.layernorm_after(hidden_states)
+        # 前馈层(分成了两部分)
+        layer_output = self.intermediate(layer_output)
+        # 后部分,里面残差
+        layer_output = self.output(layer_output, hidden_states)
+        # 输出包括:编码器的输出+权重
+        outputs = (layer_output,) + outputs
+        return outputs

@@ -1,0 +1,206 @@
+import os
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+import keras
+
+print(keras.__version__) 
+
+3.0.1
+
+mnist被称为深度学习的hello world,因为它太简单了,为啥那些手写辨识好区分,甚至只用全连接网络都能达到很高的准确率,因为它背景色单一,都是黑色,特征简单,你只用平铺那些像素特征就行,像这种简单的特别适合入门,但是这么简单的,测试准确率达到99%才算及格,mnist特征简单,背景色单一,这就是为啥mnist准确率会很容易达到98%以上
+
+import numpy as np
+
+path='../datasets/mnist.npz'
+
+with np.load(path) as data:
+    x_train=data['x_train']
+    y_train=data['y_train']
+    x_test=data['x_test']
+    y_test=data['y_test']
+
+print(x_train.shape,y_train.shape,x_test.shape,y_test.shape)
+
+print(x_train.dtype,y_test.dtype,np.max(x_train),np.min(x_train),np.unique(y_train))
+
+x_train = x_train.astype("float32") / 255#转换数据到0-1,float32
+x_test = x_test.astype("float32") / 255
+
+print(x_train.dtype,x_train.max(),x_train.min())# 可以看到x_train变成float32,范围0-1
+
+#在最后增加一维通道
+x_train = np.expand_dims(x_train, -1)
+x_test = np.expand_dims(x_test, -1)
+
+num_classes = 10
+input_shape = (28, 28, 1)
+model = keras.Sequential(
+    [
+        keras.layers.Input(shape=input_shape),
+        keras.layers.Conv2D(64, kernel_size=(3, 3), activation="relu"),
+        keras.layers.Conv2D(64, kernel_size=(3, 3), activation="relu"),
+        keras.layers.MaxPooling2D(pool_size=(2, 2)),
+        keras.layers.Conv2D(128, kernel_size=(3, 3), activation="relu"),
+        keras.layers.Conv2D(128, kernel_size=(3, 3), activation="relu"),
+        keras.layers.GlobalAveragePooling2D(),#全局平均池化(会在8*8内取均值,之后形成新向量)
+        keras.layers.Dropout(0.5),
+        keras.layers.Dense(num_classes)
+    ]
+)
+
+model.summary()# 3*3*1*64+64,3*3*64*64+64,3*3*64*128+128,3*3*128*128+128
+
+model.compile(
+    loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+    optimizer=keras.optimizers.Adam(learning_rate=1e-3),
+    metrics=[
+        keras.metrics.SparseCategoricalAccuracy(name="acc"),
+    ],
+)
+
+batch_size = 128
+epochs = 20
+callbacks = [
+    keras.callbacks.ModelCheckpoint(filepath="./checkpoint/model_at_epoch_{epoch}.keras",
+                           monitor='val_loss',verbose=1,save_best_only=True,mode='min'),
+    keras.callbacks.EarlyStopping(monitor="val_loss", patience=2),#超过两次验证损失不减少就停止
+]
+model.fit(
+    x_train,
+    y_train,
+    batch_size=batch_size,# 批次大小128
+    epochs=epochs,
+    validation_split=0.15,#会切割0.15的比例做验证集
+    callbacks=callbacks
+)
+
+best_model=keras.models.load_model('./checkpoint/model_at_epoch_16.keras')
+
+# best_model=keras.saving.load_model('./checkpoint/model_at_epoch_2.keras')#也可以这样加载
+
+score = best_model.evaluate(x_test, y_test, verbose=2)
+
+313/313 - 3s - 9ms/step - acc: 0.9923 - loss: 0.0223
+
+在平均池化之前添加最大池化层
+
+model2 = keras.Sequential(
+    [
+        keras.layers.Input(shape=input_shape),
+        keras.layers.Conv2D(64, kernel_size=(3, 3), activation="relu"),
+        keras.layers.Conv2D(64, kernel_size=(3, 3), activation="relu"),
+        keras.layers.MaxPooling2D(pool_size=(2, 2)),
+        keras.layers.Conv2D(128, kernel_size=(3, 3), activation="relu"),
+        keras.layers.Conv2D(128, kernel_size=(3, 3), activation="relu"),
+        keras.layers.MaxPooling2D(pool_size=(2, 2)),
+        keras.layers.GlobalAveragePooling2D(),#全局平均池化(会在8*8内取均值,之后形成新向量)
+        keras.layers.Dropout(0.5),
+        keras.layers.Dense(num_classes)
+    ]
+)
+
+model2.compile(
+    loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+    optimizer=keras.optimizers.Adam(learning_rate=1e-3),
+    metrics=[
+        keras.metrics.SparseCategoricalAccuracy(name="acc"),
+    ],
+)
+
+batch_size = 128
+epochs = 20
+callbacks = [ keras.callbacks.ModelCheckpoint(
+    filepath="./checkpoint/best_model_mnist.keras",\
+                   monitor='val_loss',verbose=1,save_best_only=True,mode='min'),\
+    keras.callbacks.EarlyStopping(monitor="val_loss", patience=2)#超过两次验证损失不减少就停止
+]
+model2.fit(
+    x_train,
+    y_train,
+    batch_size=batch_size,# 批次大小128
+    epochs=epochs,
+    validation_split=0.15,#会切割0.15的比例做验证集
+    callbacks=callbacks
+)
+
+model2.load_weights('./checkpoint/best_model_mnist.keras')
+
+model2.evaluate(x_test,y_test,verbose=2)
+
+313/313 - 1s - 5ms/step - acc: 0.9924 - loss: 0.0239
+
+把.GlobalAveragePooling2D 换成Flattern,相当于提取的像素特征向量化,不像平均池化提前的是均值,这里是做了变形一样的reshape操作,4X4X128的特征图会被按顺序排列像素值,变成1维向量
+
+model3 = keras.Sequential(
+    [
+        keras.layers.Input(shape=input_shape),
+        keras.layers.Conv2D(64, kernel_size=(3, 3), activation="relu"),
+        keras.layers.Conv2D(64, kernel_size=(3, 3), activation="relu"),
+        keras.layers.MaxPooling2D(pool_size=(2, 2)),
+        keras.layers.Conv2D(128, kernel_size=(3, 3), activation="relu"),
+        keras.layers.Conv2D(128, kernel_size=(3, 3), activation="relu"),
+        keras.layers.MaxPooling2D(pool_size=(2, 2)),
+        keras.layers.Flatten(),
+        keras.layers.Dropout(0.5),
+        keras.layers.Dense(num_classes)
+    ]
+)
+
+model3.compile(
+    loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+    optimizer=keras.optimizers.Adam(learning_rate=1e-3),
+    metrics=[
+        keras.metrics.SparseCategoricalAccuracy(name="acc"),
+    ],
+)
+
+batch_size = 128
+epochs = 20
+callbacks = [ keras.callbacks.ModelCheckpoint(
+    filepath="./checkpoint/best_model_mnist2.keras",\
+                   monitor='val_loss',verbose=1,save_best_only=True,mode='min'),\
+    keras.callbacks.EarlyStopping(monitor="val_loss", patience=2)#超过两次验证损失不减少就停止
+]
+model3.fit(
+    x_train,
+    y_train,
+    batch_size=batch_size,# 批次大小128
+    epochs=epochs,
+    validation_split=0.15,#会切割0.15的比例做验证集
+    callbacks=callbacks
+)
+
+b_model=keras.models.load_model('./checkpoint/best_model_mnist2.keras')
+
+scor2 = b_model.evaluate(x_test, y_test, verbose=2)
+
+313/313 - 2s - 6ms/step - acc: 0.9941 - loss: 0.0196
+
+model3.load_weights('./checkpoint/best_model_mnist2.keras')
+
+model3.evaluate(x_test,y_test,verbose=2)
+
+313/313 - 3s - 8ms/step - acc: 0.9941 - loss: 0.0196
+
+layer_output=[layer.output for layer in model3.layers]
+
+len(layer_output)
+
+m_11=keras.Model(model3.inputs,layer_output[0])
+
+b11=m_11(x_train[:64]) #这里我们看前64个样本
+
+print(b11.numpy().max(),b11.numpy().min(),b11.shape)
+
+0.48058948 0.0 (64, 26, 26, 64)
+
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(12,12))
+for i in range(64):
+    plt.subplot(8,8,i+1)
+    plt.axis('off')
+    plt.imshow(b11[i,:,:,:3])#i,第i个样本,一共64个卷积,每个卷积在输入的每个通道权重不同,但同一个通道共用权重,权重形状是kernal_size X kernal_size X channel,:3是plt显示前3个卷积(滤镜)的叠加,类似rgb3个通道的叠加颜色,你单独看每个rgb通道是单独的颜色,合起来其实是3种颜色的合成色
+可以看到第一个卷积模型就能抓取各个图片的主要特征,这主要因为mnist背景色单一,背景色是黑色,如果背景复杂,甚至宣宾夺主,那模型就不间的那么容易抓取特征
+

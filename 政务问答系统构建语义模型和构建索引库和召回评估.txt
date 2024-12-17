@@ -1,0 +1,608 @@
+​
+
+import os
+import random
+from functools import partial
+import numpy as np
+import paddle
+from scipy import stats
+from paddlenlp.data import Pad, Tuple
+from paddlenlp.datasets import load_dataset
+from paddlenlp.transformers import AutoModel, AutoTokenizer
+import paddle.nn as nn
+import paddle.nn.functional as F
+import utils
+
+dropout=0.2
+save_dir='./checkpoints/zwqa/'
+batch_size=16
+epochs = 5
+max_seq_length= 64
+output_emb_size= 256
+dup_rate= 0.3
+train_set_file='./datasets/data/train.csv'
+device='gpu'
+seed=1000
+model_name_or_path = 'rocketqa-zh-dureader-query-encoder'
+margin=0.1
+scale=10.
+
+paddle.set_device(device)
+
+paddle和paddlenlp的版本必须是2.4.2以下的，用cpu训练不了，用python3.8以下，python3.9之前出现过生成的dataloader数据有大问题，不是非常大的负数就是0，可见paddle存在着很大的兼容性问题，要么是他们内部应该安装了其他的，果然和tensorflow，pytorch之类的没法比，要不是为了学里面的nlp一些应用，都懒得用这个，paddle_serving中最新的0.9.0，用paddlepaddle-2.6就报错，原因是新版没fruild
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    paddle.seed(seed)
+
+set_seed(seed)
+
+def read_simcse_text(data_path):
+    with open(data_path, "r", encoding="utf-8") as f:
+        for line in f:
+            data = line.rstrip()
+            yield {"text_a": data, "text_b": data}
+
+train_ds = load_dataset(
+        read_simcse_text, data_path=train_set_file, lazy=False)
+
+train_ds[:5]
+
+pretrained_model = AutoModel.from_pretrained(\
+    model_name_or_path, hidden_dropout_prob=dropout, attention_probs_dropout_prob=dropout)
+tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+
+def convert_example(example, tokenizer, max_seq_length=512, do_evalute=False):
+    result = []
+    for key, text in example.items():
+        if "label" in key:
+            # do_evaluate
+            result += [example["label"]]
+        else:
+            # do_train
+            encoded_inputs = tokenizer(text=text,max_length=max_seq_length,truncation=True)
+            input_ids = encoded_inputs["input_ids"]
+            token_type_ids = encoded_inputs["token_type_ids"]
+            result += [input_ids, token_type_ids]
+    return result
+
+trans_func = partial(
+    convert_example,
+    tokenizer=tokenizer,
+    max_seq_length=max_seq_length)
+
+trans_func(train_ds[0])#(前后加开始结束符)
+
+batchify_fn=lambda samples,fn=Tuple(
+        Pad(axis=0, pad_val=tokenizer.pad_token_id, dtype="int64"),  # query_input
+        Pad(axis=0, pad_val=tokenizer.pad_token_type_id, dtype="int64"),  # query_segment
+        Pad(axis=0, pad_val=tokenizer.pad_token_id, dtype="int64"),  # title_input
+        Pad(axis=0, pad_val=tokenizer.pad_token_type_id, dtype="int64"),  # title_segment
+    ):fn(samples)
+
+def create_dataloader(dataset, mode="train", batch_size=1, batchify_fn=None, trans_fn=None):
+    if trans_fn:
+        dataset = dataset.map(trans_fn)
+    shuffle = True if mode == "train" else False
+    if mode == "train":
+        batch_sampler = paddle.io.DistributedBatchSampler(dataset,batch_size=batch_size,shuffle=shuffle)
+    else:
+        batch_sampler = paddle.io.BatchSampler(dataset, batch_size=batch_size, shuffle=shuffle)
+
+    return paddle.io.DataLoader(\
+        dataset=dataset, batch_sampler=batch_sampler, collate_fn=batchify_fn, return_list=True)
+
+train_data_loader = create_dataloader(#构建dataloader
+        train_ds,
+        mode='train',
+        batch_size=batch_size,
+        batchify_fn=batchify_fn,
+        trans_fn=trans_func)
+
+for i in train_data_loader:
+    print(i)
+    break
+
+dropout=0.
+dropout if dropout is not None else 0.1
+
+class SimCSE(nn.Layer):
+    def __init__(self, pretrained_model, dropout=None, margin=0.0, scale=20, output_emb_size=None):
+        super().__init__()
+        self.ptm = pretrained_model#预训练模型
+        #dropout is not None和dropout是不一样的,dropout＝０．时,dropout是Ｆalse,dropout is not None是Ｔrue
+        self.dropout = nn.Dropout(dropout if dropout is not None else 0.1)
+        self.output_emb_size = output_emb_size
+        if output_emb_size > 0:#如果output_emb_size>0,线性转换
+            weight_attr = paddle.ParamAttr(initializer=paddle.nn.initializer.TruncatedNormal(std=0.02))
+            self.emb_reduce_linear = paddle.nn.Linear(768, output_emb_size, weight_attr=weight_attr)
+        self.margin = margin
+        self.scale = scale
+
+    @paddle.jit.to_static(
+        input_spec=[
+            paddle.static.InputSpec(shape=[None, None], dtype="int64"),
+            paddle.static.InputSpec(shape=[None, None], dtype="int64"),
+        ]
+    )
+    def get_pooled_embedding(
+        self, input_ids, token_type_ids=None, position_ids=None, attention_mask=None, with_pooler=True
+    ):
+        # Note: cls_embedding is poolerd embedding with act tanh
+        sequence_output, cls_embedding = self.ptm(input_ids, token_type_ids, position_ids, attention_mask)
+        if with_pooler is False:#如果ptm不返回池化层,把［CLS］输出作为池化输出
+            cls_embedding = sequence_output[:, 0, :]
+        if self.output_emb_size > 0:
+            cls_embedding = self.emb_reduce_linear(cls_embedding)
+        cls_embedding = self.dropout(cls_embedding)
+        cls_embedding = F.normalize(cls_embedding, p=2, axis=-1)#向量单位化（b,d）
+        return cls_embedding
+    def get_semantic_embedding(self, data_loader):
+        self.eval()
+        with paddle.no_grad():
+            for batch_data in data_loader:
+                input_ids, token_type_ids = batch_data
+                text_embeddings = self.get_pooled_embedding(input_ids, token_type_ids=token_type_ids)
+                yield text_embeddings#获取文本语义嵌入(b,d)
+
+    def cosine_sim(
+        self,
+        query_input_ids,
+        title_input_ids,
+        query_token_type_ids=None,
+        query_position_ids=None,
+        query_attention_mask=None,
+        title_token_type_ids=None,
+        title_position_ids=None,
+        title_attention_mask=None,
+        with_pooler=True,
+    ):
+
+        query_cls_embedding = self.get_pooled_embedding(
+            query_input_ids, query_token_type_ids, query_position_ids, query_attention_mask, with_pooler=with_pooler
+        )
+
+        title_cls_embedding = self.get_pooled_embedding(
+            title_input_ids, title_token_type_ids, title_position_ids, title_attention_mask, with_pooler=with_pooler
+        )
+        #query和title的余弦相似度,相当于对应向量点乘,因为两个都是单位向量,所以就是两个向量夹角的余弦值
+        cosine_sim = paddle.sum(query_cls_embedding * title_cls_embedding, axis=-1)
+        return cosine_sim
+    def forward(
+        self,
+        query_input_ids,
+        title_input_ids,
+        query_token_type_ids=None,
+        query_position_ids=None,
+        query_attention_mask=None,
+        title_token_type_ids=None,
+        title_position_ids=None,
+        title_attention_mask=None,
+    ):
+        #query语义向量(b,d)
+        query_cls_embedding = self.get_pooled_embedding(
+            query_input_ids, query_token_type_ids, query_position_ids, query_attention_mask
+        )
+        #title语义向量(b,d)
+        title_cls_embedding = self.get_pooled_embedding(
+            title_input_ids, title_token_type_ids, title_position_ids, title_attention_mask
+        )
+        #(b,d)@(d,b)=(b,b),得到的是query中的每个语义向量和title的每个语义向量的余弦值．
+        #每一行都是query和当前批次中的title的余弦相似度,按理对角线上更相似,因为对角线上是对应的query和title
+        #而余弦值范围是-1--1,所以模型要做的是让对角线上的值变大，其他位置值变小
+        cosine_sim = paddle.matmul(query_cls_embedding, title_cls_embedding, transpose_y=True)
+        #现在只是list形式
+        margin_diag = paddle.full(
+            shape=[query_cls_embedding.shape[0]], fill_value=self.margin, dtype=paddle.get_default_dtype()
+        )
+        cosine_sim = cosine_sim - paddle.diag(margin_diag)#在对角线上减去固定值
+        # 缩放余弦相似度，让模型更好的收敛
+        cosine_sim *= self.scale
+        labels = paddle.arange(0, query_cls_embedding.shape[0], dtype="int64")
+        labels = paddle.reshape(labels, shape=[-1, 1])#(b,1)
+        loss = F.cross_entropy(input=cosine_sim, label=labels)
+        return loss
+
+model =SimCSE(
+        pretrained_model,
+        margin=margin,
+        scale=scale,
+        output_emb_size=output_emb_size)
+
+num_training_steps =len(train_data_loader) *epochs
+
+lr_scheduler =utils.get_scheduler(num_training_steps,0.04)
+
+optimizer = paddle.optimizer.Adam(learning_rate=lr_scheduler,
+                                  parameters=model.parameters())
+
+#重复词策略
+def word_repetition(input_ids, token_type_ids, dup_rate=0.32):
+    """Word Repetition strategy."""
+    input_ids = input_ids.numpy().tolist()
+    token_type_ids = token_type_ids.numpy().tolist()
+    batch_size, seq_len = len(input_ids), len(input_ids[0])
+    repetitied_input_ids = []
+    repetitied_token_type_ids = []
+    rep_seq_len = seq_len
+    for batch_id in range(batch_size):
+        cur_input_id = input_ids[batch_id]
+        actual_len = np.count_nonzero(cur_input_id)
+        dup_word_index = []
+        # If sequence length is less than 5, skip it
+        if actual_len > 5:
+            dup_len = random.randint(a=0, b=max(2, int(dup_rate * actual_len)))
+            # Skip cls and sep position
+            dup_word_index = random.sample(list(range(1, actual_len - 1)), k=dup_len)
+
+        r_input_id = []
+        r_token_type_id = []
+        for idx, word_id in enumerate(cur_input_id):
+            # Insert duplicate word
+            if idx in dup_word_index:
+                r_input_id.append(word_id)
+                r_token_type_id.append(token_type_ids[batch_id][idx])
+            r_input_id.append(word_id)
+            r_token_type_id.append(token_type_ids[batch_id][idx])
+        after_dup_len = len(r_input_id)
+        repetitied_input_ids.append(r_input_id)
+        repetitied_token_type_ids.append(r_token_type_id)
+
+        if after_dup_len > rep_seq_len:
+            rep_seq_len = after_dup_len
+    # Padding the data to the same length
+    for batch_id in range(batch_size):
+        after_dup_len = len(repetitied_input_ids[batch_id])
+        pad_len = rep_seq_len - after_dup_len
+        repetitied_input_ids[batch_id] += [0] * pad_len
+        repetitied_token_type_ids[batch_id] += [0] * pad_len
+
+    return paddle.to_tensor(repetitied_input_ids, dtype="int64"), paddle.to_tensor(
+        repetitied_token_type_ids, dtype="int64"
+    )
+
+def train(model,dataloader,optimizer,scheduler,global_step):
+    model.train()
+    total_loss=0.
+    for step, batch in enumerate(dataloader, start=1):
+        query_input_ids, query_token_type_ids, title_input_ids, title_token_type_ids = batch
+        #随机加重复词
+        if dup_rate > 0.0:
+            query_input_ids, query_token_type_ids = word_repetition(
+                query_input_ids, query_token_type_ids,dup_rate)
+            title_input_ids, title_token_type_ids = word_repetition(
+                title_input_ids, title_token_type_ids, dup_rate)
+        loss = model(
+            query_input_ids=query_input_ids,
+            title_input_ids=title_input_ids,
+            query_token_type_ids=query_token_type_ids,
+            title_token_type_ids=title_token_type_ids)
+        loss.backward()#反向传播
+        optimizer.step()#梯度更新
+        optimizer.clear_grad()#梯度归0
+        scheduler.step()#更新学习率
+        global_step += 1
+        total_loss += loss.item()
+        if global_step % 30 == 0 and global_step!=0:
+            print("global_step %d - batch: %d -loss: %.5f -dup_rate %.4f"
+                  %(global_step,step,loss.item(),dup_rate))
+    avg_loss=total_loss/len(dataloader)
+    return avg_loss,global_step
+
+def train_epochs(epochs,save_path):
+    global_step = 0#全局步
+    best_loss=float('inf')#最好的损失
+    for epoch in range(1,epochs+1):
+        avg_loss,global_step = train(model,train_data_loader,optimizer,\
+        lr_scheduler,global_step)
+        print("epoch:%d - global_step:%d - avg_loss: %.4f - best_loss: %.4f -lr:%.8f" \
+          % (epoch,global_step,avg_loss,best_loss,optimizer.get_lr()))
+        if avg_loss < best_loss:#avg_loss< best_loss才会更新保存模型
+            paddle.save(model.state_dict(),\
+                save_path+'zfqa_best_1.pdparams')
+            tokenizer.save_pretrained(save_path)
+            best_loss=avg_loss#更新best_loss
+
+if not os.path.exists(save_dir): os.makedirs(save_dir)
+
+train_epochs(epochs,save_dir)
+​
+ import os
+from functools import partial
+import paddle
+from paddlenlp.data import Pad, Tuple
+from paddlenlp.datasets import MapDataset
+from paddlenlp.transformers import AutoModel, AutoTokenizer
+from paddlenlp.utils.log import logger
+import paddle.nn as nn
+import paddle.nn.functional as F
+import hnswlib
+import numpy as np
+
+log_dir = "recall_log/"
+device ='gpu'
+recall_result_dir = "recall_result_dir"
+recall_result_file = "zfqa_recall_result.txt"
+params_path='./checkpoints/zwqa/zfqa_best_1.pdparams'
+hnsw_m = 100
+hnsw_ef = 100
+hnsw_max_elements=3000000
+batch_size = 16
+output_emb_size = 256
+max_seq_length = 64
+recall_num = 10
+similar_text_pair ='./datasets/data/test_pair.csv'
+corpus_file = "./datasets/data/corpus.csv"
+
+paddle.set_device(device)
+
+model_name_or_path = "rocketqa-zh-dureader-query-encoder"
+
+tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+
+def convert_example_test(example, tokenizer, max_seq_length=512, pad_to_max_seq_len=False):
+    result = []
+    for key, text in example.items():
+        encoded_inputs = tokenizer(\
+            text=text,max_length=max_seq_length,truncation=True,pad_to_max_seq_len=pad_to_max_seq_len)
+        input_ids = encoded_inputs["input_ids"]
+        token_type_ids = encoded_inputs["token_type_ids"]
+        result += [input_ids, token_type_ids]
+    return result
+
+trans_func = partial(convert_example_test, tokenizer=tokenizer, max_seq_length=max_seq_length)
+
+def batchify_fn(
+    samples,
+    fn=Tuple(
+        Pad(axis=0, pad_val=tokenizer.pad_token_id, dtype="int64"),  # text_input
+        Pad(axis=0, pad_val=tokenizer.pad_token_type_id, dtype="int64"),  # text_segment
+    ),
+):
+    return [data for data in fn(samples)]
+
+pretrained_model = AutoModel.from_pretrained(model_name_or_path)
+
+class SimCSE(nn.Layer):
+    def __init__(self, pretrained_model, dropout=None, margin=0.0, scale=20, output_emb_size=None):
+        super().__init__()
+        self.ptm = pretrained_model#预训练模型
+        #dropout is not None和dropout是不一样的,dropout＝０．时,dropout是Ｆalse,dropout is not None是Ｔrue
+        self.dropout = nn.Dropout(dropout if dropout is not None else 0.1)
+        self.output_emb_size = output_emb_size
+        if output_emb_size > 0:#如果output_emb_size>0,线性转换
+            weight_attr = paddle.ParamAttr(initializer=paddle.nn.initializer.TruncatedNormal(std=0.02))
+            self.emb_reduce_linear = paddle.nn.Linear(768, output_emb_size, weight_attr=weight_attr)
+        self.margin = margin
+        self.scale = scale
+
+    @paddle.jit.to_static(
+        input_spec=[
+            paddle.static.InputSpec(shape=[None, None], dtype="int64"),
+            paddle.static.InputSpec(shape=[None, None], dtype="int64"),
+        ]
+    )
+    def get_pooled_embedding(
+        self, input_ids, token_type_ids=None, position_ids=None, attention_mask=None, with_pooler=True
+    ):
+        # Note: cls_embedding is poolerd embedding with act tanh
+        sequence_output, cls_embedding = self.ptm(input_ids, token_type_ids, position_ids, attention_mask)
+        if with_pooler is False:#如果ptm不返回池化层,把［CLS］输出作为池化输出
+            cls_embedding = sequence_output[:, 0, :]
+        if self.output_emb_size > 0:
+            cls_embedding = self.emb_reduce_linear(cls_embedding)
+        cls_embedding = self.dropout(cls_embedding)
+        cls_embedding = F.normalize(cls_embedding, p=2, axis=-1)#向量单位化（b,d）
+        return cls_embedding
+    def get_semantic_embedding(self, data_loader):
+        self.eval()
+        with paddle.no_grad():
+            for batch_data in data_loader:
+                input_ids, token_type_ids = batch_data
+                text_embeddings = self.get_pooled_embedding(input_ids, token_type_ids=token_type_ids)
+                yield text_embeddings#获取文本语义嵌入(b,d)
+
+    def cosine_sim(
+        self,
+        query_input_ids,
+        title_input_ids,
+        query_token_type_ids=None,
+        query_position_ids=None,
+        query_attention_mask=None,
+        title_token_type_ids=None,
+        title_position_ids=None,
+        title_attention_mask=None,
+        with_pooler=True,
+    ):
+
+        query_cls_embedding = self.get_pooled_embedding(
+            query_input_ids, query_token_type_ids, query_position_ids, query_attention_mask, with_pooler=with_pooler
+        )
+
+        title_cls_embedding = self.get_pooled_embedding(
+            title_input_ids, title_token_type_ids, title_position_ids, title_attention_mask, with_pooler=with_pooler
+        )
+        #query和title的余弦相似度,相当于对应向量点乘,因为两个都是单位向量,所以就是两个向量夹角的余弦值
+        cosine_sim = paddle.sum(query_cls_embedding * title_cls_embedding, axis=-1)
+        return cosine_sim
+    def forward(
+        self,
+        query_input_ids,
+        title_input_ids,
+        query_token_type_ids=None,
+        query_position_ids=None,
+        query_attention_mask=None,
+        title_token_type_ids=None,
+        title_position_ids=None,
+        title_attention_mask=None,
+    ):
+        #query语义向量(b,d)
+        query_cls_embedding = self.get_pooled_embedding(
+            query_input_ids, query_token_type_ids, query_position_ids, query_attention_mask
+        )
+        #title语义向量(b,d)
+        title_cls_embedding = self.get_pooled_embedding(
+            title_input_ids, title_token_type_ids, title_position_ids, title_attention_mask
+        )
+        #(b,d)@(d,b)=(b,b),得到的是query中的每个语义向量和title的每个语义向量的余弦值．
+        #每一行都是query和当前批次中的title的余弦相似度,按理对角线上更相似,因为对角线上是对应的query和title
+        #而余弦值范围是-1--1,所以模型要做的是让对角线上的值变大，其他位置值变小
+        cosine_sim = paddle.matmul(query_cls_embedding, title_cls_embedding, transpose_y=True)
+        #现在只是list形式
+        margin_diag = paddle.full(
+            shape=[query_cls_embedding.shape[0]], fill_value=self.margin, dtype=paddle.get_default_dtype()
+        )
+        cosine_sim = cosine_sim - paddle.diag(margin_diag)#在对角线上减去固定值
+        # 缩放余弦相似度，让模型更好的收敛
+        cosine_sim *= self.scale
+        labels = paddle.arange(0, query_cls_embedding.shape[0], dtype="int64")
+        labels = paddle.reshape(labels, shape=[-1, 1])#(b,1)
+        loss = F.cross_entropy(input=cosine_sim, label=labels)
+        return loss
+
+model = SimCSE(pretrained_model, output_emb_size=output_emb_size)
+model = paddle.DataParallel(model)
+
+if params_path and os.path.isfile(params_path):
+    state_dict = paddle.load(params_path)
+    model.set_dict(state_dict)
+    logger.info("Loaded parameters from %s" % params_path)
+else:
+    raise ValueError("Please set --params_path with correct pretrained model file")
+
+def gen_id2corpus(corpus_file):
+    id2corpus = {}
+    with open(corpus_file, "r", encoding="utf-8") as f:
+        for idx, line in enumerate(f):
+            id2corpus[idx] = line.rstrip()
+    return id2corpus
+
+#基于语义索引模型抽取出Doc样本库的文本向量
+id2corpus = gen_id2corpus(corpus_file)
+
+[{k:v} for k,v in id2corpus.items()][:3]
+
+corpus_list = [{idx: text} for idx, text in id2corpus.items()]
+corpus_ds = MapDataset(corpus_list)#查询库
+
+def create_dataloader(dataset, mode="train", batch_size=1, batchify_fn=None, trans_fn=None):
+    if trans_fn:
+        dataset = dataset.map(trans_fn)
+    shuffle = True if mode == "train" else False
+    if mode == "train":
+        batch_sampler = paddle.io.DistributedBatchSampler(dataset, batch_size=batch_size, shuffle=shuffle)
+    else:
+        batch_sampler = paddle.io.BatchSampler(dataset, batch_size=batch_size, shuffle=shuffle)
+    return paddle.io.DataLoader(\
+        dataset=dataset, batch_sampler=batch_sampler, collate_fn=batchify_fn, return_list=True)
+
+corpus_data_loader = create_dataloader(
+    corpus_ds, mode="predict", batch_size=batch_size, batchify_fn=batchify_fn, trans_fn=trans_func
+)
+
+# Need better way to get inner model of DataParallel
+inner_model = model._layers
+
+# 采用hnswlib对Doc端Embedding建库
+def build_index(data_loader, model):
+    index = hnswlib.Index(space="ip", dim=output_emb_size if output_emb_size > 0 else 768)
+    index.init_index(max_elements=hnsw_max_elements, ef_construction=hnsw_ef, M=hnsw_m)
+    index.set_ef(hnsw_ef)
+    index.set_num_threads(8)
+    logger.info("start build index..........")
+    all_embeddings = []#用来装所有批次的语义向量
+    for text_embeddings in model.get_semantic_embedding(data_loader):
+        all_embeddings.append(text_embeddings.numpy())
+    all_embeddings = np.concatenate(all_embeddings, axis=0)#合并数据
+    index.add_items(all_embeddings)
+    logger.info("Total index number:{}".format(index.get_current_count()))
+    return index
+
+#使用 ANN 引擎构建索引库（这里基于 hnswlib 进行 ANN 索引）
+final_index = build_index(corpus_data_loader, inner_model)
+
+def gen_text_file(similar_text_pair_file):
+    text2similar_text = {}
+    texts = []
+    with open(similar_text_pair_file, "r", encoding="utf-8") as f:
+        for line in f:
+            splited_line = line.rstrip().split("\t")
+            if len(splited_line) != 2:#过滤掉不是成对的
+                continue
+            text, similar_text = splited_line
+            if not text or not similar_text:#过滤掉空文本
+                continue
+            text2similar_text[text] = similar_text#重复的key文本会被替换
+            texts.append({"text": text})
+    return texts, text2similar_text
+
+text_list, text2similar_text = gen_text_file(similar_text_pair)
+
+text_list[:3]
+
+[{k,v} for k,v in text2similar_text.items()][:3]
+
+query_ds = MapDataset(text_list)
+
+query_data_loader = create_dataloader(
+        query_ds, mode="predict", batch_size=batch_size, batchify_fn=batchify_fn, trans_fn=trans_func
+    )
+
+# 基于语义索引模型抽取出评估集 Source Text 的文本向量
+query_embedding = inner_model.get_semantic_embedding(query_data_loader)
+
+if not os.path.exists(recall_result_dir):
+        os.mkdir(recall_result_dir)
+
+recall_result_file = os.path.join(recall_result_dir,recall_result_file)
+
+# 基于语义索引模型抽取出评估集 Source Text 的文本向量，在第 2 步中建立的索引库中进行 ANN 查询，
+# 召回 Top10 最相似的 Target Text，产出评估集中 Source Text 的召回结果 文件。recall_result
+#1.0 - cosine_sims[row_index][idx]范围0-2,越大越不相似,因为cosine_sims[row_index][idx]范围-1-1
+#因为0表示两个文本相同,2表示两个文本语义完全不同
+with open(recall_result_file, "w", encoding="utf-8") as f:
+        for batch_index, batch_query_embedding in enumerate(query_embedding):
+            #当前批次的召回，相似度
+            recalled_idx, cosine_sims = final_index.knn_query(batch_query_embedding.numpy(),recall_num)
+            batch_size = len(cosine_sims)
+            for row_index in range(batch_size):
+                text_index = batch_size * batch_index + row_index#在原问题文本集中的索引
+                for idx, doc_idx in enumerate(recalled_idx[row_index]):#idx:0-9,doc_idx:库中索引
+                    f.write(
+                        "{}\t{}\t{}\n".format(
+                            text_list[text_index]["text"], id2corpus[doc_idx],1.0-cosine_sims[row_index][idx]
+                        )
+                    )
+
+def recall(rs, N=10):
+    recall_flags = [np.sum(r[0:N]) for r in rs]#rs是one-hot形式,所以是前n个有１个是１,列表位置就是１
+    return np.mean(recall_flags)
+
+rs = []#存放比对标记,长度与原始查询问题对长度相同
+with open(recall_result_file, "r", encoding="utf-8") as f:
+    relevance_labels = []
+    for index, line in enumerate(f):
+        #查询问题文本，召回文本，相似度
+        text, recalled_text, cosine_sim = line.rstrip().split("\t")
+        if text2similar_text[text] == recalled_text:#召回如果和语义相似文本对中的值相同            
+            relevance_labels.append(1)#设置标记为１，表示找到准确的语义相似问题
+        else:
+            relevance_labels.append(0)
+        if (index + 1) % recall_num == 0:#确保够１０个召回就继续下个文本比对
+            rs.append(relevance_labels)
+            relevance_labels = []
+
+recall_N = []
+recall_num = [1, 5, 10]#设置召回数
+result = open(f"{recall_result_dir}/result.tsv", "a")
+res = []
+for topN in recall_num:#遍历，topN:1-5-10
+    R = round(100 * recall(rs, N=topN), 3)#统计对应的召回精度
+    recall_N.append(str(R))
+for key, val in zip(recall_num, recall_N):#打包召回数和召回精度
+    print("recall@{}={}".format(key, val))#打印召回数和其对应的精度
+    res.append(str(val))
+result.write("\t".join(res) + "\n")
+result.close()
+# print("\t".join(recall_N))

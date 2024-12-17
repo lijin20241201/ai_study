@@ -1,0 +1,349 @@
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'#设置tensorflow的日志级别
+from tensorflow.python.platform import build_info
+
+import tensorflow as tf
+
+# 列出所有物理GPU设备  
+gpus = tf.config.list_physical_devices('GPU')  
+if gpus:  
+    # 如果有GPU，设置GPU资源使用率  
+    try:  
+        # 允许GPU内存按需增长  
+        for gpu in gpus:  
+            tf.config.experimental.set_memory_growth(gpu, True)  
+        # 设置可见的GPU设备（这里实际上不需要，因为已经通过内存增长设置了每个GPU）  
+        # tf.config.set_visible_devices(gpus, 'GPU')  
+        print("GPU可用并已设置内存增长模式。")  
+    except RuntimeError as e:  
+        # 虚拟设备未就绪时可能无法设置GPU  
+        print(f"设置GPU时发生错误: {e}")  
+else:  
+    # 如果没有GPU  
+    print("没有检测到GPU设备。")
+
+import tensorflow_datasets as tfds
+from tensorflow_examples.models.pix2pix import pix2pix
+import os
+import time
+import matplotlib.pyplot as plt
+from IPython.display import clear_output
+AUTOTUNE = tf.data.AUTOTUNE
+# tf.data.AUTOTUNE 是一个特殊的值，它告诉TensorFlow的tf.data API自动选择适当的并行度。
+# 当使用tf.data API来构建输入管道时，经常需要决定并行
+# 处理数据的方式，以最大化数据加载和预处理的速度，同时不浪费计算资源。
+
+# 加载训练数据  
+def load_and_preprocess_image(image_path):  
+    image = tf.io.read_file(image_path)  
+    image = tf.image.decode_jpeg(image, channels=3)  
+    image = tf.image.resize(image, IMAGE_SIZE)  
+    image /= 255.0  # 归一化到[0, 1]  
+    return image 
+
+BUFFER_SIZE = 1000
+BATCH_SIZE = 1
+IMG_WIDTH = 256
+IMG_HEIGHT = 256
+
+#改变图片大小
+def resize(image, height, width):
+  image = tf.image.resize(image, [height, width],
+                                method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
+  return image
+
+#定义随机裁剪方法
+def random_crop(image):
+  cropped_image = tf.image.random_crop(
+      image, size=[IMG_HEIGHT, IMG_WIDTH, 3])
+  return cropped_image
+
+# 标准化 to [-1, 1]
+def normalize(image):
+  image = tf.cast(image, tf.float32)
+  image = (image / 127.5) - 1
+  return image
+
+def random_jitter(image):
+  # 改变尺寸到 286x286
+  image = resize(image, 286, 286)
+  # 随机裁剪to 256 x 256 x 3
+  image = random_crop(image)
+  # 随机的水平翻转
+  image = tf.image.random_flip_left_right(image)
+  return image
+
+def load(image_file):
+    # 读取图片文件,并且解码转换成uint8
+    image = tf.io.read_file(image_file)
+    image = tf.image.decode_jpeg(image, channels=3)
+    image = tf.cast(image, tf.float32)
+    return image
+
+def preprocess_image_train(image_file):#定义预处理训练图片的方法
+    # print(image_file)
+    image = load(image_file)
+    image = random_jitter(image)
+    image = normalize(image)
+    return image
+
+import matplotlib.pylab as plt
+
+def preprocess_image_test(image_file):#定义预处理测试图片的方法，只做标准化处理
+    image = load(image_file)
+    image = normalize(image)
+    return image
+
+import pathlib
+
+PATH=pathlib.Path('./datasets/horse2zebra/')
+
+# 创建数据集  
+train_horse_dataset = tf.data.Dataset.list_files(str(PATH /'trainA/*.jpg'))
+
+train_horse_dataset = train_horse_dataset.map(\
+    preprocess_image_train,num_parallel_calls=AUTOTUNE) 
+
+train_horse_dataset = train_horse_dataset.shuffle(BUFFER_SIZE)#缓冲区大小，可以随机刷新数据
+train_horse_dataset = train_horse_dataset.batch(BATCH_SIZE)#返回指定批次数据
+
+train_zebra_dataset = tf.data.Dataset.list_files(str(PATH /'trainB/*.jpg'))
+
+from PIL import Image
+
+import numpy as np
+
+ima=Image.open(str(PATH /'trainB/n02391049_1004.jpg'))
+np.array(ima).shape
+
+train_zebra_dataset = train_zebra_dataset.map(\
+    preprocess_image_train,num_parallel_calls=AUTOTUNE) 
+
+train_zebra_dataset = train_zebra_dataset.shuffle(BUFFER_SIZE).batch(BATCH_SIZE)
+
+for i in train_zebra_dataset.take(1):
+    print(i.shape)
+    plt.imshow(i[0])
+
+test_horse_dataset = tf.data.Dataset.list_files(str(PATH /'testA/*.jpg'))
+test_horse_dataset = test_horse_dataset.map(\
+    preprocess_image_test,num_parallel_calls=AUTOTUNE)  
+test_horse_dataset = test_horse_dataset.shuffle(BUFFER_SIZE).batch(BATCH_SIZE)
+
+test_zebra_dataset = tf.data.Dataset.list_files(str(PATH /'testB/*.jpg'))
+test_zebra_dataset = test_zebra_dataset.map(\
+    preprocess_image_test,num_parallel_calls=AUTOTUNE)  
+test_zebra_dataset = test_zebra_dataset.shuffle(BUFFER_SIZE).batch(BATCH_SIZE)
+
+sample_horse = next(iter(train_horse_dataset))
+sample_zebra = next(iter(train_zebra_dataset))
+
+plt.subplot(121)
+plt.title('Horse')
+plt.imshow(sample_horse[0] * 0.5 + 0.5)
+plt.subplot(122)
+plt.title('Horse with random jitter')
+plt.imshow(random_jitter(sample_horse[0]) * 0.5 + 0.5)
+
+plt.subplot(121)
+plt.title('Zebra')
+plt.imshow(sample_zebra[0] * 0.5 + 0.5)
+plt.subplot(122)
+plt.title('Zebra with random jitter')
+plt.imshow(random_jitter(sample_zebra[0]) * 0.5 + 0.5)
+
+OUTPUT_CHANNELS = 3# 输出通道
+#生成器G(用于从马生成斑马)
+generator_g = pix2pix.unet_generator(OUTPUT_CHANNELS, norm_type='instancenorm')
+#生成器F(用于从班马生成马)
+generator_f = pix2pix.unet_generator(OUTPUT_CHANNELS, norm_type='instancenorm')
+#判别器,discriminator_x和discriminator_y。判别器的任务是区分输入的图像是来自真实数据集还是由生成器生成的。
+# target=False通常意味着判别器在训练时不会将输入图像与某个特定的目标（或条件）进行比较。在pix2pix中，
+#这通常意味着判别器只接收生成的图像或真实图像作为输入，而不是成对的图像（一个源图像和一个目标图像）。
+discriminator_x = pix2pix.discriminator(norm_type='instancenorm', target=False)
+discriminator_y = pix2pix.discriminator(norm_type='instancenorm', target=False)
+
+to_zebra = generator_g(sample_horse)#用生成器G转变马-->斑马
+to_horse = generator_f(sample_zebra)#用生成器F转变斑马-->马
+plt.figure(figsize=(8, 8))#设置画布大小
+contrast = 8
+#图片列表:马,变成斑马的马,斑马,变成马的斑马
+imgs = [sample_horse, to_zebra, sample_zebra, to_horse]
+title = ['Horse', 'To Zebra', 'Zebra', 'To Horse']
+for i in range(len(imgs)):
+  plt.subplot(2, 2, i+1)
+  plt.title(title[i])
+  if i % 2 == 0:
+    plt.imshow(imgs[i][0] * 0.5 + 0.5)
+  else:
+    plt.imshow(imgs[i][0] * 0.5 * contrast + 0.5)
+plt.show()
+
+plt.figure(figsize=(8, 8))
+plt.subplot(121)
+plt.title('Is a real zebra?')
+plt.imshow(discriminator_y(sample_zebra)[0, ..., -1], cmap='RdBu_r')
+plt.subplot(122)
+plt.title('Is a real horse?')
+plt.imshow(discriminator_x(sample_horse)[0, ..., -1], cmap='RdBu_r')
+plt.show()
+
+LAMBDA = 10
+loss_obj = tf.keras.losses.BinaryCrossentropy(from_logits=True)
+
+#定义判别器损失函数,参数:real:判别器给真实图片打的分值,generated:判别器给生成器生成图片打的分
+def discriminator_loss(real, generated):
+  #计算real和全1(理想的真实分值)之间的损失
+  real_loss = loss_obj(tf.ones_like(real), real)
+  #计算generate和全0(理想的假货分值)之间的损失
+  generated_loss = loss_obj(tf.zeros_like(generated), generated)
+  total_disc_loss = real_loss + generated_loss#总的判别损失是这两个的和
+  return total_disc_loss * 0.5
+
+#定义生成器损失,参数:判别器给生成器生成图片打的分
+def generator_loss(generated):
+  #计算generate和全1(理想的真实分值)间的损失,生成器会更新参数减少这个损失
+  return loss_obj(tf.ones_like(generated), generated)
+
+#循环损失,参数:真实图片,经过一圈处理,回到起点的图片
+# 循环损失是一种正则化技术，用于鼓励模型在转换过程中保留原始图像的信息，
+# 从而使得转换回原始风格后的图像与原始图像尽可能接近
+def calc_cycle_loss(real_image, cycled_image):
+  #计算原真实图片和转换处理两次后转换回来的图片数据之间的mae
+  loss1 = tf.reduce_mean(tf.abs(real_image - cycled_image))
+  return LAMBDA * loss1
+
+#一致性损失,生成器G负责将图片X转换为Y 。一致性损失表明，如果您将图片Y馈送给生成器G ，它应当生成真实图片Y或接近于Y的图片
+def identity_loss(real_image, same_image):
+  #计算真实目标图片和生成器处理这个图片之后的图片的mae,就是对应像素求差异,之后整体求均值
+  loss = tf.reduce_mean(tf.abs(real_image - same_image))
+  return LAMBDA * 0.5 * loss
+
+#为所有生成器和判别器初始化优化器。
+generator_g_optimizer = tf.keras.optimizers.Adam(2e-4, beta_1=0.5)
+generator_f_optimizer = tf.keras.optimizers.Adam(2e-4, beta_1=0.5)
+discriminator_x_optimizer = tf.keras.optimizers.Adam(2e-4, beta_1=0.5)
+discriminator_y_optimizer = tf.keras.optimizers.Adam(2e-4, beta_1=0.5)
+
+checkpoint_path = "./checkpoints/train"
+ckpt = tf.train.Checkpoint(generator_g=generator_g,#生成器G
+                           generator_f=generator_f,#生成器F
+                           discriminator_x=discriminator_x,#判别器X
+                           discriminator_y=discriminator_y,#判别器Y
+                           generator_g_optimizer=generator_g_optimizer,
+                           generator_f_optimizer=generator_f_optimizer,
+                           discriminator_x_optimizer=discriminator_x_optimizer,
+                           discriminator_y_optimizer=discriminator_y_optimizer)
+# max_to_keep: 这是一个整数，指定了在checkpoint_path目录下最多保留多少个检查点文件。
+# 在这个例子中，max_to_keep=5意味着最多保留最近的5个检查点文件。
+# 当创建新的检查点时，如果已经有5个或更多的检查点文件存在，那么最旧的检查点文件将被删除。
+ckpt_manager = tf.train.CheckpointManager(ckpt, checkpoint_path, max_to_keep=5)
+#如果最新的检查点存在
+if ckpt_manager.latest_checkpoint:
+  ckpt.restore(ckpt_manager.latest_checkpoint)
+  print ('最新检查点加载了!!')
+
+EPOCHS = 10
+#定义生成图片方法,生成器,测试的输入数据
+def generate_images(model, test_input):
+  prediction = model(test_input)# 获取生成器生成图片
+  plt.figure(figsize=(12, 12))#设置画布大小
+  display_list = [test_input[0], prediction[0]]#图片列表
+  title = ['Input Image', 'Predicted Image']
+  for i in range(2):
+    plt.subplot(1, 2, i+1)
+    plt.title(title[i])
+    # 转换数据在0-1之间,并且显示图片
+    plt.imshow(display_list[i] * 0.5 + 0.5)
+    plt.axis('off')
+  plt.show()
+
+@tf.function#图函数,真实图片x,真实图片y
+def train_step(real_x, real_y):
+  # persistent=True,这样tape可以被多次调用
+  with tf.GradientTape(persistent=True) as tape:
+    #获取生成器G的输出,x-->y
+    fake_y = generator_g(real_x, training=True)
+    #之后用生成器F把fake_y生成cycled_x,为一个循环
+    #我们希望经过这个循环,cycled_x和real_x区别不大
+    cycled_x = generator_f(fake_y, training=True)
+    #获取生成器F的输出,y-->x
+    fake_x = generator_f(real_y, training=True)
+    #之后用生成器G把fake_x生成cycled_y,为一个循环  
+    cycled_y = generator_g(fake_x, training=True)
+    #生成器F是做y-->x转换的,你把真实的x丢进去,它应该生成和x相像的
+    same_x = generator_f(real_x, training=True)
+    #生成器G是做x-->y转换的,你把真实的y丢进去,它应该生成和y相像的
+    same_y = generator_g(real_y, training=True)
+    #获取判别器x判别真实x的分值
+    disc_real_x = discriminator_x(real_x, training=True)
+    #获取判别器y判别真实y的分值
+    disc_real_y = discriminator_y(real_y, training=True)
+    #获取判别器x判别生成器F生成的x的分值
+    disc_fake_x = discriminator_x(fake_x, training=True)
+    #获取判别器y判别生成器G生成的y的分值
+    disc_fake_y = discriminator_y(fake_y, training=True)
+    #计算生成器G损失(disc_fake_y和全1的差异)
+    gen_g_loss = generator_loss(disc_fake_y)
+    #计算生成器F损失(disc_fake_x和全1的差异)
+    gen_f_loss = generator_loss(disc_fake_x)
+    #计算循环损失(循环损失在生成器总损失中占比最大,包括这两部分损失,用的mae
+    total_cycle_loss = calc_cycle_loss(real_x, cycled_x) + calc_cycle_loss(real_y, cycled_y)
+
+    #计算生成器G的总损失,总损失=生成器G损失+循环损失+生成器G对应的一致性损失
+    total_gen_g_loss = gen_g_loss + total_cycle_loss + identity_loss(real_y, same_y)
+    #计算生成器F的总损失,总损失=生成器F损失+循环损失+生成器F对应的一致性损失
+    total_gen_f_loss = gen_f_loss + total_cycle_loss + identity_loss(real_x, same_x)
+    #模型会想尽一切方法降低对应的损失,这样保证训练出来的模型,循环回来能尽量和原图区别不大,还要尽量能欺骗到判别器
+    #还不能把自己要生成的目标类型图片给变成另外的样子
+    #计算判别器x损失,判别器损失包括计算自己给真实x打的分和1的比较,自己给赝品打的分和0的比较
+    #判别器要在这两个损失间求一个平衡,因为随着训练的进行,赝品会越来越像真品,这会导致判别器对真品的置信度也会降低
+    #对每个丢进去的图片都持怀疑态度,这样判别器的判别能力也会提升
+    disc_x_loss = discriminator_loss(disc_real_x, disc_fake_x)
+    #计算判别器y损失,判别器x是判别x_real和生成器F生成的x,判别器y是判别y_real和生成器G生成的y
+    disc_y_loss = discriminator_loss(disc_real_y, disc_fake_y)
+
+  #分别计算生成器G,F的损失对各自可训练变量的梯度
+  generator_g_gradients = tape.gradient(total_gen_g_loss,
+                                        generator_g.trainable_variables)
+  generator_f_gradients = tape.gradient(total_gen_f_loss,
+                                        generator_f.trainable_variables)
+  #分别计算判别器x,y的损失对各自可训练变量的梯度
+  discriminator_x_gradients = tape.gradient(disc_x_loss,
+                                            discriminator_x.trainable_variables)
+  discriminator_y_gradients = tape.gradient(disc_y_loss,
+                                            discriminator_y.trainable_variables)
+
+  #分别用生成器G,F,判别器x,y各自的梯度更新他们的可训练参数
+  generator_g_optimizer.apply_gradients(zip(generator_g_gradients,
+                                            generator_g.trainable_variables))
+
+  generator_f_optimizer.apply_gradients(zip(generator_f_gradients,
+                                            generator_f.trainable_variables))
+
+  discriminator_x_optimizer.apply_gradients(zip(discriminator_x_gradients,
+                                                discriminator_x.trainable_variables))
+
+  discriminator_y_optimizer.apply_gradients(zip(discriminator_y_gradients,
+                                                discriminator_y.trainable_variables))
+
+for epoch in range(EPOCHS):#训练轮次
+  start = time.time() #设置起始时间,用于记录每个轮次耗时
+  n = 0
+  for image_x, image_y in tf.data.Dataset.zip((train_horse_dataset, train_zebra_dataset)):
+    train_step(image_x, image_y)#训练一个批次
+    if n % 9 == 0:#10步一点
+      print ('.', end='')
+    n += 1#更新计数器
+  #以下的都是1个轮次训练结束后做的事情
+  clear_output(wait=True) #清楚之间控制台输出
+  #用一个不变的斑马图片来查看训练状态
+  generate_images(generator_f,sample_zebra)
+  #每隔5个轮次
+  if (epoch + 1) % 5 == 0:
+    ckpt_save_path = ckpt_manager.save()#保存模型
+    print ('已经保存了第{}个轮次的模型在{}路径下.'.format(epoch+1,
+                                                         ckpt_save_path))
+  #打印每个轮次训练耗时
+  print ('第{}个轮次耗时{}秒\n'.format(epoch + 1,
+                                                      time.time()-start))

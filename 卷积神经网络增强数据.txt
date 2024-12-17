@@ -1,0 +1,252 @@
+import tensorflow as tf
+import numpy as np
+import matplotlib.pyplot as plt
+import scipy
+import keras
+# 设置GPU设备
+gpus = tf.config.experimental.list_physical_devices('GPU')
+try:
+    if gpus:
+        tf.config.experimental.set_visible_devices(gpus[0], 'GPU')
+        tf.config.experimental.set_memory_growth(gpus[0], True)
+        print("GPU set successfully!")
+except Exception as e:
+    print(e)
+import os,shutil
+# basedir是我要建的文件夹根目录,下面要有train,test,yz三个文件夹
+#train,test,yz文件夹下有cats,dogs文件夹,cats,dogs装猫狗图片
+basedir='E:\jupyter_rgzn\datasets\cats_dogs_s'
+#这个是下载的猫狗图片,很多张,我们要取的是train,2000,1000张猫,1000张狗
+#,yz,1000,test,1000
+src='E:\\jupyter_rgzn\\深度学习\\cat_dog\\train'
+# 创建文件夹
+def make_dirs(f_dir,c_dir):
+    path_=os.path.join(f_dir,c_dir)
+    os.makedirs(path_)
+train_dir=os.path.join(basedir,'train')
+test_dir=os.path.join(basedir,'test')
+yz_dir=os.path.join(basedir,'yz')
+#E:\\jupyter_rgzn\\datasets\\cats_dogs_s\\train\\cats
+train_cats_dir=os.path.join(basedir+'\\train','cats')
+test_cats_dir=os.path.join(basedir+'\\test','cats')
+yz_cats_dir=os.path.join(basedir+'\\yz','cats')
+train_dogs_dir=os.path.join(basedir+'\\train','dogs')
+test_dogs_dir=os.path.join(basedir+'\\test','dogs')
+yz_dogs_dir=os.path.join(basedir+'\\yz','dogs')
+#复制文件
+def copy_file(src,dst,names):
+    for name in names:
+        src_=os.path.join(src,name)
+        dst_=os.path.join(dst,name)
+        shutil.copyfile(src_,dst_)
+from keras import layers
+from keras import models
+model=models.Sequential()
+#过滤层,抓取一些简单的图形,3x3的卷积核扫描,会少两行两列,所以过滤后
+#size-2,补padding的话要补一圈0,一圈0就包含两行两列,是在扫描前补0
+model.add(layers.Conv2D(32,(3,3),activation='relu',input_shape=(150,150,3)))
+#抓大放小,2x2的扫描器,只抓取区域内的最大值,2x2变成1x1,而且步长是2,扫描区域不重复
+#所以最后图片变成之前一半,学名,池化层
+model.add(layers.MaxPooling2D((2,2)))
+#通常滤镜的个数会越弄越大
+model.add(layers.Conv2D(64,(3,3),activation='relu'))
+model.add(layers.MaxPooling2D((2,2)))
+model.add(layers.Conv2D(128,(3,3),activation='relu'))
+model.add(layers.MaxPooling2D((2,2)))
+model.add(layers.Conv2D(128,(3,3),activation='relu'))
+model.add(layers.MaxPooling2D((2,2)))
+# 这个flatten是把高维弄成一维,其实很简单,循环遍历,
+# 之后把每个元素都装进一个-维的ndarray
+model.add(layers.Flatten())
+# 密集连接层
+model.add(layers.Dense(512,activation='relu'))
+# 二分类问题,sigmoid,输出层
+model.add(layers.Dense(1,activation='sigmoid'))
+# 要估计的参数
+#(3*3*3+1)*32,(3*3*32+1)*64,(3*3*64+1)*128,
+#(3*3*128+1)*128,flatten:7*7*128
+#(6272+1)*512,(512+1)*1
+model.summary()
+from keras import optimizers
+# 优化器,损失函数,指标
+model.compile(optimizer=optimizers.RMSprop(learning_rate=1e-4),\
+                           loss='binary_crossentropy',metrics=['accuracy'])
+# 图片转化为数据
+from keras.preprocessing.image import ImageDataGenerator
+
+# rescale,缩放因子,将图片(ndarray)中每个数字*rescale的值
+train_gen=ImageDataGenerator(rescale=1./255)
+vald_gen=ImageDataGenerator(rescale=1./255)
+#生成器,训练数据里既有猫,又有狗,而且被自动设置了标签,二分类
+train_generator=train_gen.flow_from_directory(
+    train_dir,#目标图片文件夹,这个文件夹内有几个,就被归结为几类
+    target_size=(150,150),#要设置的图片大小,对应model接收
+    batch_size=20,#每个批次
+    class_mode='binary'#二分类
+)
+vald_generator=vald_gen.flow_from_directory(
+    yz_dir,
+    target_size=(150,150),
+    batch_size=20,
+    class_mode='binary'
+)
+import keras as ks
+import scipy
+cnt=0
+# batch_size=20是之前设置的
+#data_batch是小批次的20个样本图片,labels_batch是对应的是猫还是狗的标签
+for data_batch,labels_batch in train_generator:
+    print(type(data_batch),type(labels_batch),data_batch.shape,labels_batch.shape)
+    print('labels:',labels_batch)
+    plt.imshow(data_batch[-1])
+    if cnt>3:
+        break
+    cnt+=1
+print(cnt)
+his=model.fit_generator(train_generator,  
+    epochs=30,  # 训练轮数  
+    verbose=2,  # 日志显示模式  
+    steps_per_epoch=len(train_generator),  # 每个epoch需要完成的步数，通常设置为训练集的总样本数除以批次大小  
+    validation_data=vald_generator,  # 如果有验证集的话，这里也应该是另一个DirectoryIterator实例  
+    validation_steps=len(vald_generator),  # 验证集的步数 
+    shuffle=True
+)
+ len(vald_generator),验证loss在第9次epoch最小
+np.argmin(his.history['val_loss'])
+xl_loss=his.history['loss']
+yz_loss=his.history['val_loss']
+xl_acc=his.history['accuracy']
+yz_acc=his.history['val_accuracy']
+plt.rcParams['font.size'] = 22
+plt.figure(figsize=(20,9),dpi=100)
+plt.subplot((121))
+x=range(1,len(xl_loss)+1)
+plt.plot(x,xl_loss,'b',label='xl_loss')
+plt.plot(x,yz_loss,'bo',label='yz_loss')
+plt.legend()
+plt.subplot((122))
+plt.plot(x,xl_acc,'r',label='xl_acc')
+plt.plot(x,yz_acc,'ro',label='yz_acc')
+plt.legend()
+plt.show()
+#得到训练文件夹下的所有猫图片的路径,listdir是顺序打乱的
+train_cats_path=[os.path.join(train_cats_dir,name) for name in os.listdir(train_cats_dir)]
+from keras.preprocessing import image  
+import numpy as np  
+from PIL import Image  
+im_path=train_cats_path[8]#获得索引8的那个图片
+
+# 把图片加载进来,变成4个维度的张量
+img=Image.open(im_path)
+img=img.resize((150,150))
+x=image.image_utils.img_to_array(img)
+x=x.reshape((1,)+x.shape)# 前面增加个维度,是样本数
+x.shape
+#改变图片的方式
+data_gen=ImageDataGenerator(
+    rotation_range=40,#旋转角度
+    width_shift_range=0.2,#水平平移
+    height_shift_range=0.2,#上下平移,高度乘以0.2当成我们平移的距离
+    shear_range=0.2,#拉的斜一些
+    zoom_range=0.2,#变大变小
+    horizontal_flip=True,#有些图片会被随机的翻转过来
+    fill_mode='nearest'#用临近的像素填充被移出的区域
+)
+查看data_gen作用在图片上的效果,图片发生了一些平移之类的变化
+i=0
+for batch in data_gen.flow(x,batch_size=1):
+    # 如果已经存在具有该标识符的图形，那么这个图形会被设为当前活动图形并返回。
+    plt.figure(i)
+    plt.imshow(image.image_utils.array_to_img(batch[0]))
+    i+=1
+    if i%4==0:
+        break
+plt.show()
+from keras import optimizers
+model=models.Sequential()
+#过滤层,抓取一些简单的图形,3x3的卷积核扫描,会少两行两列,所以过滤后
+#size-2,补padding的话要补一圈0,一圈0就包含两行两列,是在扫描前补0
+model.add(layers.Conv2D(32,(3,3),activation='relu',input_shape=(150,150,3)))
+#抓大放小,2x2的扫描器,只抓取区域内的最大值,2x2变成1x1,而且步长是2,扫描区域不重复
+#所以最后图片变成之前一半,学名,池化层
+model.add(layers.MaxPooling2D((2,2)))
+model.add(layers.Conv2D(64,(3,3),activation='relu'))
+model.add(layers.MaxPooling2D((2,2)))
+model.add(layers.Conv2D(128,(3,3),activation='relu'))
+model.add(layers.MaxPooling2D((2,2)))
+model.add(layers.Conv2D(128,(3,3),activation='relu'))
+model.add(layers.MaxPooling2D((2,2)))
+# 这个flatten是把高维弄成一维,其实很简单,循环遍历,
+# 之后把每个元素都装进一个-维的ndarray
+model.add(layers.Flatten())
+model.add(layers.Dropout(0.5))#加了一个dropout层
+#输出层
+model.add(layers.Dense(512,activation='relu'))
+# 二分类问题,sigmoid
+model.add(layers.Dense(1,activation='sigmoid'))
+model.summary()
+model.compile(optimizer=optimizers.RMSprop(learning_rate=1e-4),loss='binary_crossentropy',metrics=['acc'])
+from keras.preprocessing.image import ImageDataGenerator
+#因为训练准确率高,所以给训练增加难度,又是旋转
+#又是平移,让电脑能抓住本质
+train_datagen=ImageDataGenerator(
+        #图片数据*rescale设定值
+        rescale=1./255,
+        #旋转角度
+        rotation_range=40,
+        #平移
+        width_shift_range=0.2,
+        height_shift_range=0.2,
+        shear_range=0.2,
+        zoom_range=0.2,#变大变小
+        #水平翻转
+        horizontal_flip=True
+)
+#验证资料就不要旋转平移
+yz_datagen=ImageDataGenerator(rescale=1./255)
+train_generator=train_datagen.flow_from_directory(
+    train_dir,
+    target_size=(150,150),
+    batch_size=20,
+    class_mode='binary'
+)
+vald_generator=yz_datagen.flow_from_directory(
+    yz_dir,
+    target_size=(150,150),
+    batch_size=20,
+    class_mode='binary'
+)
+his_=model.fit(train_generator,  
+    epochs=80,  # 训练轮数  
+    verbose=2,  # 日志显示模式  
+    steps_per_epoch=100,  # 每个epoch需要完成的步数，通常设置为训练集的总样本数除以批次大小  
+    validation_data=vald_generator,  # 如果有验证集的话，这里也应该是另一个DirectoryIterator实例  
+    validation_steps=50,  # 验证集的步数 
+    shuffle=True
+)
+np.argmin(his_.history['val_loss'])# 第80次迭代验证loss最小,还没出现overfiting
+xl_loss=his_.history['loss']
+yz_loss=his_.history['val_loss']
+xl_acc=his_.history['acc']
+yz_acc=his_.history['val_acc']
+plt.rcParams['font.size'] = 22
+plt.figure(figsize=(20,9),dpi=100)
+plt.subplot((121))
+x=range(1,len(xl_loss)+1)
+plt.plot(x,xl_loss,'b',label='xl_loss')
+plt.plot(x,yz_loss,'g',label='yz_loss')
+plt.legend()
+plt.subplot((122))
+plt.plot(x,xl_acc,'r',label='xl_acc')
+plt.plot(x,yz_acc,'b',label='yz_acc')
+plt.legend()
+plt.show()
+test_datagen=ImageDataGenerator(rescale=1./255)
+test_generator=test_datagen.flow_from_directory(
+    test_dir,
+    target_size=(150,150),
+    batch_size=20,
+    class_mode='binary'
+)
+loss_,acc_=model.evaluate(test_generator)
+model.save('../data/cats_and_dogs_small2.h5')

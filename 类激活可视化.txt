@@ -1,0 +1,114 @@
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ["KERAS_BACKEND"] = "tensorflow"
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
+mport numpy as np
+import tensorflow as tf
+import keras
+from IPython.display import Image, display
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+
+model_builder = keras.applications.xception.Xception
+
+img_size = (299, 299)
+
+preprocess_input=keras.applications.xception.preprocess_input
+decode_predictions = keras.applications.xception.decode_predictions
+
+last_conv_layer_name = "block14_sepconv2_act"
+
+img_path='./imgs/fzx11.jpeg'
+
+display(Image(img_path))
+
+def get_img_array(img_path, size):#加载图片数据为tenor张量
+    img = keras.utils.load_img(img_path, target_size=size)
+    array = keras.utils.img_to_array(img)
+    array = np.expand_dims(array,0)
+    return array
+
+#构造热力图,参数:图片数据,模型,最后的卷积层,预测的类别
+def make_gradcam_heatmap(img_array, model, last_conv_layer_name, pred_index=None):
+    #单输入多输出,输入:模型输入,输出:最后一个卷积层输出的特征图和模型预测分数
+    grad_model = keras.models.Model(
+        model.inputs, [model.get_layer(last_conv_layer_name).output, model.output]
+    )
+    with tf.GradientTape() as tape:
+        #(1,10,10,2048),(1,1000)
+        last_conv_layer_output, preds = grad_model(img_array)
+        if pred_index is None:
+            pred_index = tf.argmax(preds[0])#模型预测类别索引
+        class_channel = preds[:, pred_index]#模型预测的类别分数,是个数值,9.082964
+    # print(f'{class_channel=}')
+    #获取类别分值对卷积特征图的梯度,梯度形状和特征图形状一样(1,10,10,2048)
+    grads = tape.gradient(class_channel, last_conv_layer_output)#
+    # print(f'{grads.shape=}')
+    #相当于平均池化,聚合(10,10)区域,获取每个特征的均值
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))#(2048,)
+    # print(f'{pooled_grads.shape=},{last_conv_layer_output.shape=}')
+    last_conv_layer_output = last_conv_layer_output[0]#特征图(10,10,2048)
+    #(10,10,2048)@(2048,1)=(10,10,1)
+    #特征图的加权特征图,这样的特征图更倾向于指定类别图片
+    #最后一层特征图的输出是确定的,不同的是不同图片获取的预测类别,pooled_grads
+    #当前类别得到的2048个特征的分数,这里做的是特征加权和
+    heatmap = last_conv_layer_output @ pooled_grads[..., tf.newaxis]
+    # print(f'{heatmap.shape=}')
+    heatmap = tf.squeeze(heatmap)#(10,10)
+    #tf.maximum(heatmap, 0),会把heatmap中小于0的值变成0,大于0的值不变
+    #tf.math.reduce_max(heatmap)会聚合出最大值,相当于maxmin标准化
+    heatmap = tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
+    return heatmap.numpy()
+
+img_array = preprocess_input(get_img_array(img_path, size=img_size))
+
+print(img_array.shape,img_array.max(),img_array.min())
+
+model = model_builder(weights="imagenet")
+
+model.layers[-1].activation = None
+
+preds = model.predict(img_array)
+
+heatmap = make_gradcam_heatmap(img_array, model, last_conv_layer_name)
+
+plt.matshow(heatmap)
+plt.show()
+
+#图片路径,加权特征图
+def display_gradcam(img_path,heatmap,alpha=0.4):
+    img = keras.utils.load_img(img_path)#原图
+    img = keras.utils.img_to_array(img)#图片数据
+    heatmap = np.uint8(255 * heatmap)#变成0-255
+    jet = mpl.colormaps["jet"]#jet
+    # 返回的数组形状是(256,4),其中每一行都是一个 RGBA 颜色（红、绿、蓝和透明度）
+    #不要透明度
+    jet_colors = jet(np.arange(256))[:,:3]#0-255
+    # print(jet_colors.shape)
+    jet_heatmap = jet_colors[heatmap]
+    jet_heatmap = keras.utils.array_to_img(jet_heatmap)
+    jet_heatmap = jet_heatmap.resize((img.shape[1], img.shape[0]))
+    jet_heatmap = keras.utils.img_to_array(jet_heatmap)# (850,1280,3)
+    # print(jet_heatmap.shape)
+    superimposed_img = jet_heatmap * alpha + img
+    superimposed_img = keras.utils.array_to_img(superimposed_img)
+    display(superimposed_img)
+display_gradcam(img_path, heatmap)
+mg_path='./imgs/cat_and_dog.jpg'
+
+display(Image(img_path))
+img_array = preprocess_input(get_img_array(img_path, size=img_size))
+
+print(img_array.max(),img_array.min())#1,-1
+
+preds = model.predict(img_array)
+print("Predicted:", decode_predictions(preds, top=2)[0])
+
+heatmap = make_gradcam_heatmap(img_array, model, \
+                               last_conv_layer_name, pred_index=260)
+
+display_gradcam(img_path, heatmap)
+heatmap = make_gradcam_heatmap(img_array, model, last_conv_layer_name, pred_index=285)
+display_gradcam(img_path, heatmap)
+

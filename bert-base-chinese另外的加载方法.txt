@@ -1,0 +1,38 @@
+import os
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+import torch
+from transformers import pipeline
+pipe = pipeline("fill-mask", model="google-bert/bert-base-chinese")
+from transformers import AutoTokenizer, AutoModelForMaskedLM
+tokenizer = AutoTokenizer.from_pretrained("google-bert/bert-base-chinese")
+model = AutoModelForMaskedLM.from_pretrained("google-bert/bert-base-chinese")
+input_text='bert-base-chinese该怎么用?'
+inx_text=tokenizer.encode(input_text)
+inv_text=tokenizer.convert_ids_to_tokens(inx_text)
+with torch.no_grad():
+    output=model(torch.tensor([inx_text]))
+print(type(output))
+last_hidden=output['logits']
+print(last_hidden.shape,last_hidden[0])# (1,9,21128)(batch_size,seq_len,d_model)
+from transformers import AutoModelForQuestionAnswering
+aq=AutoModelForQuestionAnswering.from_pretrained("google-bert/bert-base-chinese")
+# 定义问题和上下文  
+question = "你好，请问今天天气怎么样？"  
+context = "今天是晴天，气温适中，非常适合户外活动。"  
+# 使用分词器对问题和上下文进行编码  
+inputs = tokenizer(question, context, return_tensors='pt', \
+                   padding=True, truncation=True)
+
+input_ids = inputs['input_ids']  
+attention_mask = inputs['attention_mask'] 
+# 在Transformers库中，模型并不是通过数字本身来识别分割符的，
+# 而是通过分词器（Tokenizer）对输入文本的处理来识别这些特殊标记。
+# 在不计算梯度的情况下进行推理  
+with torch.no_grad():  
+    aq_outputs =aq(input_ids, attention_mask=attention_mask) 
+start_inxes=aq_outputs['start_logits'][0]
+end_inxes=aq_outputs['end_logits'][0]
+print(len(start_inxes),len(end_inxes))
+start=torch.argmax(start_inxes)
+end=torch.argmax(end_inxes)
+(question+context)[start:end]

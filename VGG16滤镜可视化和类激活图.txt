@@ -1,0 +1,291 @@
+这个用keras2.2.4+tensorflow1.15.0
+import keras
+keras.__version__
+from keras.applications import VGG16
+from keras import backend as K
+import numpy as np
+from keras import models
+import matplotlib.pyplot as plt
+import tensorflow as tf
+model=VGG16(weights='imagenet',include_top=False)#最后几层不要
+model.summary()
+from PIL import Image
+# 输入图片滤镜,变为4维张量,并把数据变到0-1之间
+def img2tensor(img_path,):
+    img=Image.open(img_path)
+    img=img.resize((64,64))
+    img_tensor=np.array(img,dtype='float32')
+    #变成4d张量
+    img_tensor2=np.expand_dims(img_tensor,axis=0)#在索引0的轴增加一维,就是样本数
+#     print(img_tensor2.dtype)
+    img_tensor2/=255.#在jupyter里不能重复执行
+    return img_tensor2
+# 获取索引1-6层名称,没特殊指定,就是conv2d_1这样的
+layer_names=[layer.name for layer in model.layers[1:7]]
+layer_outputs=[layer.output for layer in model.layers[1:7]]
+# 猫在草丛中,是被剪贴到那的
+img_path='../datasets/cats_dogs_s/yz/cats/cat.1700.jpg'
+img_tensor2=img2tensor(img_path)
+# 输入:一张图片,输出:前8层的输出,卷积或池化后的特征图
+activation_model=models.Model(inputs=model.input,outputs=layer_outputs)
+print(img_tensor2.min(),img_tensor2.max())
+# 得到上面的猫图片的前8层特征图
+activations=activation_model.predict(img_tensor2)
+#每行8个图片
+n_cols=8
+# zip有打包作用,就是把两个东西关联起来
+for layer_name,layer_activation in zip(layer_names,activations):
+    n_features=layer_activation.shape[-1]# 每层的滤镜数
+    size=layer_activation.shape[1]# 特征图的大小,这个每一层大小不一样,越往后越小
+    n_rows=n_features//n_cols# 如果一层32个滤镜,那这层就四行
+    #弄一个容器来装这些特征图
+    display_grid=np.zeros((n_rows*size,n_cols*size))
+#     print(n_features,n_rows,size,display_grid.shape)
+    i=0
+    for row in range(n_rows):#row,col索引都从0开始
+        for col in range(n_cols):
+            i=row*n_cols+col
+            #某一层的第i个滤镜
+            img_i=layer_activation[0,:,:,i]
+#             print('第{}个滤镜的形状,均值,标准差:'.format(i),img_i.shape,img_i.mean(),img_i.std())
+            img_i-=img_i.mean()# 中心化,以0为中心,方差和前面方差一样
+#             print('中心化后的标准差,均值:',img_i.std(),img_i.mean())
+            zero=np.zeros_like(img_i,dtype=np.uint8)
+            #标准差是0.0或者nan,就是滤镜没抓到要的特征,所以特征图里的数据全为0.0
+            if img_i.std()==0.0 or np.isnan(img_i.std()):
+                img_i=zero
+#                 print('黑色:',img_i.max(),img_i.min())
+            else:
+                img_i=img_i/img_i.std()# 方差单位化为1,平均值还是0,标准正太
+#             print('标准化后的标准差,均值:',img_i.std(),img_i.mean())
+            #下面做的处理是放大数据之间的差异,把滤镜想抓取的特征放大
+            img_i*=64
+#             print('乘以64后的标准差,均值:',img_i.std(),img_i.mean())# 方差变成64
+            img_i+=128# 平均值变成128
+#             print('加128后的标准差,均值:',img_i.std(),img_i.mean())
+#             print('裁剪前的最大,最小值:',img_i.max(),img_i.min())
+            #裁剪小于0的会变成0,大于255的会变成255
+            img_i=np.clip(img_i,0,255)# 裁剪
+            img_i=img_i.astype('uint8')#无符号整型,0-255之间
+#             print('裁剪后的最大,最小值:',img_i.max(),img_i.min())
+            # 把第i个滤镜放进容器里
+            display_grid[row*size:(row+1)*size,\
+                         col*size:(col+1)*size]=img_i
+#     scale=1./size# 对于第一层来说,scale=1/148
+#     # figsize=((1/148)*8*148,(1/148)*4*148)=(8,4)--对应宽和高
+#     plt.figure(figsize=(scale*display_grid.shape[1],\
+#                        scale*display_grid.shape[0]))
+    plt.figure(figsize=(n_cols*2,n_rows*2),dpi=150)
+    plt.axis('off')# 不显示轴
+    plt.title(layer_name)# 标题
+#     print('display_grid的形状',display_grid.shape)
+    # aspect:像素的形状,equal方形,auto通常不是方形
+    # display_grid,某一层的所有滤镜
+    plt.imshow(display_grid,cmap='viridis',aspect='auto')
+plt.show()
+import tensorflow as tf
+model=VGG16(weights='imagenet',include_top=False)#最后几层不要
+layer_name='block3_conv1'#层名
+filter_index=0#滤镜索引
+layer_output=model.get_layer(layer_name).output# 获取block3_conv1的滤镜处理后的特征图
+# print(layer_output.shape)#(None, None, None, 256)
+filter_=layer_output[:,:,:,filter_index]# 0号滤镜处理后的特征图,是个矩阵
+print(filter_)# (None, None, None)
+#损失函数是0号滤镜里数据和的均值,#我们要做的事极大化这个值,
+# 之前看每一层的滤镜处理后的特征图时,有些数据全是0.0,就是因为
+#那个滤镜在图片里没找到自己想找的几何线条,所以这里我们找的是
+#这个滤镜到底在抓什么样的几何图形,所以要最大化这个矩阵里的数据
+#极大化它的均值,就极大化了它的数据
+loss=K.mean(filter_)
+loss
+# loss是上面定义的损失函数,是个数值,这里是在对输入的图片数据做微分
+#可以想象成对猫那样的图片数据(3维ndarray)做微分,也就是dy/dx,这里的x
+#有很多个,所以微分出来的系数w也就有很多个,微分出来的梯度还是3d图形
+#和原来的输入图形形状一样,只是数据变成了梯度值
+grads=K.gradients(loss,model.input)[0]
+#grads是一个立体的数据,这是先对这些数据做平方,现在还是一个立体数据
+#可以想象成堆叠起来的单通道图片数据,
+#之后做均值,这个处理后就是一个数了,之后再开方
+K.sqrt(K.mean(K.square(grads)))
+# K.sqrt(K.mean(K.square(grads))),张量运算
+# 加上一个小数是防止除0
+grads/=(K.sqrt(K.mean(K.square(grads)))+1e-5)
+iterate=K.function([model.input],[loss,grads])#函数,输入:一张图片,输出:那个滤镜图的均值和它对图片的微分
+rand_nums=np.random.random((1,150,150,3))*20+128.# 最小128.,最大147.
+# rand_nums是150个(150,3)的随机乱数,*20之后最大19.9999...,最小0.000...
+print(rand_nums.shape,rand_nums.max(),rand_nums.min())
+# 猫在草丛中,是被剪贴到那的
+img_path='../datasets/cats_dogs_s/yz/cats/cat.1882.jpg'
+img_tensor2=img2tensor(img_path)
+img_tensor3=img_tensor2.copy()
+print(img_tensor2.max(),img_tensor3.max(),img_tensor3.min())
+loss_,grads_=iterate([img_tensor3])
+print(loss_,grads_.shape)
+step=1#
+np.set_printoptions(suppress=True)
+for i in range(40):
+    loss_v,grads_v=iterate([img_tensor3])# 传入一个图片,返回损失,和3层的梯度数据
+    img_tensor3+=step*grads_v# 更新图片数据,梯度上升,step相当于学习率,梯度是损失对图片数据求导
+    print('loss_v:',loss_v)
+    print('grads_v:',grads_v.shape,grads_v.max(),grads_v.min())
+    print('img_tensor3:',img_tensor3.max(),img_tensor3.min())
+    print('-'*100)
+def deprocess_img(x):# 处理图片每个通道内的数据
+    x-=x.mean()
+    x/=(x.std()+1e-5)# 标准化
+#     print('x标准化后的期望,方差,最大值,最小值:',x.mean(),x.std(),x.max(),x.min())
+    x*=0.1#设方差为0.1
+#     print('x*0.1后的期望,方差,最大值,最小值:',x.mean(),x.std(),x.max(),x.min())
+    x+=0.5# 0.5设为平均值
+#     print('x+0.5后的期望,方差,最大值,最小值:',x.mean(),x.std(),x.max(),x.min())
+    x=np.clip(x,0,1)#小于0,设为0,大于1,设为1
+#     print('x裁剪后的期望,方差,最大值,最小值:',x.mean(),x.std(),x.max(),x.min())
+    x*=255#设为0-255之间,#期望127,方差25
+#     print('x乘255后的期望,方差,最大值,最小值:',x.mean(),x.std(),x.max(),x.min())
+#     x=np.clip(x,0,255).astype('uint8')
+    x=x.astype('uint8')
+#     print('x,uint8的期望,方差,最大值,最小值:',x.mean(),x.std(),x.max(),x.min())
+    return x
+# 猫在草丛中,是被剪贴到那的
+img_path='../datasets/cats_dogs_s/yz/cats/cat.1720.jpg'
+img_tensor2=img2tensor(img_path)
+img_tensor3=img_tensor2.copy()
+print(img_tensor2.max(),img_tensor3.max(),img_tensor3.min())
+loss_,grads_=iterate([img_tensor3])
+print(loss_,grads_.shape)
+plt.imshow(img_tensor3[0])
+print(img_tensor3.max(),img_tensor3.min(),img_tensor3.shape)
+a=np.random.random((1,size,size,3))*20+128.
+print(a.max(),a.min())
+#用梯度上升的方式极大化loss(某一层第i个滤镜处理后的图片数据的均值)
+#经过多次迭代后,原图片数据出现分化,数值大的越来越大,数组小的越来越小
+# loss是正数,而loss对图片数据的梯度有正有负,学习率是固定值1,如果
+#图片数据对应的梯度是负的,那个数据会越来越小,最后loss最大时,就
+#证明这时的图片让这个滤镜的反应最大,而这个图片现在的样子就是滤镜要
+#抓取的图形
+# 产生模式,参数:层名称,层的某个滤镜索引,图片大小
+def generate_pattern(layer_name,filter_index,size=100):
+    layer_output=model.get_layer(layer_name).output#获取层输出,形如(150,150,滤镜数)
+    loss = K.mean(layer_output[:,:,:,filter_index]) #损失:指定滤镜处理后图片里面数据的均值
+    grads=K.gradients(loss,model.input)[0]# 获取loss对图片的梯度,梯度和图片形状一样
+    grads/=(K.sqrt(K.mean(K.square(grads)))+1e-5)# 做处理
+    iterate=K.function([model.input],[loss,grads])#函数,输入:图片,输出:损失,梯度
+    input_img_data=np.random.random((1,size,size,3))*20+128.# 最小128.,最大147.
+#     print('input_img_data初始值:',input_img_data.max(),input_img_data.min())
+#     input_img_data=img_tensor3.copy()
+    step=1
+    np.set_printoptions(suppress=True)
+    # 每经过一次梯度上升,图片数据大的会更大,小的会更小(大的是正数,小的是负数,负数的话相当于一直在减)
+    # 最后抓取的亮的点都是大值,做的是差异化处理,把图片里的像素,亮的更亮,暗的更暗
+    for i in range(40):
+        loss_v,grads_v=iterate([input_img_data])#传入是一个列表,列表里是图片数据
+        input_img_data += step*grads_v# 更新图片数据,梯度上升
+#         print('step*grads_v最大最小值:',(step*grads_v).max(),(step*grads_v).min())
+#         print('loss_v:',loss_v)
+#         print('grads_v:',grads_v.max(),grads_v.min())
+        # 每次input_img_data都会变大,在这里是对应数+grads_v中对应梯度值
+#         print('input_img_data每次的img_data',input_img_data.max(),input_img_data.min())
+#         print('-'*50)
+    #经过40次迭代后,loss已经相当大,而这时的图片数据,是大的更大,小的更小
+    #小的是负数,经过图片数据处理后是0,大的不会超过255,就是说,当前的滤镜要抓的图片就是这样的几何线条
+    img=input_img_data[0]
+    return deprocess_img(img)
+for i in range(10):
+    plt.imshow(generate_pattern('block3_conv1',i))
+    plt.show()
+# 可以看到VGG16每个滤镜都抓取特定的图形,之后不断放大这个图像
+#最后得到自己想要的有助于分类的特征
+#获取vgg16感兴趣的图形,参数:层名称,一层几行,一行几张图片,图片大小,图片间隔
+def fetch_vgg_roi(layer_names,n_rows,n_cols,size=64,margin=5):
+    #抓取这几层滤镜,看他们对什么图形感兴趣
+    for layer_name in layer_names:# margin,图片之间的间隔,可以展示的更漂亮
+        #用来装图像的容器
+        results=np.zeros((n_rows*size+(n_rows-1)*margin,\
+                    n_cols*size+(n_cols-1)*margin,3),dtype=np.uint8)
+        # 遍历行,索引从0开始,多层迭代的逻辑是从里往外
+        for row in range(n_rows):
+            for col in range(n_cols):# 遍历列
+                # row*n_cols+col,从0号滤镜开始一个个排,img是滤镜感兴趣的图片
+                img=generate_pattern(layer_name,row+col*n_rows,size=size)
+#                 print('img:',img.shape,img.max(),img.min())
+                row_start=row*size+row*margin# 一个图片的行起始位置
+                row_end=row_start+size#行结束位置
+                col_start=col*size+col*margin#列起始位置
+                col_end=col_start+size#列结束位置
+                #切取大图片中的区域给每个滤镜图片,通道都要
+                results[row_start:row_end,col_start:col_end,:]=img
+#                 print('22:',results[row_start:row_end,col_start:col_end,:].shape)
+        plt.figure(figsize=(n_cols*2,n_rows*2))
+#         print('results:',results.max(),results.min())
+        # 对于使用imshow函数来显示RGB数据的情况，需要将输入数据裁剪到有效范围内。
+        #对于RGB数据,这个有效范围通常是[0...1]（用于浮点数）或[0...255]（用于整数）。
+        # 对于浮点数数据，可以通过除以255来将数据裁剪到[0..1]的范围内。
+        # 这样可以确保像素值在正确的范围内，以便正确显示图像
+        plt.title(layer_name)
+        plt.imshow(results)
+        plt.show()
+layer_names=['block1_conv1','block2_conv1','block3_conv1','block4_conv1','block5_conv1']
+n_rows=8
+n_cols=8
+fetch_vgg_roi(layer_names,n_rows,n_cols)
+from PIL import Image
+import numpy as np
+from keras import models
+base_model = VGG16(weights='imagenet')
+import cv2
+from keras.applications.vgg16 import preprocess_input,decode_predictions
+def img2tensor_(img_path,):
+    img=Image.open(img_path)
+    img=img.resize((224,224))#vgg16需要的图片形状(224,224,3)
+    img_tensor=np.array(img,dtype='float32')
+    #变成4d张量
+    img_tensor2=np.expand_dims(img_tensor,axis=0)#在索引0的轴增加一维,就是样本数
+    img_tensor2=preprocess_input(img_tensor2)#转换颜色格式(rgb转成bgr,之后3个通道分别减个平均数)
+    return img_tensor2
+img_path='./img/fzx11.jpeg'
+img_tensor=img2tensor_(img_path)
+print(img_tensor.max(),img_tensor.min())
+#1000分类,所以一张图片会被预估为这1000类的概率,概率越大,就证明它属于1000个分类器中的那个分类
+pre=base_model.predict(img_tensor)
+print(np.argmax(pre))
+base_model.summary()
+fzxlb=base_model.output[:,386]#这是非洲象类别
+last_conv_layer_output=base_model.get_layer('block5_conv3').output#vgg16的最后一个卷积层处理后的特征图
+last_conv_layer_output.shape#(14,14,512)
+#用y类别对特征图做微分运算,就是对里面的x做运算,得到一系列梯度值,形状还是(14,14,512)
+grads=K.gradients(fzxlb,last_conv_layer_output)[0]
+# 这个是对每一层的特征图做均值,那每一层就变成一个值,层数还是512层,
+#channel是索引3,前面三个是样本数,行和列,前面那个是类别对特征图微分,这个是求的每层微分的均值
+mean_features=K.mean(grads,axis=(0,1,2))
+mean_features.shape
+#输入:一张3通道图片,输出:vgg最后一个conv层梯度的均值(512,),特征图(14,14,512)
+func1=K.function([base_model.input],[mean_features,last_conv_layer_output[0]])
+mean_features_val,last_conv_layer_val=func1([img_tensor])
+print(np.max(mean_features_val),np.argmax(mean_features_val),last_conv_layer_val.shape)
+for i in range(512):
+    # 一共512个特征图,让每个特征图*对应梯度的均值
+    last_conv_layer_val[:,:,i]*=mean_features_val[i]
+print(last_conv_layer_val.shape,last_conv_layer_val.max(),last_conv_layer_val.min())
+#因为我们要展示的是2d的图,所以最后对所有通道做个均值处理
+heatmap=np.mean(last_conv_layer_val,axis=-1)
+print(heatmap.shape,heatmap.max(),heatmap.min())#(14, 14) 1.5231113e-09 0.0
+heatmap2=heatmap/heatmap.max()# 做0-1之间的处理,plt只显示0-1的浮点数
+print(heatmap2.shape,heatmap2.max(),heatmap2.min())
+plt.matshow(heatmap2)
+plt.show()
+#读取原图片
+fzx_img=cv2.imread('./img/fzx11.jpeg')
+fzx_img=cv2.resize(fzx_img,dsize=None,fx=0.6,fy=0.6)
+# 把热力图变成原图片大小
+heatmap3=cv2.resize(heatmap2,(fzx_img.shape[1],fzx_img.shape[0]))
+print(heatmap3.shape,fzx_img.shape,heatmap3.max(),heatmap3.min())#可以看到一个单通道,一个3通道
+cv2.imshow('fzc',fzx_img)
+cv2.waitKey(0)
+cv2.destroyAllWindows()
+heatmap4=np.uint8(heatmap3*255)#变到0-255之间的正整数
+print(heatmap4.shape,heatmap4.max(),heatmap4.min())
+heatmap5=cv2.applyColorMap(heatmap4,cv2.COLORMAP_JET)#这个能把单通道变成3通道
+print(heatmap5.shape,heatmap5.max(),heatmap5.min())
+# plt.imshow(heatmap5)
+hct=heatmap5*0.4+fzx_img#合成图
+cv2.imwrite('./img/fzx_rlt.jpeg',hct)

@@ -1,0 +1,333 @@
+def gen_id2corpus(corpus_file):
+    id2corpus = {}
+    with open(corpus_file, "r", encoding="utf-8") as f:
+        for idx, line in enumerate(f):
+            id2corpus[idx] = line.rstrip()
+    return id2corpus
+
+corpus_file='./datasets/zwqa/corpus.csv'
+id2corpus = gen_id2corpus(corpus_file)
+corpus_list = [{idx: text} for idx, text in id2corpus.items()]
+
+model_dir='./output'
+model_file = model_dir + "/inference.get_pooled_embedding.pdmodel"
+params_file = model_dir + "/inference.get_pooled_embedding.pdiparams"
+
+import os
+import paddle
+
+if not os.path.exists(model_file):
+    raise ValueError("not find model file path {}".format(model_file))
+if not os.path.exists(params_file):
+    raise ValueError("not find params file path {}".format(params_file))
+config = paddle.inference.Config(model_file, params_file)
+
+from paddle import inference
+
+precision='fp32'
+output_emb_size = 256
+
+config.enable_use_gpu(100, 0)
+precision_map = {
+            "fp16": inference.PrecisionType.Half,
+            "fp32": inference.PrecisionType.Float32,
+            "int8": inference.PrecisionType.Int8,
+        }
+precision_mode = precision_map[precision]
+
+batch_size=32
+
+# config.enable_tensorrt_engine(max_batch_size=batch_size,
+#                                               min_subgraph_size=30,
+#                                               precision_mode=precision_mode)
+
+ predictor.get_input_names()
+
+config.switch_use_feed_fetch_ops(False)
+predictor = paddle.inference.create_predictor(config)
+input_handles = [predictor.get_input_handle(name) for name in predictor.get_input_names()]
+output_handle = predictor.get_output_handle(predictor.get_output_names()[0])
+
+from paddlenlp.data import Pad, Tuple
+
+from paddlenlp.transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained('ernie-3.0-medium-zh')
+
+def batchify_fn(
+            samples,
+            fn=Tuple(
+                Pad(axis=0, pad_val=tokenizer.pad_token_id, dtype="int64"),  # input
+                Pad(axis=0, pad_val=tokenizer.pad_token_id, dtype="int64"),  # segment
+            ),
+        ):
+            return fn(samples)
+
+corpus_list[:3]#索引文本集，与问答对中的问题相对应，用于构建标准问题语义库
+
+def convert_example(example, tokenizer, max_seq_length=512, pad_to_max_seq_len=False):
+    result = []
+    for key, text in example.items():
+        encoded_inputs = tokenizer(\
+            text=text,max_length=max_seq_length,truncation=True,pad_to_max_seq_len=pad_to_max_seq_len)
+        input_ids = encoded_inputs["input_ids"]
+        token_type_ids = encoded_inputs["token_type_ids"]
+        result += [input_ids, token_type_ids]
+    return result
+
+import numpy as np
+
+batch_size=32
+max_seq_length=64
+def process_batch(examples):
+    input_ids, segment_ids = batchify_fn(examples)#填充
+    input_handles[0].copy_from_cpu(input_ids)
+    input_handles[1].copy_from_cpu(segment_ids)
+    predictor.run()#推理
+    logits =output_handle.copy_to_cpu()
+    print(logits.shape)
+    all_embeddings.append(logits)
+
+all_embeddings = []
+examples = []#用来临时存放一个批次的样本((input_ids,segment_ids))
+for idx, text in enumerate(corpus_list):#text：单个样本字典形式
+    input_ids, segment_ids = convert_example(#转换文本为数字形式
+        text,tokenizer,max_seq_length=max_seq_length)
+    examples.append((input_ids,segment_ids))
+    if len(examples) >= batch_size:
+        process_batch(examples)
+        examples = []
+if len(examples) > 0:
+    process_batch(examples)
+all_embeddings = np.concatenate(all_embeddings, axis=0)
+np.save("corpus_embedding",all_embeddings)
+
+import pymilvus
+
+from pymilvus import (
+    connections,
+    utility,
+    FieldSchema,
+    CollectionSchema,
+    DataType,
+    Collection,
+)
+
+import os
+MILVUS_HOST = 'localhost'
+MILVUS_PORT =19530
+data_dim = 256
+top_k = 20
+collection_name = 'faq_system'
+partition_tag = 'partition_1'
+embedding_name = 'embeddings'
+index_config = {
+    "index_type": "IVF_FLAT",
+    "metric_type": "L2",
+    "params": {
+        "nlist": 1000
+    },
+}
+search_params = {
+    "metric_type": "L2",
+    "params": {
+        "nprobe": 500
+    },
+}
+
+fmt = "\n=== {:30} ===\n"
+text_max_len = 1000
+
+fields = [
+    FieldSchema(name="pk",
+                dtype=DataType.INT64,
+                is_primary=True,
+                auto_id=False,
+                max_length=100),
+    FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=text_max_len),
+    FieldSchema(name="embeddings", dtype=DataType.FLOAT_VECTOR, dim=data_dim)
+]
+schema = CollectionSchema(fields, "faq_system Index")
+class VecToMilvus():
+    def __init__(self):
+        print(fmt.format("start connecting to Milvus"))
+        connections.connect("default", host=MILVUS_HOST, port=MILVUS_PORT)
+        self.collection = None
+
+    def has_collection(self, collection_name):
+        try:
+            has = utility.has_collection(collection_name)
+            print(f"Does collection {collection_name} exist in Milvus: {has}")
+            return has
+        except Exception as e:
+            print("Milvus has_table error:", e)
+
+    def creat_collection(self, collection_name):
+        try:
+            print(fmt.format("Create collection {}".format(collection_name)))
+            self.collection = Collection(collection_name,
+                                         schema,
+                                         consistency_level="Strong")
+        except Exception as e:
+            print("Milvus create collection error:", e)
+
+    def drop_collection(self, collection_name):
+        try:
+            utility.drop_collection(collection_name)
+        except Exception as e:
+            print("Milvus delete collection error:", e)
+
+    def create_index(self, index_name):
+        try:
+            print(fmt.format("Start Creating index"))
+            self.collection.create_index(index_name, index_config)
+            print(fmt.format("Start loading"))
+            self.collection.load()
+        except Exception as e:
+            print("Milvus create index error:", e)
+
+    def has_partition(self, partition_tag):
+        try:
+            result = self.collection.has_partition(partition_tag)
+            return result
+        except Exception as e:
+            print("Milvus has partition error: ", e)
+
+    def create_partition(self, partition_tag):
+        try:
+            self.collection.create_partition(partition_tag)
+            print('create partition {} successfully'.format(partition_tag))
+        except Exception as e:
+            print('Milvus create partition error: ', e)
+
+    def insert(self, entities, collection_name, index_name, partition_tag=None):
+        try:
+            if not self.has_collection(collection_name):
+                self.creat_collection(collection_name)
+                self.create_index(index_name)
+            else:
+                self.collection = Collection(collection_name)
+            if (partition_tag
+                    is not None) and (not self.has_partition(partition_tag)):
+                self.create_partition(partition_tag)
+
+            self.collection.insert(entities, partition_name=partition_tag)
+            print(
+                f"Number of entities in Milvus: {self.collection.num_entities}"
+            )  # check the num_entites
+        except Exception as e:
+            print("Milvus insert error:", e)
+
+file_path = 'zwqa_corpus_embedding.npy'
+
+ embeddings = np.load(file_path)
+print(embeddings.shape)
+
+embedding_ids = [i for i in range(embeddings.shape[0])]
+print(len(embedding_ids))
+
+client = VecToMilvus()
+collection_name = 'faq_system'
+partition_tag = 'partition_1'
+
+client.has_collection(collection_name)
+
+client.drop_collection(collection_name)
+
+data_size = len(embedding_ids)
+
+corpus_list=[list(i.values())[0]for i in corpus_list]
+
+batch_size = 100000
+for i in  range(0, data_size, batch_size):
+    cur_end = i + batch_size
+    if (cur_end > data_size):
+        cur_end = data_size
+    batch_emb = embeddings[np.arange(i, cur_end)]
+    entities = [
+        [j for j in range(i, cur_end, 1)],
+        [corpus_list[j][:text_max_len - 1] for j in range(i, cur_end, 1)],
+        batch_emb  # field embeddings, supports numpy.ndarray and list
+    ]
+    client.insert(collection_name=collection_name,
+                      entities=entities,
+                      index_name=embedding_name,
+                      partition_tag=partition_tag)
+
+class RecallByMilvus():
+    def __init__(self):
+        print(fmt.format("start connecting to Milvus"))
+        connections.connect("default", host=MILVUS_HOST, port=MILVUS_PORT)
+        self.collection = None
+    def get_collection(self, collection_name):
+        try:
+            print(fmt.format("Connect collection {}".format(collection_name)))
+            self.collection = Collection(collection_name)
+        except Exception as e:
+            print("Milvus create collection error:", e)
+    def search(self,
+               vectors,
+               embedding_name,
+               collection_name,
+               partition_names=[],
+               output_fields=[]):
+        try:
+            self.get_collection(collection_name)
+            result = self.collection.search(vectors,
+                                            embedding_name,
+                                            search_params,
+                                            limit=top_k,
+                                            partition_names=partition_names,
+                                            output_fields=output_fields)
+            return result
+        except Exception as e:
+            print('Milvus recall error: ', e)
+
+recall_client = RecallByMilvus()
+
+results = recall_client.search([embeddings[0]],
+                                   embedding_name,
+                                   collection_name,
+                                   partition_names=[partition_tag],
+                                   output_fields=['pk', 'text'])
+
+list_data = []
+for line in results:
+    for item in line:
+        idx = item.id
+        distance = item.distance
+        text = item.entity.get('text')
+        list_data.append([corpus_list[0], text, distance])
+
+import pandas as pd
+
+df = pd.DataFrame(list_data, columns=['query_text', 'text', 'distance'])
+
+df.to_csv('recall_result.csv', index=False)
+
+corpus_file = "./datasets/zwqa/qa_pair.csv"
+
+id2corpus = gen_id2corpus(corpus_file)
+
+list_data = []
+for line in results:
+    for item in line:
+        idx = item.id
+        distance = item.distance
+        text = id2corpus[idx]
+        # print(text, distance)
+        list_data.append([corpus_list[0], text, distance])
+
+df = pd.DataFrame(list_data, columns=['query_text', 'text', 'distance'])
+
+df = df.sort_values(by="distance", ascending=True)#ascending=True,按升序排序
+
+# header=None：这个参数指定了在导出的文件中不包含列名（即DataFrame的头部）
+# sep='\t'：这个参数设置了列与列之间的分隔符为制表符（\t）
+# index=False：这个参数指定了在导出的文件中不包含行索引。在Pandas的DataFrame中，每一行都有一个默认的行索引（从0开始的整数）
+
+df.to_csv('recall_predict.csv',
+          columns=['text', 'distance'],
+          sep='\t',
+          header=None,
+          index=False)
