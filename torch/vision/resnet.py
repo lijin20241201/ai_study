@@ -1,0 +1,441 @@
+def conv3x3(in_planes: int, out_planes: int, stride: int = 1, groups: int = 1, dilation: int = 1) -> nn.Conv2d:
+    return nn.Conv2d(
+        in_planes, # 输入通道
+        out_planes, # 输出通道
+        kernel_size=3, # 核大小
+        stride=stride, # 步长
+        padding=dilation, # 填充
+        groups=groups, # 分组卷积
+        bias=False, # 截距
+        dilation=dilation, # 膨胀率
+    )
+def conv1x1(in_planes: int, out_planes: int, stride: int = 1) -> nn.Conv2d:
+    # in_c,out_c,核大小=1,点卷积,步长
+    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
+class BasicBlock(nn.Module):
+    expansion: int = 1
+    def __init__(
+        self,
+        inplanes: int,
+        planes: int,
+        stride: int = 1,
+        downsample: Optional[nn.Module] = None,
+        groups: int = 1,
+        base_width: int = 64,
+        dilation: int = 1,
+        norm_layer: Optional[Callable[..., nn.Module]] = None,
+    ) -> None:
+        super().__init__()
+        # 如果未设定标准化层
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d # 设置为批次标准化
+        # 如果groups不是1,或者base_width不是64,抛出值错误
+        if groups != 1 or base_width != 64:
+            raise ValueError("BasicBlock only supports groups=1 and base_width=64")
+        # 如果膨胀率大于1,抛出未实现错误
+        if dilation > 1:
+            raise NotImplementedError("Dilation > 1 not supported in BasicBlock")
+        # Both self.conv1 and self.downsample layers downsample the input when stride != 1
+        self.conv1 = conv3x3(inplanes, planes, stride) # 普通卷积
+        self.bn1 = norm_layer(planes)  # 标准化层
+        # inplace=True：表示操作将在原始张量上直接进行，而不创建新的张量。这意味着输入张量将会被修改，
+        # 并且返回的也是同一个张量。这种方式可以节省内存，因为它不需要额外的空间来存储结果
+        # inplace=False：表示操作将返回一个新的张量，而不会修改输入张量。这种方式保留了输入张量的原始
+        # 值，但在处理大型数据集时可能会消耗更多内存，因为每次操作都会创建一个新的张量。
+        # 梯度计算：在训练过程中，反向传播需要访问中间结果，因此使用 inplace 操作时需要特别小心，确
+        # 保不会破坏需要用于梯度计算的数据。
+        # 多线程：如果在多线程环境下使用 inplace 操作，可能会导致竞态条件，特别是当多个线程试图同
+        # 时修改同一个张量时。
+        self.relu = nn.ReLU(inplace=True) 
+        self.conv2 = conv3x3(planes, planes) # 普通卷积,不下采样
+        self.bn2 = norm_layer(planes) # 标准化层
+        self.downsample = downsample # 下采样模块
+        self.stride = stride
+    # 批次规范化（Batch Normalization，简称 BatchNorm 或 BN）通常放在卷积层之后的原因是
+    # 为了确保网络的稳定性和更好的训练效果。下面详细解释为什么批次规范化通常放在卷积层之后：
+    # 批次规范化的位置选择
+    # 数据分布稳定：批次规范化的主要作用之一是使各层的输入数据分布更加稳定。通过计算小批量数据的均值和方差，
+    # 并对数据进行归一化，可以减少内部协变量偏移（internal covariate shift），从而加快训练速度并提高模型性能。
+    # 如果将批次规范化放在卷积层之前，那么卷积层的输入数据分布将受到前一层输出数据分布的影响，这可能导致不稳定的数
+    # 据分布，从而影响批次规范化的效果。
+    # 非线性激活 在卷积层之后加上批次规范化，然后再经过非线性激活函数（如 ReLU），这样的顺序可以
+    # 使整个模块（Conv -> BN -> ReLU）更加合理。
+    # 批次规范化层之后通常跟着非线性激活函数，这是因为批次规范化层输出的数据是标准化的（均值接近0，
+    # 方差接近1），这使得非线性激活函数的输入更稳定，从而有助于梯度传播。
+    # 在残差网络（ResNet）中，残差连接（skip connection）将输入直接加到输出上。如果在卷积层之前进行批
+    # 次规范化，那么残差连接的输入和输出之间可能存在不一致的情况，因为批次规范化改变了输入的分布。而在
+    # 卷积层之后进行批次规范化，可以确保残差连接的输入和输出具有相同的分布。
+    # 批次规范化通常放在卷积层之后的原因包括：
+    # 数据分布稳定：确保各层输入数据分布的稳定性。
+    # 非线性激活：使非线性激活函数的输入更加稳定。
+    # 残差连接：确保残差连接的输入和输出具有相同的分布。
+    # 数据分布的稳定性：卷积操作后的数据分布差异较大，BN可以帮助标准化这些数据，使之具有更好的分布特性。
+    # 非线性激活的影响：激活函数对数据分布的影响相对较小，所以之前标准化的效果仍然存在
+    # 而且卷积后又进行了标准化
+    def forward(self, x: Tensor) -> Tensor:
+        identity = x # 残差前段(b,inplanes,h,w)
+        out = self.conv1(x) # (b,planes,...)
+        out = self.bn1(out) # 标准化层
+        out = self.relu(out) # 激活函数
+        out = self.conv2(out) # 普通卷积
+        # 标准化层,这个标准化层后没有激活函数,是因为激活函数的非线性
+        # 有可能影响残差连接,因为卷积是线性的
+        out = self.bn2(out) 
+        # 如果有设定下采样模块
+        if self.downsample is not None:
+            # 对残差前段下采样,这是为了让残差的两部分具有一致的形状
+            identity = self.downsample(x)
+        out += identity # 残差连接
+        out = self.relu(out) # 残差连接后再经过激活函数处理
+        return out
+# 这个 Bottleneck 类实现了 ResNet 模型中的一个瓶颈模块，通过使用 1x1 和 3x3 卷积层组合
+# ，以及批规范化和 ReLU 激活函数，实现了高效的特征提取和残差连接机制。通过这种方式，模型能够
+# 在保持较高精度的同时减少计算复杂度。
+class Bottleneck(nn.Module):
+    #  Bottleneck 在 torchvision 中将下采样的步长放在 3x3 的卷积层 (self.conv2)，
+    # 而原始的实现将步长放在第一个 1x1 的卷积层 (self.conv1)，这种变体也被称作 
+    # ResNet V1.5 并且提高了模型的准确性。
+    expansion: int = 4
+    # 构造函数初始化 Bottleneck 模块，并设置必要的参数
+    def __init__(
+        self,
+        inplanes: int, # 输入通道的数量。
+        planes: int, # 中间层的通道数量。
+        stride: int = 1, # 卷积操作的步长，默认为 1。
+        downsample: Optional[nn.Module] = None,# 用于下采样的可选模块。
+        # 分组卷积中的组数，默认为 1，表示标准卷积。
+        groups: int = 1,
+        # base_width: 基础宽度，默认为 64。
+        base_width: int = 64,
+        dilation: int = 1, # dilation: 空洞卷积的膨胀率，默认为 1。
+        # 规范化层，默认为 nn.BatchNorm2d。
+        norm_layer: Optional[Callable[..., nn.Module]] = None,
+    ) -> None:
+        super().__init__()
+        # 如果未指定 norm_layer，则默认使用 nn.BatchNorm2d 作为规范化层。接着计算中间层的宽度 width。
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+        width = int(planes * (base_width / 64.0)) * groups
+        # 初始化卷积层和批规范化层：
+        # conv1: 1x1 卷积层，输入通道数为 inplanes，输出通道数为 width。
+        self.conv1 = conv1x1(inplanes, width)
+        # bn1: 第一个规范化层，作用于 conv1 的输出。
+        self.bn1 = norm_layer(width)
+        # conv2: 3x3 卷积层，输入和输出通道数均为 width，步长为 stride。
+        self.conv2 = conv3x3(width, width, stride, groups, dilation)
+        # bn2: 第二个规范化层，作用于 conv2 的输出。
+        self.bn2 = norm_layer(width)
+        # conv3: 1x1 卷积层，输入通道数为 width，输出通道数为 planes * self.expansion。
+        self.conv3 = conv1x1(width, planes * self.expansion)
+        # bn3: 第三个规范化层，作用于 conv3 的输出。
+        self.bn3 = norm_layer(planes * self.expansion)
+        # relu: 激活函数，采用 inplace=True 选项。
+        self.relu = nn.ReLU(inplace=True)
+        # downsample: 下采样模块，如果提供了则使用。
+        self.downsample = downsample
+        self.stride = stride # 步长
+    # 前向传播函数 前向传播函数定义了数据流经模块的过程：
+    def forward(self, x: Tensor) -> Tensor:
+        identity = x # 残差前段(b,inplanes,h,w)
+        out = self.conv1(x) # (b,width,h,w) 点卷积切换通道
+        out = self.bn1(out) # 批次标准化,用于规范卷积后数据分布
+        out = self.relu(out) # 激活函数处理
+        out = self.conv2(out) # 普通卷积处理(b,width,...)
+        out = self.bn2(out) # 批次标准化
+        out = self.relu(out) # 激活函数
+        out = self.conv3(out) # 点卷积切换通道
+        # 批次标准化,这个之后不进行激活函数处理,是因为激活函数的非
+        # 线性有可能影响线性的残差操作
+        out = self.bn3(out) 
+        if self.downsample is not None:
+            # 如果有下采样模块,就对前段下采样,这是为了让残差的两部分具有一致的形状
+            identity = self.downsample(x)
+        out += identity # 残差
+        out = self.relu(out) # 激活函数处理
+        return out
+# 用于构建 ResNet 模型。通过构造函数初始化模型的各个组成部分，并通过 _make_layer
+# 方法创建多层结构。前向传播过程定义了数据从输入到输出的流程，并在初始化时对
+# 模型的权重进行了适当的初始化。这种方式构建的模型可以在多种图像识别任务中表现出色。
+class ResNet(nn.Module):
+    def __init__(
+        self,
+        # 指定使用的块类型，可以是 BasicBlock 或者 Bottleneck。
+        block: Type[Union[BasicBlock, Bottleneck]],
+        # 一个列表，表示每个层中有多少个重复的块。
+        layers: List[int],
+        # 输出分类的数量，默认为 1000。
+        num_classes: int = 1000,
+        # 是否对最后一个 BN 层进行零初始化。
+        zero_init_residual: bool = False,
+        # 分组卷积中的组数，默认为 1，表示标准卷积。
+        groups: int = 1,
+        # 每组的基础宽度，默认为 64。
+        width_per_group: int = 64,
+        # 是否用膨胀卷积替换步长，如果为 None 则默认为 [False, False, False]。
+        replace_stride_with_dilation: Optional[List[bool]] = None,
+        # 规范化层，默认为 nn.BatchNorm2d。
+        norm_layer: Optional[Callable[..., nn.Module]] = None,
+    ) -> None:
+        super().__init__()
+        _log_api_usage_once(self)
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+        self._norm_layer = norm_layer
+        # 初始输入平面的数量，设置为 64。这里说平面,就是指通道
+        # 因为通道可以看成很多个二维空间面的堆叠
+        self.inplanes = 64
+        self.dilation = 1 # 膨胀率，初始为 1。
+        if replace_stride_with_dilation is None:
+            # each element in the tuple indicates if we should replace
+            # the 2x2 stride with a dilated convolution instead
+            replace_stride_with_dilation = [False, False, False]
+        if len(replace_stride_with_dilation) != 3:
+            raise ValueError(
+                "replace_stride_with_dilation should be None "
+                f"or a 3-element tuple, got {replace_stride_with_dilation}"
+            )
+        self.groups = groups
+        self.base_width = width_per_group
+        # 第一个卷积层，输入通道数为 3，输出通道数为 64。核大小为7时,padding=3,stride=2,下采样
+        self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = norm_layer(self.inplanes) # 第一个规范化层。
+        self.relu = nn.ReLU(inplace=True) # 激活函数，使用 ReLU。
+        # 最大池化层。
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        # self.layer1 至 self.layer4: 通过 _make_layer 方法创建的四个层
+        self.layer1 = self._make_layer(block, 64, layers[0])
+        self.layer2 = self._make_layer(
+            block, 128, layers[1], stride=2, dilate=replace_stride_with_dilation[0])
+        self.layer3 = self._make_layer(
+            block, 256, layers[2], stride=2, dilate=replace_stride_with_dilation[1])
+        self.layer4 = self._make_layer(
+            block, 512, layers[3], stride=2, dilate=replace_stride_with_dilation[2])
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1)) # self.avgpool: 平均池化层。
+        # 全连接层，输出分类的数量由 num_classes 决定。
+        self.fc = nn.Linear(512 * block.expansion, num_classes)
+        # 初始化模型的权重：
+        # 将每个残差分支中的最后一个BN（批规范化层）初始化为零，
+        # 这样残差分支就会从零开始，使得每个残差块的行为类似于恒等映射。这样做可以将模型性能提升0.2%~0.3%。
+        # 如果 zero_init_residual 为 True，则对最后一个 BN 层进行零初始化，以改善模型性能。
+        # 这段注释解释了为什么在初始化时将残差分支中的最后一个批规范化（Batch Normalization, BN）
+        # 层的权重设为零。这样做可以让残差分支在开始时输出为零，从而使整个残差块的行为类似于恒等映
+        # 射（即输入等于输出）。这种方法能够稍微提升模型的表现
+        for m in self.modules():
+            # 使用 Kaiming 初始化方法初始化卷积层的权重。
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            # 初始化规范化层的权重和偏置。
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+        if zero_init_residual:
+            for m in self.modules():
+                if isinstance(m, Bottleneck) and m.bn3.weight is not None:
+                    nn.init.constant_(m.bn3.weight, 0)  # type: ignore[arg-type]
+                elif isinstance(m, BasicBlock) and m.bn2.weight is not None:
+                    nn.init.constant_(m.bn2.weight, 0)  # type: ignore[arg-type]
+    # 创建一个由多个相同类型的块组成的层。
+    def _make_layer(
+        self,
+        block: Type[Union[BasicBlock, Bottleneck]], # 使用的块类型。
+        planes: int, # 中间层的通道数量。
+        blocks: int, # 层中包含的块的数量。
+        stride: int = 1, # 卷积操作的步长，默认为 1。
+        dilate: bool = False, # 是否使用膨胀卷积。
+    ) -> nn.Sequential:
+        norm_layer = self._norm_layer
+        downsample = None
+        previous_dilation = self.dilation # 保留以前的膨胀率
+        if dilate: # 如果使用膨胀卷积
+            self.dilation *= stride  # 让膨胀率乘于步长
+            stride = 1 # 并且设置步长为1
+        # 如果步长不等于1 或 输入通道不等于瓶颈内通道×block.expansion
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            # 构建下采样模块,包括点卷积切换通道,下采样,和之后的标准化
+            # 这样在残差时才能和另外的残差段形状一致
+            downsample = nn.Sequential(
+                conv1x1(self.inplanes, planes * block.expansion, stride),
+                norm_layer(planes * block.expansion),
+            )
+        # 构建列表,用于装处理块
+        layers = []
+        layers.append(
+            block(
+                self.inplanes, planes, stride, downsample, self.groups, 
+                self.base_width, previous_dilation, norm_layer
+            )
+        )
+        self.inplanes = planes * block.expansion
+        
+        for _ in range(1, blocks):
+            layers.append(
+                block(
+                    self.inplanes,
+                    planes,
+                    groups=self.groups,
+                    base_width=self.base_width,
+                    dilation=self.dilation,
+                    norm_layer=norm_layer,
+                )
+            )
+        # 返回序列化栈
+        return nn.Sequential(*layers)
+    # 定义了数据流经模块的过程：
+    # 数据依次通过卷积层、规范化层、激活函数、最大池化层，然后通过四个由 _make_layer 创建的层
+    # 最后通过平均池化层和平坦化，然后通过全连接层得到最终的输出。
+    def _forward_impl(self, x: Tensor) -> Tensor:
+        # See note [TorchScript super()]
+        # (b,3,h,w)-->(b,inplanes,h/2,w/2)
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        # (b,inplanes,h/2,w/2)-->(b,inplanes,h/4,w/4)
+        x = self.maxpool(x)
+        # 之后经过特征提取模块处理
+        x = self.layer1(x)
+        x = self.layer2(x) # h/8,w/8
+        x = self.layer3(x) # h/16,w/16
+        x = self.layer4(x) # h/32,w/32
+        x = self.avgpool(x) # (b,d,1,1)
+        x = torch.flatten(x, 1)  # 从索引1开始扁平化
+        x = self.fc(x) # d-->num_classes
+        return x
+    # 实际的前向传播方法，调用 _forward_impl 方法完成前向传播。
+    def forward(self, x: Tensor) -> Tensor:
+        return self._forward_impl(x)
+# 这段代码定义了一个 _resnet 函数，用于构建 ResNet 模型并根据提供的权重进行初始化。
+# 函数首先根据预训练权重的类别数量调整 num_classes 参数，然后构建模型，并在提供预训练
+# 权重的情况下加载这些权重。最后返回构建好的模型。
+# 如果提供了预训练权重，并且这些权重带有类别元数据，那么模型的输出类别数将被设置为与预训练权重
+# 相匹配的数量。
+def _resnet(
+    # 指定使用的块类型，可以是 BasicBlock 或者 Bottleneck。
+    block: Type[Union[BasicBlock, Bottleneck]],
+    layers: List[int],# 一个列表，表示每个层中有多少个重复的块。
+    weights: Optional[WeightsEnum],# 可选的权重枚举类型，用于指定模型的预训练权重。
+    progress: bool,# 一个布尔值，用于在下载预训练权重时显示进度条。
+    **kwargs: Any, # 其他关键字参数，用于传递给 ResNet 构造函数。
+) -> ResNet:
+    # _ovewrite_named_param 函数的作用是在给定的 kwargs 字典中覆盖（或设置）名为 "num_classes" 
+    # 的参数，其值为 weights.meta["categories"] 的长度。这意味着如果提供了预训练权重，那么模型的输出类
+    # 别数将被设置为与预训练权重相匹配的数量。
+    # 权重覆盖：如果提供了 weights 参数，那么首先覆盖 kwargs 中的 num_classes 参数，
+    # 使其与权重元数据中类别数量一致。
+    if weights is not None:
+        _ovewrite_named_param(kwargs, "num_classes", len(weights.meta["categories"]))
+    # 模型构建：使用提供的 block 类型和 layers 列表构建 ResNet 模型，并传递其他关键字参数。
+    model = ResNet(block, layers, **kwargs)
+    # 权重加载：如果提供了 weights 参数，那么加载相应的预训练权重。
+    if weights is not None:
+        model.load_state_dict(weights.get_state_dict(progress=progress, check_hash=True))
+    # 返回模型：返回构建好的 ResNet 模型。
+    return model
+# 这段代码定义了 ResNet50_Weights 类，这是一个继承自 WeightsEnum 的枚举类，
+# 用于管理 ResNet50 模型的不同预训练权重版本。
+class ResNet50_Weights(WeightsEnum):
+    # 定义 ResNet50 的预训练权重版本
+    # 这个版本的权重是从 PyTorch 官方提供的链接下载的，适用于 ImageNet-1K 数据集。它包含了以下信息：
+    # URL: 预训练权重文件的下载链接。
+    # transforms: 数据转换函数，指定了裁剪尺寸为 224x224。
+    # meta: 包含了元数据，包括参数数量、训练配方链接、准确率指标、操作数量、文件大小以及文档描述。
+    IMAGENET1K_V1 = Weights(
+        url="https://download.pytorch.org/models/resnet50-0676ba61.pth",
+        transforms=partial(ImageClassification, crop_size=224),
+        meta={
+            **_COMMON_META,
+            "num_params": 25557032,
+            "recipe": "https://github.com/pytorch/vision/tree/main/references/classification#resnet",
+            "_metrics": {
+                "ImageNet-1K": {
+                    "acc@1": 76.130,
+                    "acc@5": 92.862,
+                }
+            },
+            "_ops": 4.089,
+            "_file_size": 97.781,
+            "_docs": """These weights reproduce closely the results of the paper using a simple training recipe.""",
+        },
+    )
+    # 这个版本的权重同样适用于 ImageNet-1K 数据集，但是采用了改进的训练方法，其准确率比 V1 版本
+    # 更高。它包含了以下信息：
+    # URL: 预训练权重文件的下载链接。
+    # transforms: 数据转换函数，指定了裁剪尺寸为 224x224 和调整大小为 232x232。
+    # meta: 包含了元数据，包括参数数量、训练配方链接、准确率指标、操作数量、文件大小以及文档描述。
+    IMAGENET1K_V2 = Weights(
+        url="https://download.pytorch.org/models/resnet50-11ad3fa6.pth",
+        transforms=partial(ImageClassification, crop_size=224, resize_size=232),
+        meta={
+            **_COMMON_META,
+            "num_params": 25557032,
+            "recipe": "https://github.com/pytorch/vision/issues/3995#issuecomment-1013906621",
+            "_metrics": {
+                "ImageNet-1K": {
+                    "acc@1": 80.858,
+                    "acc@5": 95.434,
+                }
+            },
+            "_ops": 4.089,
+            "_file_size": 97.79,
+            "_docs": """
+                These weights improve upon the results of the original paper by using TorchVision's `new training recipe
+                <https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/>`_.
+            """,
+        },
+    )
+    # 定义了一个默认的预训练权重版本，这里默认使用的是 IMAGENET1K_V2 版本
+    DEFAULT = IMAGENET1K_V2
+# 这段代码定义了一个 resnet50 函数，用于构建并返回一个 ResNet-50 模型。该函数支持使
+# 用预训练权重，并且可以接收其他任意关键字参数来自定义模型。函数的实现使用了装
+# 饰器来处理旧接口的兼容性，并通过 _resnet 辅助函数来构建具体的模型实例
+# register_model()：这是一个装饰器，用于注册模型，使得可以通过某种方式（
+# 如配置文件或命令行参数）来选择模型。
+# @handle_legacy_interface()：这个装饰器用于处理旧接口的兼容性问题。在这里，它将旧
+# 的 pretrained 参数映射到了新的 weights 参数，使得老的代码仍然可以正常工作。具体来
+# 说，如果传入了 pretrained 参数，它会被转换成 weights=ResNet50_Weights.IMAGENET1K_V1。
+@register_model()
+@handle_legacy_interface(weights=("pretrained", ResNet50_Weights.IMAGENET1K_V1))
+def resnet50(*, weights: Optional[ResNet50_Weights] = None, progress: bool = True, **kwargs: Any) -> ResNet:
+    # weights: 类型为 Optional[ResNet50_Weights]，表示是否使用预训练权重。
+    # ResNet50_Weights 是一个枚举类型，包含了不同的预训练权重版本。
+    # progress: 类型为 bool，表示是否在下载预训练权重时显示进度条。默认值为 True
+    # **kwargs: 允许传递其他任意的关键字参数给 ResNet 的构造函数
+    # 模型来源：ResNet-50 来源于论文《图像识别的深度残差学习》。
+    # 注意：TorchVision 实现的 ResNet-50 在瓶颈（bottleneck）部分的下采样步长（stride）
+    # 放在了第二个 3x3 卷积层，而原始论文将其放在了第一个 1x1 卷积层。这种变体被称为 
+    # ResNet V1.5，并且提高了准确率。
+    # 验证权重：ResNet50_Weights.verify(weights)：这个方法用于验证传入的 weights 
+    # 参数是否有效，并返回一个合适的 weights 实例。
+    weights = ResNet50_Weights.verify(weights)
+    # 调用 _resnet 函数来构建模型。_resnet 函数接收 block 类型、每一层的块数量、权重、进
+    # 度条显示与否以及其他参数，并返回构建好的模型实例。
+    return _resnet(Bottleneck, [3, 4, 6, 3], weights, progress, **kwargs)
+# 这段代码定义了一个名为 __all__ 的列表，它列出了 ResNet 模型及其相关权重检查点的名称。这个列表通
+# 常用于模块的导出控制，指示哪些符号（如类、函数等）应该被外部模块导入时可见。
+__all__ = [
+    "ResNet",
+    "ResNet18_Weights",
+    "ResNet34_Weights",
+    "ResNet50_Weights",
+    "ResNet101_Weights",
+    "ResNet152_Weights",
+    "ResNeXt50_32X4D_Weights",
+    "ResNeXt101_32X8D_Weights",
+    "ResNeXt101_64X4D_Weights",
+    "Wide_ResNet50_2_Weights",
+    "Wide_ResNet101_2_Weights",
+    "resnet18",
+    "resnet34",
+    "resnet50",
+    "resnet101",
+    "resnet152",
+    "resnext50_32x4d",
+    "resnext101_32x8d",
+    "resnext101_64x4d",
+    "wide_resnet50_2",
+    "wide_resnet101_2",
+]
+# 这里定义了一些公共的元数据，包括最小输入尺寸和IMAGENET类别列表。
+_COMMON_META = {
+    "min_size": (1, 1),
+    "categories": _IMAGENET_CATEGORIES,
+}
